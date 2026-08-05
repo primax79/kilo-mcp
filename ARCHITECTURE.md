@@ -6,9 +6,9 @@ This document captures the original design discussions, specifications, and arch
 
 The fundamental reason for this tool's existence is the separation of concerns between two distinct AI personas:
 
-1. **Claude (The Architect & Orchestrator):**
+1. **The Orchestrator / Architect (e.g. Claude, Kilo, Roo Code):**
     * **Role:** Tech Lead, System Designer, Reviewer.
-    * **Strengths:** Superior reasoning (especially models like Sonnet 3.7), architectural planning, managing complex constraints, and writing highly detailed specifications.
+    * **Strengths:** High-level reasoning, architectural planning, managing complex constraints, writing highly detailed specifications, and coordinating workflows.
     * **Weaknesses:** Expensive and slow for massive multi-file codebase refactorings. Pulling an entire workspace into context just to find a few files is inefficient.
     * **Responsibilities:**
         * Receive user requests.
@@ -18,7 +18,7 @@ The fundamental reason for this tool's existence is the separation of concerns b
         * Delegate the actual coding to Kilo using `kilo_implement`.
         * Review the final output provided by Kilo.
 
-2. **KiloCode / Gemini 3.1 Pro (The Executor):**
+2. **KiloCode / Executor Model (The Executor):**
     * **Role:** The Developer, The "Doer".
     * **Strengths:** Massive context window, incredibly fast execution, native workspace awareness, Agent Manager capabilities (parallel worktrees), and built-in semantic search.
     * **Responsibilities:**
@@ -115,11 +115,11 @@ Added 2026-07-29, alongside the reliability fixes in §8. The Kilo VS Code exten
 
 ### Components Diagram
 
-This diagram shows how the various components of the system interact, highlighting Claude's role as "Architect" and Kilo's role as "Executor", mediated by the MCP server.
+This diagram shows how the various components of the system interact, highlighting the AI Assistant's role as "Architect / Orchestrator" and Kilo's role as "Executor", mediated by the MCP server.
 
 ```mermaid
 graph TD
-    User([Utente]) -->|Richiesta| Claude[Claude / LLM\nArchitect & Orchestrator]
+    User([Utente]) -->|Richiesta| Orchestrator[Orchestrator AI / LLM\nClaude / Kilo / Roo Code]
     
     subgraph Kilo MCP Server
         MCP_Server[FastMCP Server\nserver.py]
@@ -135,7 +135,7 @@ graph TD
         MCP_Server --> Tool4
     end
 
-    Claude <-->|Protocollo MCP| MCP_Server
+    Orchestrator <-->|Protocollo MCP| MCP_Server
     
     Tool3 -->|Subprocess:\n'kilo run --agent explore'| KiloCLI[Kilo CLI\nExecutor]
     Tool4 -->|Subprocess:\n'kilo run --agent code'| KiloCLI
@@ -149,11 +149,11 @@ graph TD
 
 ### Sequence Diagram: `kilo_implement` Flow
 
-This diagram details the most complex operation (`kilo_implement`), showing step-by-step how Claude delegates work to Kilo asynchronously, bypassing shell limits.
+This diagram details the most complex operation (`kilo_implement`), showing step-by-step how the orchestrator delegates work to Kilo asynchronously, bypassing shell limits.
 
 ```mermaid
 sequenceDiagram
-    participant C as Claude (Architect)
+    participant C as Orchestrator AI (Architect)
     participant S as FastMCP Server (server.py)
     participant FS as Filesystem Locale
     participant K as Kilo CLI (Executor)

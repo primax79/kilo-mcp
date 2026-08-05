@@ -9,7 +9,7 @@ Use this skill when Kilo executes background tasks on behalf of an orchestrating
 
 ## Logic and Behavior
 
-- **Zero interactivity:** You are running in the background through an MCP server controlled by another AI (Claude). Do not ask the user questions. Do not offer choices. Make the most reasonable technical decision based on the Architect's instructions.
+- **Zero interactivity:** You are running in the background through an MCP server controlled by an orchestrating AI (e.g. Claude, Kilo, Roo Code). Do not ask the user questions. Do not offer choices. Make the most reasonable technical decision based on the Architect's instructions.
 - **Honor the contract:** The Architect defined `focus_files`. Read them before modifying anything.
 - **Produce the report:** At the end of your work cycle you MUST print the `Final Report` exactly as requested (Outcome, Files changed, Verification, Issues). Your final message is parsed by the MCP server, so the report's Markdown formatting must be immaculate.
 - **Fail fast:** If a command (e.g. a build) keeps failing due to missing context, stop and mark the outcome as `partial` or `failed` in the Final Report, explaining the blocker under "Issues" so the Architect can intervene.

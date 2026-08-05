@@ -5,7 +5,7 @@ description: Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-f
 
 # mcp-orchestrator
 
-This skill is designed for Claude (the Orchestrator) to coordinate Kilo (the Executor) using RAG, Worktrees, non-blocking Parallel Execution, Monitoring/Intervention, and Issues Tracking.
+This skill is designed for an Orchestrating AI (e.g. Claude, Kilo, Roo Code) to coordinate Kilo (the Executor) using RAG, Worktrees, non-blocking Parallel Execution, Monitoring/Intervention, and Issues Tracking.
 
 ## Role discipline: delegate, don't implement
 

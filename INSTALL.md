@@ -51,7 +51,7 @@ cd ~/.local/share/kilo-mcp-server
 
 ### Step 2: Install Bundled Skills
 
-This MCP server includes specialized skills (`kilo-mcp-headless-executor`, `kilo-mcp-conflict-resolver`, `kilo-mcp-rag-explorer`) designed to optimize execution when orchestrated by Claude. Install them into your global Kilo configuration:
+This MCP server includes specialized skills (`kilo-mcp-headless-executor`, `kilo-mcp-conflict-resolver`, `kilo-mcp-rag-explorer`) designed to optimize execution when orchestrated by an AI assistant. Install them into your global Kilo configuration:
 
 ```bash
 uv run --no-project --with mcp python server.py --install-skills
@@ -59,9 +59,9 @@ uv run --no-project --with mcp python server.py --install-skills
 
 (The `--with mcp` flag is required even for skill installation because `server.py` imports the MCP SDK at module load.)
 
-### Step 2b: Claude-Side Skills (optional)
+### Step 2b: Orchestrator-Side Skills (optional)
 
-The repository also bundles two skills for **Claude** (the orchestrator) under `.claude/skills/`: `mcp-orchestrator` (the 5-phase delegation workflow) and `mcp-metrics-analyst` (ROI and defect analysis). When you open this repository with Claude Code they are picked up automatically as project skills. To make them available in every project, copy them to your global Claude skills directory:
+The repository also bundles two skills for **Claude / Orchestrators** under `.claude/skills/` (and under `plugins/kilo-mcp/skills/`): `mcp-orchestrator` (the 5-phase delegation workflow) and `mcp-metrics-analyst` (ROI and defect analysis). When using Claude Code, they are picked up automatically as project skills. To make them available globally in Claude Code, copy them to your global Claude skills directory:
 
 ```bash
 cp -R .claude/skills/mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.claude/skills/
