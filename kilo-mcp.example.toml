@@ -1,0 +1,63 @@
+# kilo-mcp-server configuration — EXAMPLE
+#
+# Copy this file to one of the locations below (searched in order), then edit:
+#   1. any path, exported as  KILO_MCP_CONFIG=/path/to/file.toml
+#   2. kilo-mcp.toml next to server.py            (per-checkout config)
+#   3. ~/.config/kilo-mcp/config.toml             (per-user config)
+#
+# Every key is optional: built-in defaults apply when a key (or the whole
+# file) is missing. Environment variables ALWAYS override the file — the
+# env var name for each key is noted in the comments — so settings passed
+# via the MCP client's `env` block keep working as usual.
+
+[kilo]
+# Max seconds a single Kilo subprocess may run before being killed.
+# env: KILO_MCP_TIMEOUT
+timeout = 1800
+
+# Default provider/model id for kilo_implement (must exist in `kilo models`).
+# env: KILO_MCP_DEFAULT_MODEL
+default_model = "google/gemini-3.5-flash"
+
+# What Kilo's model tokens cost YOU (USD per million tokens). Default 0.0 =
+# free, which is right only if your Kilo API keys are provided at no charge
+# (e.g. institution-supplied Google keys). If you pay for the Kilo model, set
+# the real rates here: the default delegation policy switches to a paid-Kilo
+# cost comparison, and cost estimates / kilo_metrics include Kilo's own
+# execution cost.
+# env: KILO_MCP_KILO_INPUT_PER_MTOK / KILO_MCP_KILO_OUTPUT_PER_MTOK
+input_cost_per_mtok = 0.0
+output_cost_per_mtok = 0.0
+
+# Policy text injected into the kilo_implement tool description: tells Claude
+# WHEN delegating to Kilo beats doing the work inline. Uncomment to override
+# the built-in policy (picked automatically from the cost keys above:
+# free-Kilo policy when both are 0.0, paid-Kilo policy otherwise).
+# env: KILO_MCP_DELEGATION_POLICY
+# delegation_policy = """
+# DELEGATE large, well-specifiable multi-file work; do small edits yourself.
+# Always review the returned report.
+# """
+
+[metrics]
+# Where metrics.jsonl and issues.jsonl are written.
+# env: KILO_MCP_DATA_DIR
+data_dir = "~/.local/share/kilo-mcp"
+
+# Claude pricing (USD per million tokens) used for cost estimates.
+# env: KILO_MCP_CLAUDE_INPUT_PER_MTOK / KILO_MCP_CLAUDE_OUTPUT_PER_MTOK
+claude_input_per_mtok = 5.0
+claude_output_per_mtok = 25.0
+
+# Rough chars→tokens divisor for size estimates.
+# env: KILO_MCP_CHARS_PER_TOKEN
+chars_per_token = 4.0
+
+# Inline-generation cost model: what Claude would have spent doing the task
+# itself. output ≈ generated_code_tokens × inline_output_factor (retries),
+# input ≈ output × inline_input_per_output (context resent across the agentic
+# loop; 40 is a conservative, cache-adjusted figure — raw ratios measured on
+# real sessions ranged 40–170).
+# env: KILO_MCP_INLINE_OUTPUT_FACTOR / KILO_MCP_INLINE_INPUT_PER_OUTPUT
+inline_output_factor = 1.2
+inline_input_per_output = 40.0

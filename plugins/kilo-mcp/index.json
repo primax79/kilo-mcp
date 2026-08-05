@@ -1,0 +1,36 @@
+{
+  "skills": [
+    {
+      "name": "skills/kilo-mcp-conflict-resolver",
+      "files": [
+        "SKILL.md"
+      ]
+    },
+    {
+      "name": "skills/kilo-mcp-headless-executor",
+      "files": [
+        "SKILL.md"
+      ]
+    },
+    {
+      "name": "skills/kilo-mcp-rag-explorer",
+      "files": [
+        "SKILL.md"
+      ]
+    },
+    {
+      "name": "skills/mcp-metrics-analyst",
+      "files": [
+        "SKILL.md"
+      ]
+    },
+    {
+      "name": "skills/mcp-orchestrator",
+      "files": [
+        "SKILL.md",
+        "scripts/diagnose-kilo-tasks.sh",
+        "scripts/kill-kilo-task.sh"
+      ]
+    }
+  ]
+}

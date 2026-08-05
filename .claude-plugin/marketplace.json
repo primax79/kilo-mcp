@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "kilo-mcp",
+  "description": "MCP server + Kilo-specific skills for delegating implementation work from an orchestrating AI to Kilo Code - the Kilo binding of the Architect/Executor pattern",
+  "owner": {
+    "name": "Alfredo Oliviero"
+  },
+  "plugins": [
+    {
+      "name": "kilo-mcp",
+      "description": "Kilo-specific skills for the Architect/Executor pattern: kilo-mcp-headless-executor, kilo-mcp-conflict-resolver, kilo-mcp-rag-explorer, mcp-orchestrator, mcp-metrics-analyst, plus the mcp-orchestrator-agent subagent. The MCP server itself (server.py) is registered separately - see README.md.",
+      "author": {
+        "name": "Alfredo Oliviero"
+      },
+      "category": "development",
+      "source": "./plugins/kilo-mcp"
+    }
+  ]
+}

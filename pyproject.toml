@@ -1,0 +1,19 @@
+[project]
+name = "kilo-mcp-server"
+version = "0.1.0"
+description = "MCP server that lets Claude orchestrate KiloCode as a coding executor (architect/executor pattern)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Alfredo Oliviero" }]
+keywords = ["mcp", "claude", "kilocode", "agent", "orchestration"]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+kilo-mcp = "server:main"

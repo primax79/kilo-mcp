@@ -1,0 +1,12 @@
+{
+  "skills": [
+    {
+      "name": "mcp-orchestrator",
+      "files": [
+        "SKILL.md",
+        "scripts/diagnose-kilo-tasks.sh",
+        "scripts/kill-kilo-task.sh"
+      ]
+    }
+  ]
+}
