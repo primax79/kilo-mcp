@@ -94,6 +94,77 @@ def _cfg(env_name: str, section: str, key: str, default, cast=str):
 # Timeout (seconds) for a single Kilo subprocess before we give up.
 KILO_TIMEOUT = _cfg("KILO_MCP_TIMEOUT", "kilo", "timeout", 1800, int)
 
+# Server API Endpoint Configuration (for communicating with running kilo serve instance)
+KILO_SERVER_URL = _cfg("KILO_SERVER_URL", "kilo", "server_url", "")
+KILO_SERVER_PASSWORD = _cfg("KILO_SERVER_PASSWORD", "kilo", "server_password", "")
+
+
+def _discover_active_kilo_server() -> tuple[Optional[str], Optional[str]]:
+    """Discover a running `kilo serve` instance on this machine by inspecting
+    running processes or environment variables. Returns (url, password)."""
+    if KILO_SERVER_URL:
+        return KILO_SERVER_URL.rstrip("/"), KILO_SERVER_PASSWORD
+
+    try:
+        res = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if "kilo serve" in line:
+                    m_port = re.search(r"--port\s+(\d+)", line)
+                    if m_port and m_port.group(1) != "0":
+                        port = m_port.group(1)
+                        return f"http://127.0.0.1:{port}", KILO_SERVER_PASSWORD
+    except Exception:
+        pass
+    return None, None
+
+
+async def _kilo_server_prompt_async(server_url: str, password: Optional[str],
+                                    session_id: str, prompt_text: str) -> bool:
+    """Send a prompt instruction directly to a running `kilo serve` session
+    via its HTTP REST API (`/session/:sessionID/prompt_async` or `/session/:sessionID/message`).
+    Returns True if accepted."""
+    import urllib.request
+    import urllib.error
+
+    url = f"{server_url}/session/{session_id}/prompt_async"
+    data = json.dumps({"parts": [{"type": "text", "text": prompt_text}]}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    if password:
+        import base64
+        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+        req.add_header("Authorization", f"Basic {auth}")
+
+    try:
+        def _do_req():
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status in (200, 201, 202, 204)
+        return await asyncio.to_thread(_do_req)
+    except Exception:
+        return False
+
+
+async def _kilo_server_stop_session(server_url: str, password: Optional[str],
+                                    session_id: str) -> bool:
+    """Stop/abort a running session directly via `kilo serve` REST API
+    (`/session/:sessionID/abort` or `/session/:sessionID/stop`). Returns True on success."""
+    import urllib.request
+
+    url = f"{server_url}/session/{session_id}/abort"
+    req = urllib.request.Request(url, method="POST", headers={"Content-Type": "application/json"})
+    if password:
+        import base64
+        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+        req.add_header("Authorization", f"Basic {auth}")
+
+    try:
+        def _do_req():
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status in (200, 201, 202, 204)
+        return await asyncio.to_thread(_do_req)
+    except Exception:
+        return False
+
 # Grace period kilo_task_cancel waits after SIGTERM before escalating to
 # SIGKILL. Not user-configurable (an implementation detail); a module-level
 # constant so tests can shorten it.
@@ -893,6 +964,19 @@ async def kilo_implement(
     })
     if continue_session_id:
         _agent_manager_note_session(cwd, continue_session_id, agent_manager_worktree_id)
+    else:
+        # Schedule lazy session linking so new background sessions immediately link
+        # to agent-manager.json and appear in VS Code's Agent Manager UI without delay.
+        try:
+            loop = asyncio.get_running_loop()
+            async def _lazy_link():
+                await asyncio.sleep(1.5)
+                sid = _find_session_for_task(cwd, datetime.now(timezone.utc).isoformat())
+                if sid:
+                    _agent_manager_note_session(cwd, sid, agent_manager_worktree_id)
+            loop.create_task(_lazy_link())
+        except Exception:
+            pass
 
     session_note = (
         f"- Continuing session: {continue_session_id}\n"
@@ -1397,16 +1481,13 @@ async def kilo_task_cancel(
     shows a delegation going wrong — off-spec changes, a stuck/looping process,
     burning cost with no progress — and you don't want to wait for the timeout.
 
-    Sends SIGTERM to the tracked process, escalating to SIGKILL after a couple
-    seconds if it hasn't exited. This is a hard stop, not a graceful in-session
-    abort — Kilo does not get a chance to write its Final Report. Any partial
-    file changes it already made are left as-is; review with
-    kilo_workspace_status and decide whether to keep, revert, or continue them
-    with a fresh kilo_implement call using continue_session_id.
-
-    Use freely for complex/high-risk delegations that show clear warning
-    signs; for small tasks it's usually simpler to just let them finish or
-    time out.
+    Sends SIGTERM to the tracked process (and attempts an HTTP abort if
+    connected to a running `kilo serve` instance), escalating to SIGKILL after a
+    couple seconds if it hasn't exited. This is a hard stop — Kilo does not get
+    a chance to write its Final Report. Any partial file changes it already
+    made are left as-is; review with kilo_workspace_status and decide whether to
+    keep, revert, or continue them with a fresh kilo_implement call using
+    continue_session_id.
     """
     record = _read_task_record(task_id)
     if record is None:
@@ -1414,12 +1495,22 @@ async def kilo_task_cancel(
     status = record.get("status")
     if status != "running":
         return f"Task {task_id} already ended (status: {status}); nothing to cancel."
+
+    # Try HTTP abort first if a running kilo serve instance and session_id are known
+    session_id = record.get("session_id")
+    if session_id:
+        srv_url, password = _discover_active_kilo_server()
+        if srv_url:
+            await _kilo_server_stop_session(srv_url, password, session_id)
+
     pid = record.get("pid")
     if not pid:
+        _write_task_record(task_id, {"status": "cancelled", "result": f"Cancelled: {reason}" if reason else "Cancelled."})
         return (
             f"Task {task_id} has no recorded process id yet — it may have just "
-            "started. Try again in a moment."
+            "started. Marked as cancelled."
         )
+
     note = f"Cancelled by architect. Reason: {reason}" if reason else "Cancelled by architect (no reason given)."
     try:
         os.kill(pid, signal.SIGTERM)
