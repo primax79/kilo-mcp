@@ -1,0 +1,10 @@
+{
+  "kilo-mcp-headless-executor": {
+    "profile": "bulk-execution",
+    "reason": "Behavioral contract for Kilo running as the Executor over kilo-mcp — governs the high-volume, spec-driven implementation side."
+  },
+  "kilo-mcp-rag-explorer": {
+    "profile": "exploration",
+    "reason": "Read-only semantic search over the codebase index — high volume, low judgment, errors are immediately visible as an irrelevant result."
+  }
+}

@@ -1,39 +1,39 @@
 {
   "items": [
     {
+      "id": "mcp-orchestrator",
+      "description": "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, and defect telemetry. Use when coordinating development work through the kilo-mcp tools.",
+      "category": "architect-side",
+      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/architect-side/skills/mcp-orchestrator",
+      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/mcp-orchestrator.tar.gz"
+    },
+    {
+      "id": "mcp-metrics-analyst",
+      "description": "Evaluate kilo-mcp delegation efficiency - ROI analysis via kilo_metrics (delegation_cost_usd vs inline_estimate_usd), defect-pattern review from kilo_log_issue, and feedback-loop proposals for better task specifications. Use when asked whether delegation to Kilo is paying off.",
+      "category": "architect-side",
+      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/architect-side/skills/mcp-metrics-analyst",
+      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/mcp-metrics-analyst.tar.gz"
+    },
+    {
       "id": "kilo-mcp-conflict-resolver",
       "description": "Resolve merge conflicts in files produced by parallel Kilo tasks - find conflict markers, merge both versions preserving the semantics of each parallel feature, verify with linter/build.",
-      "category": "kilo-mcp",
-      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/kilo-mcp/skills/kilo-mcp-conflict-resolver",
+      "category": "architect-side",
+      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/architect-side/skills/kilo-mcp-conflict-resolver",
       "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-conflict-resolver.tar.gz"
     },
     {
       "id": "kilo-mcp-headless-executor",
       "description": "Behavioral contract for Kilo when executing background tasks delegated by an orchestrating AI (e.g. Claude) through the kilo-mcp server - zero interactivity, focus_files contract, mandatory Final Report, fail fast.",
-      "category": "kilo-mcp",
-      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/kilo-mcp/skills/kilo-mcp-headless-executor",
+      "category": "executor-side",
+      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/executor-side/skills/kilo-mcp-headless-executor",
       "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-headless-executor.tar.gz"
     },
     {
       "id": "kilo-mcp-rag-explorer",
       "description": "Specialized skill for Kilo's explore agent when running codebase semantic searches. Optimizes index lookups, file summaries, and ensures read-only safety.",
-      "category": "kilo-mcp",
-      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/kilo-mcp/skills/kilo-mcp-rag-explorer",
+      "category": "executor-side",
+      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/executor-side/skills/kilo-mcp-rag-explorer",
       "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-rag-explorer.tar.gz"
-    },
-    {
-      "id": "mcp-metrics-analyst",
-      "description": "Evaluate kilo-mcp delegation efficiency - ROI analysis via kilo_metrics (delegation_cost_usd vs inline_estimate_usd), defect-pattern review from kilo_log_issue, and feedback-loop proposals for better task specifications. Use when asked whether delegation to Kilo is paying off.",
-      "category": "kilo-mcp",
-      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/kilo-mcp/skills/mcp-metrics-analyst",
-      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/mcp-metrics-analyst.tar.gz"
-    },
-    {
-      "id": "mcp-orchestrator",
-      "description": "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, and defect telemetry. Use when coordinating development work through the kilo-mcp tools.",
-      "category": "kilo-mcp",
-      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/kilo-mcp/skills/mcp-orchestrator",
-      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/mcp-orchestrator.tar.gz"
     }
   ]
 }

@@ -1,0 +1,16 @@
+{
+  "skills": [
+    {
+      "name": "kilo-mcp-headless-executor",
+      "files": [
+        "SKILL.md"
+      ]
+    },
+    {
+      "name": "kilo-mcp-rag-explorer",
+      "files": [
+        "SKILL.md"
+      ]
+    }
+  ]
+}

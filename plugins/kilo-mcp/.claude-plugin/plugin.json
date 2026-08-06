@@ -1,8 +1,0 @@
-{
-  "name": "kilo-mcp",
-  "version": "0.1.0",
-  "description": "Kilo-specific skills for the Architect/Executor pattern (headless-executor contract, conflict resolution, RAG explorer, orchestrator methodology, ROI metrics) plus the mcp-orchestrator-agent subagent",
-  "author": {
-    "name": "Alfredo Oliviero"
-  }
-}

@@ -2133,8 +2133,11 @@ def install_skills():
     dest = os.path.expanduser("~/.kilo/skills")
     os.makedirs(dest, exist_ok=True)
 
-    src_skills = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins", "kilo-mcp", "skills")
-    if os.path.exists(src_skills):
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    for plugin_dir in ("architect-side", "executor-side"):
+        src_skills = os.path.join(repo_root, "plugins", plugin_dir, "skills")
+        if not os.path.exists(src_skills):
+            continue
         for skill_dir in os.listdir(src_skills):
             full_src = os.path.join(src_skills, skill_dir)
             if os.path.isdir(full_src) and os.path.exists(os.path.join(full_src, "SKILL.md")):

@@ -10,9 +10,11 @@ That keeps the dependency one-directional, matching the declared
 plugin.json dependency (kilo-mcp -> ai-architect-executor).
 
 Each bindings/<skill>.json must correspond to a template at
-<ai-architect-executor>/plugins/architect-executor/skills/<skill>/SKILL.template.md.
-The map's own "name" field gives the concrete skill's directory name under
-plugins/kilo-mcp/skills/.
+<ai-architect-executor>/plugins/*/skills/<skill>/SKILL.template.md (searched
+across all of that repo's plugins - it doesn't matter which one the generic
+skill lives in). The map's own "name" field gives the concrete skill's
+directory name, and its "plugin" field (architect-side/executor-side) says
+which of this repo's own plugins it's written into.
 
 Usage:
   python3 scripts/regenerate_bound_skills.py [--ai-architect-executor PATH] [--check]
@@ -32,7 +34,7 @@ import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BINDINGS_DIR = REPO_ROOT / 'bindings'
-SKILLS_OUT_DIR = REPO_ROOT / 'plugins' / 'kilo-mcp' / 'skills'
+PLUGINS_DIR = REPO_ROOT / 'plugins'
 
 
 def find_ai_architect_executor(explicit):
@@ -43,6 +45,11 @@ def find_ai_architect_executor(explicit):
         return pathlib.Path(env).resolve()
     sibling = (REPO_ROOT / '..' / 'ai-architect-executor').resolve()
     return sibling
+
+
+def find_template(aae_root, skill_id):
+    matches = list(aae_root.glob(f'plugins/*/skills/{skill_id}/SKILL.template.md'))
+    return matches[0] if matches else None
 
 
 def main():
@@ -67,14 +74,22 @@ def main():
     ran = 0
     for map_path in sorted(BINDINGS_DIR.glob('*.json')):
         skill_id = map_path.stem  # generic skill name, e.g. "orchestration-methodology"
-        template = aae_root / 'plugins' / 'architect-executor' / 'skills' / skill_id / 'SKILL.template.md'
-        if not template.is_file():
-            print(f"[FAIL] {map_path.name}: no template at {template}")
+        template = find_template(aae_root, skill_id)
+        if not template:
+            print(f"[FAIL] {map_path.name}: no SKILL.template.md for '{skill_id}' "
+                  f"found under {aae_root / 'plugins'}/*/skills/")
             failures += 1
             continue
 
-        concrete_name = json.loads(map_path.read_text())['name']
-        out_path = SKILLS_OUT_DIR / concrete_name / 'SKILL.md'
+        binding = json.loads(map_path.read_text())
+        concrete_name = binding['name']
+        plugin = binding.get('plugin')
+        if not plugin:
+            print(f"[FAIL] {map_path.name}: no \"plugin\" field - which of this repo's "
+                  f"plugins does {concrete_name} belong to?")
+            failures += 1
+            continue
+        out_path = PLUGINS_DIR / plugin / 'skills' / concrete_name / 'SKILL.md'
 
         cmd = [sys.executable, str(generator), '--template', str(template),
                '--map', str(map_path), '--out', str(out_path)]

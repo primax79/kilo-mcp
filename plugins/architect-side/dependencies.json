@@ -3,7 +3,7 @@
   "dependencies": [
     {
       "repo": "https://github.com/primax79/ai-architect-executor",
-      "reason": "This plugin's skills are generated from that repo's SKILL.template.md sources plus this repo's own bindings/*.json - see scripts/regenerate_bound_skills.py.",
+      "reason": "mcp-orchestrator, mcp-metrics-analyst, and kilo-mcp-conflict-resolver are generated from that repo's SKILL.template.md sources plus this repo's own bindings/*.json - see scripts/regenerate_bound_skills.py.",
       "checked_by": "scripts/regenerate_bound_skills.py"
     },
     {

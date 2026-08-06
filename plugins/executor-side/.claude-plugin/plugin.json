@@ -1,0 +1,8 @@
+{
+  "name": "executor-side",
+  "version": "0.1.0",
+  "description": "Executor-side skills for Kilo when executing background tasks delegated over kilo-mcp: the headless-executor behavioral contract and the RAG explorer discipline. Install this on the Kilo side, not the orchestrating AI's side.",
+  "author": {
+    "name": "Alfredo Oliviero"
+  }
+}

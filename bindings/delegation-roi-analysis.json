@@ -1,6 +1,7 @@
 {
   "_comment": "Binding map for mcp-metrics-analyst from ai-architect-executor's generic template. Regenerate with scripts/regenerate_bound_skills.py.",
   "name": "mcp-metrics-analyst",
+  "plugin": "architect-side",
   "description": "Evaluate kilo-mcp delegation efficiency - ROI analysis via kilo_metrics (delegation_cost_usd vs inline_estimate_usd), defect-pattern review from kilo_log_issue, and feedback-loop proposals for better task specifications. Use when asked whether delegation to Kilo is paying off.",
   "tools": {},
   "blocks": {
@@ -9,7 +10,7 @@
     "defect_tracking": "Review issues recorded via `kilo_log_issue`. Group them by severity and category to identify patterns.",
     "cancelled_label": "Cancelled runs",
     "cancelled_runs": "a task stopped via `kilo_task_cancel` still logs a metrics record (Kilo's subprocess ran and consumed real tokens before being killed), typically with `outcome: unknown` since no Final Report was produced. A high rate of cancellations for a given kind of task is itself a signal worth surfacing \u2014 it usually means the spec needs tighter constraints or the task is a poor fit for delegation.",
-    "feedback_loop": "If recurring patterns are found (e.g., missed edge cases, styling mismatches, frequent cancellations), propose adding specific guardrails to future task specifications or creating target Kilo skills — see `task-spec-authoring` for how task-spec quality itself is the main lever on defect rate."
+    "feedback_loop": "If recurring patterns are found (e.g., missed edge cases, styling mismatches, frequent cancellations), propose adding specific guardrails to future task specifications or creating target Kilo skills \u2014 see `task-spec-authoring` for how task-spec quality itself is the main lever on defect rate."
   },
   "additions": {}
 }

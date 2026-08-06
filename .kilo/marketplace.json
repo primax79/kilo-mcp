@@ -4,29 +4,29 @@
   "version": "1.0.0",
   "plugins": [
     {
-      "name": "kilo-mcp-headless-executor",
-      "description": "Behavioral contract for Kilo when executing background tasks delegated via MCP",
-      "source": "./plugins/kilo-mcp/skills/kilo-mcp-headless-executor"
-    },
-    {
-      "name": "kilo-mcp-conflict-resolver",
-      "description": "Resolve merge conflicts in files produced by parallel Kilo tasks",
-      "source": "./plugins/kilo-mcp/skills/kilo-mcp-conflict-resolver"
-    },
-    {
-      "name": "kilo-mcp-rag-explorer",
-      "description": "Specialized skill for Kilo explore agent when running codebase semantic searches",
-      "source": "./plugins/kilo-mcp/skills/kilo-mcp-rag-explorer"
-    },
-    {
       "name": "mcp-orchestrator",
       "description": "Orchestrate Kilo through the kilo-mcp server",
-      "source": "./plugins/kilo-mcp/skills/mcp-orchestrator"
+      "source": "./plugins/architect-side/skills/mcp-orchestrator"
     },
     {
       "name": "mcp-metrics-analyst",
       "description": "Evaluate kilo-mcp delegation efficiency and ROI metrics",
-      "source": "./plugins/kilo-mcp/skills/mcp-metrics-analyst"
+      "source": "./plugins/architect-side/skills/mcp-metrics-analyst"
+    },
+    {
+      "name": "kilo-mcp-conflict-resolver",
+      "description": "Resolve merge conflicts in files produced by parallel Kilo tasks",
+      "source": "./plugins/architect-side/skills/kilo-mcp-conflict-resolver"
+    },
+    {
+      "name": "kilo-mcp-headless-executor",
+      "description": "Behavioral contract for Kilo when executing background tasks delegated via MCP",
+      "source": "./plugins/executor-side/skills/kilo-mcp-headless-executor"
+    },
+    {
+      "name": "kilo-mcp-rag-explorer",
+      "description": "Specialized skill for Kilo explore agent when running codebase semantic searches",
+      "source": "./plugins/executor-side/skills/kilo-mcp-rag-explorer"
     }
   ]
 }

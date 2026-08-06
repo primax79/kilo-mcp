@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 generate_skill_indices.py - Generates Kilo-compatible index.json files at:
-1. Plugin Level (e.g. plugins/kilo-mcp/index.json)
-2. Skills Directory Level (e.g. plugins/kilo-mcp/skills/index.json)
-3. Individual Skill Level (e.g. plugins/kilo-mcp/skills/mcp-orchestrator/index.json)
+1. Plugin Level (e.g. plugins/architect-side/index.json)
+2. Skills Directory Level (e.g. plugins/architect-side/skills/index.json)
+3. Individual Skill Level (e.g. plugins/architect-side/skills/mcp-orchestrator/index.json)
 
 Ensures all forms of Kilo 'skills.urls' inputs work seamlessly regardless of
 trailing path level (point it at any of the three, Kilo resolves the same set).
@@ -19,7 +19,8 @@ import sys
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PLUGIN_SKILL_MAPPINGS = [
-    ('plugins/kilo-mcp', 'skills'),
+    ('plugins/architect-side', 'skills'),
+    ('plugins/executor-side', 'skills'),
 ]
 
 PROFILES = {'deep-reasoning', 'orchestration', 'bulk-execution', 'exploration'}

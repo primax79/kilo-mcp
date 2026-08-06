@@ -1,6 +1,7 @@
 {
   "_comment": "Binding map for kilo-mcp-headless-executor from ai-architect-executor's generic template. Regenerate with scripts/regenerate_bound_skills.py.",
   "name": "kilo-mcp-headless-executor",
+  "plugin": "executor-side",
   "description": "Behavioral contract for Kilo when executing background tasks delegated by an orchestrating AI (e.g. Claude) through the kilo-mcp server - zero interactivity, focus_files contract, mandatory Final Report, fail fast.",
   "tools": {},
   "blocks": {

@@ -141,10 +141,16 @@ claude mcp get kilo-mcp
 
 ### Install Companion Skills
 
-Five Kilo-specific skills (`kilo-mcp-headless-executor`, `kilo-mcp-conflict-resolver`,
-`kilo-mcp-rag-explorer`, `mcp-orchestrator`, `mcp-metrics-analyst`) plus the
-`mcp-orchestrator-agent` subagent live under `plugins/kilo-mcp/` — the concrete
-Kilo binding of the generic [Architect/Executor pattern](https://github.com/primax79/ai-architect-executor).
+Two plugins, the concrete Kilo binding of the generic
+[Architect/Executor pattern](https://github.com/primax79/ai-architect-executor) —
+install the side(s) you need:
+
+- **`architect-side`**: `mcp-orchestrator`, `mcp-metrics-analyst`,
+  `kilo-mcp-conflict-resolver`, plus the `mcp-orchestrator-agent` subagent.
+  For the orchestrating AI delegating to Kilo via MCP.
+- **`executor-side`**: `kilo-mcp-headless-executor`, `kilo-mcp-rag-explorer`.
+  For the Kilo side.
+
 This repo is itself a Claude Code / Kilo Code plugin marketplace
 (`.claude-plugin/marketplace.json`), same mechanics as the sibling repos in
 this family — see [`agentic-coding-kit`'s docs](https://github.com/primax79/agentic-coding-kit/tree/main/docs)
@@ -152,33 +158,36 @@ for the full concepts/authoring/distribution reference if any of this is
 unfamiliar.
 
 **One real dependency worth knowing about**: `mcp-orchestrator` and
-`mcp-orchestrator-agent` assume the `task/` tree convention (`CONTEXT.md`,
-`00-INDEX.md`, `specs/`, `NN-<slug>/plan.md`) owned by
-[`agentic-coding-kit`](https://github.com/primax79/agentic-coding-kit)'s
+`mcp-orchestrator-agent` (both `architect-side`) assume the `task/` tree
+convention (`CONTEXT.md`, `00-INDEX.md`, `specs/`, `NN-<slug>/plan.md`)
+owned by [`agentic-coding-kit`](https://github.com/primax79/agentic-coding-kit)'s
 `macroplan-authoring` skill (`common-tools` plugin) — install that
 alongside this one if you delegate multi-step/multi-session work through
-macroplans. See `plugins/kilo-mcp/dependencies.json` for the machine-readable
-record (informational only — neither tool's installer enforces it today).
+macroplans. See `plugins/architect-side/dependencies.json` and
+`plugins/executor-side/dependencies.json` for the machine-readable record
+(informational only — neither tool's installer enforces it today).
 
 **Claude Code:**
 
 ```bash
 claude plugin marketplace add https://github.com/primax79/kilo-mcp.git
-/plugin install kilo-mcp
+/plugin install architect-side   # or executor-side, or both
 ```
 
 **Kilo Code**, either via `kilo-plugin-manager` (covers the agent too):
 
 ```bash
 python3 ~/.kilo/skills/kilo-plugin-manager/scripts/plugin_manager.py add https://github.com/primax79/kilo-mcp.git --name kilo-mcp
-python3 ~/.kilo/skills/kilo-plugin-manager/scripts/plugin_manager.py install kilo-mcp@kilo-mcp
+python3 ~/.kilo/skills/kilo-plugin-manager/scripts/plugin_manager.py install architect-side@kilo-mcp
 ```
 
 or Kilo's native Skill URLs (skills only, no extra tooling — paste into
-Settings UI **Local Config** or `.kilo/kilo.jsonc`'s `skills.urls`):
+Settings UI **Local Config** or `.kilo/kilo.jsonc`'s `skills.urls`, one URL
+per plugin):
 
 ```text
-https://raw.githubusercontent.com/primax79/kilo-mcp/main/plugins/kilo-mcp/skills/
+https://raw.githubusercontent.com/primax79/kilo-mcp/main/plugins/architect-side/skills/
+https://raw.githubusercontent.com/primax79/kilo-mcp/main/plugins/executor-side/skills/
 ```
 
 A legacy path also still works, copying the skills straight from this

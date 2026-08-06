@@ -61,7 +61,7 @@ uv run --no-project --with mcp python server.py --install-skills
 
 ### Step 2b: Orchestrator-Side Skills (optional)
 
-The repository also bundles two skills for **Claude / Orchestrators** under `.claude/skills/` (and under `plugins/kilo-mcp/skills/`): `mcp-orchestrator` (the 5-phase delegation workflow) and `mcp-metrics-analyst` (ROI and defect analysis). When using Claude Code, they are picked up automatically as project skills. To make them available globally in Claude Code, copy them to your global Claude skills directory:
+The repository also bundles two skills for **Claude / Orchestrators** under `.claude/skills/` (and under `plugins/architect-side/skills/`): `mcp-orchestrator` (the 5-phase delegation workflow) and `mcp-metrics-analyst` (ROI and defect analysis). When using Claude Code, they are picked up automatically as project skills. To make them available globally in Claude Code, copy them to your global Claude skills directory:
 
 ```bash
 cp -R .claude/skills/mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.claude/skills/
