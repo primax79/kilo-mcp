@@ -268,6 +268,39 @@ async def _kilo_server_respond_question(server_url: str, password: Optional[str]
         return False
 
 
+async def _kilo_server_fetch_session_events(server_url: str, password: Optional[str],
+                                            session_id: str, timeout_s: float = 3.0) -> list[dict]:
+    """Fetch recent live events (or SSE stream snapshot) for a session from `kilo serve` (`GET /event`).
+    Returns parsed event objects."""
+    import urllib.request
+
+    url = f"{server_url}/event"
+    req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
+    if password:
+        import base64
+        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+        req.add_header("Authorization", f"Basic {auth}")
+
+    events = []
+    try:
+        def _read_sse():
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                # Read initial buffer from SSE stream
+                data = resp.read(8192).decode("utf-8", errors="replace")
+                for line in data.splitlines():
+                    if line.startswith("data:"):
+                        try:
+                            ev = json.loads(line[5:].strip())
+                            if isinstance(ev, dict) and (not session_id or ev.get("sessionID") == session_id or ev.get("session_id") == session_id):
+                                events.append(ev)
+                        except Exception:
+                            continue
+        await asyncio.to_thread(_read_sse)
+    except Exception:
+        pass
+    return events
+
+
 def _write_db_todos(session_id: str, todos: list[dict]) -> bool:
     """Directly write/update todos for a session in Kilo's SQLite database (kilo.db)."""
     try:
