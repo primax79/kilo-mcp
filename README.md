@@ -315,6 +315,12 @@ Read the live plan and checklist (todo list) maintained by Kilo for a specific s
 
 **Parameters:** `session_id` *(required)*.
 
+### `kilo_update_session_todo`
+
+Create or update the checklist/todo list for a Kilo session. Allows an orchestrator architect to inject a structured plan or adjust steps mid-task.
+
+**Parameters:** `session_id` *(required)*, `todos` *(list of objects, required)*.
+
 ### `kilo_run_command`
 
 Execute a deterministic, pre-programmed Kilo custom command (e.g., `db-migrate`) via `kilo run --command <name>`; `args` is passed to the command as its message.

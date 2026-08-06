@@ -267,6 +267,30 @@ async def _kilo_server_respond_question(server_url: str, password: Optional[str]
     except Exception:
         return False
 
+
+def _write_db_todos(session_id: str, todos: list[dict]) -> bool:
+    """Directly write/update todos for a session in Kilo's SQLite database (kilo.db)."""
+    try:
+        con = sqlite3.connect(KILO_SESSION_DB, timeout=2)
+        with con:
+            con.execute("DELETE FROM todo WHERE session_id = ?", (session_id,))
+            for pos, item in enumerate(todos):
+                con.execute(
+                    "INSERT INTO todo (session_id, position, content, status, priority) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        pos,
+                        item.get("content", ""),
+                        item.get("status", "pending"),
+                        item.get("priority", "medium"),
+                    ),
+                )
+        con.close()
+        return True
+    except Exception:
+        return False
+
 # Grace period kilo_task_cancel waits after SIGTERM before escalating to
 # SIGKILL. Not user-configurable (an implementation detail); a module-level
 # constant so tests can shorten it.
@@ -2116,6 +2140,25 @@ async def kilo_get_session_todo(
     for t in todos:
         lines.append(f"- {mark.get(t['status'], '[?]')} ({t['priority']}) {t['content']}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def kilo_update_session_todo(
+    session_id: Annotated[str, Field(description="The session_id to update todos for")],
+    todos: Annotated[
+        list[dict],
+        Field(
+            description="List of todo items to set or update. Each item should have 'content' (str), "
+            "optional 'status' ('pending'|'in_progress'|'completed'), and optional 'priority' ('high'|'medium'|'low')."
+        ),
+    ],
+) -> str:
+    """Create or update the checklist/todo list for a Kilo session.
+    Allows an orchestrator architect to inject a structured plan or adjust steps mid-task."""
+    ok = _write_db_todos(session_id, todos)
+    if ok:
+        return f"Successfully updated {len(todos)} todo item(s) for session '{session_id}'."
+    return f"Failed to update todos for session '{session_id}' in DB."
 
 
 @mcp.tool()
