@@ -291,6 +291,30 @@ Creates a new isolated git worktree (with its own new branch) under `.kilo-workt
 
 Check the authentication status of Kilo providers (runs `kilo auth list`).
 
+### `kilo_session_revert`
+
+Revert a Kilo session back to a previous checkpoint or message (`message_id`), allowing the orchestrator to undo unintended edits or steps during task execution.
+
+**Parameters:** `session_id` *(required)*, `message_id` *(optional)*.
+
+### `kilo_session_fork`
+
+Fork an existing Kilo session at a specific checkpoint (`message_id`) to explore an alternative implementation path in parallel.
+
+**Parameters:** `session_id` *(required)*, `message_id` *(optional)*.
+
+### `kilo_respond_question`
+
+Respond to an interactive question/prompt request asked by Kilo during task execution, unblocking paused sessions.
+
+**Parameters:** `request_id` *(required)*, `answers` *(list of strings, required)*.
+
+### `kilo_get_session_todo`
+
+Read the live plan and checklist (todo list) maintained by Kilo for a specific session.
+
+**Parameters:** `session_id` *(required)*.
+
 ### `kilo_run_command`
 
 Execute a deterministic, pre-programmed Kilo custom command (e.g., `db-migrate`) via `kilo run --command <name>`; `args` is passed to the command as its message.
