@@ -151,6 +151,15 @@ this family — see [`agentic-coding-kit`'s docs](https://github.com/primax79/ag
 for the full concepts/authoring/distribution reference if any of this is
 unfamiliar.
 
+**One real dependency worth knowing about**: `mcp-orchestrator` and
+`mcp-orchestrator-agent` assume the `task/` tree convention (`CONTEXT.md`,
+`00-INDEX.md`, `specs/`, `NN-<slug>/plan.md`) owned by
+[`agentic-coding-kit`](https://github.com/primax79/agentic-coding-kit)'s
+`macroplan-authoring` skill (`common-tools` plugin) — install that
+alongside this one if you delegate multi-step/multi-session work through
+macroplans. See `plugins/kilo-mcp/dependencies.json` for the machine-readable
+record (informational only — neither tool's installer enforces it today).
+
 **Claude Code:**
 
 ```bash

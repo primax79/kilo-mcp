@@ -1,0 +1,16 @@
+{
+  "_comment": "Not a Claude Code/Kilo-native manifest - neither tool's plugin installer reads or enforces this. Same convention as skill-requirements.json: a separate, self-consistent file our own scripts can check, kept out of plugin.json to avoid depending on whether that schema tolerates unknown keys. The ai-architect-executor entry is already checked for real by scripts/regenerate_bound_skills.py (degrades to a warning, not a failure, when that checkout isn't found); the macroplan-authoring entry is documentation only for now - it lives in a third repo this one has no reason to assume is checked out.",
+  "dependencies": [
+    {
+      "repo": "https://github.com/primax79/ai-architect-executor",
+      "reason": "This plugin's skills are generated from that repo's SKILL.template.md sources plus this repo's own bindings/*.json - see scripts/regenerate_bound_skills.py.",
+      "checked_by": "scripts/regenerate_bound_skills.py"
+    },
+    {
+      "plugin": "common-tools",
+      "repo": "https://github.com/primax79/agentic-coding-kit",
+      "skill": "macroplan-authoring",
+      "reason": "mcp-orchestrator and mcp-orchestrator-agent reference the task/ tree convention (CONTEXT.md, 00-INDEX.md, specs/, NN-<slug>/plan.md, summary.md) that skill owns - inherited from ai-architect-executor's generic template and referenced directly in mcp-orchestrator-agent.md's bookkeeping step."
+    }
+  ]
+}
