@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from pydantic import Field
 
-# Create the MCP server
 # Server-level instructions are delivered to every MCP client at initialize
 # time, so directives here reach any connected assistant on install — no
 # per-user memory or prompt setup needed.
@@ -37,7 +36,17 @@ IMPORTANT — the indexing resource is yours to use directly: kilo_rag_search re
 - Call kilo_metrics to analyze ROI (delegation_cost_usd vs inline_estimate_usd).
 - Review kilo_log_issue defects to improve future specs."""
 
-mcp = FastMCP("KiloCode Server", instructions=_SERVER_INSTRUCTIONS)
+_SERVER_INSTRUCTIONS_RAG_ONLY = """kilo-mcp (RAG-Only Search Engine) exposes the local Kilo Code semantic codebase index.
+
+IMPORTANT — This server is running in READ-ONLY RAG mode. You can query the workspace's semantic index with kilo_rag_search for your own conceptual Q&A, codebase exploration, and location mapping. No execution or file modification tools are enabled on this server."""
+
+_IS_RAG_ONLY = (
+    "--rag-only" in sys.argv or
+    os.environ.get("KILO_MCP_RAG_ONLY", "").lower() in ("1", "true", "yes")
+)
+
+_active_instructions = _SERVER_INSTRUCTIONS_RAG_ONLY if _IS_RAG_ONLY else _SERVER_INSTRUCTIONS
+mcp = FastMCP("KiloCode Server" if not _IS_RAG_ONLY else "KiloCode RAG Server", instructions=_active_instructions)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -2491,6 +2500,20 @@ async def kilo_task_status(
     if not report:
         return f"No `kilo run` process found for workspace {working_directory}."
     return "# Running Kilo tasks\n\n" + "\n\n".join(report)
+
+
+# Helper: unexport write/execution tools when running in --rag-only mode
+if _IS_RAG_ONLY:
+    _WRITE_TOOLS = {
+        "kilo_implement", "kilo_task_result", "kilo_task_progress", "kilo_task_cancel",
+        "kilo_log_issue", "kilo_metrics", "kilo_create_worktree", "kilo_session_revert",
+        "kilo_session_fork", "kilo_respond_question", "kilo_get_session_todo",
+        "kilo_update_session_todo", "kilo_run_command", "kilo_workspace_status", "kilo_task_status"
+    }
+    mcp._tool_manager._tools = {
+        k: v for k, v in mcp._tool_manager._tools.items()
+        if k not in _WRITE_TOOLS
+    }
 
 
 def install_skills():
