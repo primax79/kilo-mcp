@@ -13,6 +13,7 @@ Ported from gcube-ai-toolkit/scripts/generate_skill_indices.py, same format.
 
 import os
 import json
+import subprocess
 import sys
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -125,7 +126,27 @@ def generate_indices():
 
     print(f"Generated {plugin_level_count} plugin-level, {skills_dir_count} skills-dir-level, and {single_skill_count} individual skill index.json files!")
 
+def check_binding_drift():
+    """Every bound skill (SKILL.md generated from ai-architect-executor's
+    template + this repo's own bindings/*.json) must match its source —
+    see regenerate_bound_skills.py. Skipped with a warning, not a failure,
+    when the ai-architect-executor sibling checkout isn't available (exit
+    code 2 = setup/environment issue, not drift) — this repo must still
+    work standalone for anyone who doesn't have that checkout locally."""
+    script = os.path.join(ROOT_DIR, 'scripts', 'regenerate_bound_skills.py')
+    if not os.path.isfile(script):
+        return True
+    result = subprocess.run([sys.executable, script, '--check'])
+    if result.returncode == 2:
+        print("[warn] skipped binding-drift check: ai-architect-executor checkout not found "
+              "(pass --ai-architect-executor or set $AI_ARCHITECT_EXECUTOR_PATH to enable it)")
+        return True
+    return result.returncode == 0
+
+
 if __name__ == "__main__":
     generate_indices()
-    if not validate_skill_requirements():
+    ok = validate_skill_requirements()
+    ok = check_binding_drift() and ok
+    if not ok:
         sys.exit(1)

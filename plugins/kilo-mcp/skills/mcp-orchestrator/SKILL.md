@@ -2,6 +2,7 @@
 name: mcp-orchestrator
 description: Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, and defect telemetry. Use when coordinating development work through the kilo-mcp tools.
 ---
+<!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
 
 # mcp-orchestrator
 
@@ -9,23 +10,22 @@ This skill is designed for an Orchestrating AI (e.g. Claude, Kilo, Roo Code) to 
 
 ## Role discipline: delegate, don't implement
 
-You are the architect/orchestrator, not the implementer. When a task is scoped
-for delegation (a plan/macroplan task, or any request to "implement X" that
-this skill's description matches), implementation work goes through
-`kilo_implement` — not your own `Edit`/`Write` tools. This holds even when a
-task looks small or fast to do yourself; "it's simple, I'll just do it" is
-exactly how delegation gets silently skipped. If `kilo_implement` is
-unavailable or fails, stop and say so instead of implementing in its place —
-don't silently fall back to doing the work yourself.
+You are the architect/orchestrator, not the implementer. When a task is
+scoped for delegation (a plan/macroplan task, or any request to "implement
+X" that this skill's description matches), implementation work goes
+through `kilo_implement` — not your own `Edit`/`Write` tools. This holds
+even when a task looks small or fast to do yourself; "it's simple, I'll
+just do it" is exactly how delegation gets silently skipped. If `kilo_implement`
+is unavailable or fails, stop and say so instead of implementing in its
+place — don't silently fall back to doing the work yourself.
 
 The one exception is **verification-phase minor fixes**: while reviewing a
 Final Report (Phase 5 below), you may correct a small, obvious issue
 yourself directly in Kilo's worktree — a typo, a wrong import, a
 misnamed variable — without a full round-trip. Anything bigger than a
 handful of lines, or that touches actual logic, goes back to Kilo via
-`kilo_implement(continue_session_id=..., task_instructions="<corrective
-instructions>")`, not a direct edit. When in doubt, delegate rather than
-fix it yourself.
+`kilo_implement(continue_session_id=..., task_instructions="<corrective instructions>")`, not a direct edit. When
+in doubt, delegate rather than fix it yourself.
 
 ## Logic and Behavior
 
@@ -43,14 +43,25 @@ fix it yourself.
   - **If a task drifts off-spec or looks stuck:** `kilo_task_cancel` stops it (hard kill by tracked PID, no graceful in-session abort). Review `kilo_workspace_status` for partial changes, then either revert or continue with a corrective `kilo_implement` call using `continue_session_id` — Kilo resumes the SAME session with full memory of what it already built, instead of starting blind.
   - **Don't go idle after dispatching — check back proactively, don't wait to be asked.** `kilo_implement` returning a `task_id` immediately means control comes back to you well before the work is done; if you just end your turn there, nothing polls the task until the user happens to ask "how's it going?" — observed live: a task that had already completed sat unreported until the user prompted a check. If your host exposes a self-scheduled wakeup (e.g. Claude Code's `ScheduleWakeup`), use it to check `kilo_task_progress`/`kilo_task_result` again after a delay sized to the task (don't poll every few seconds — that's wasted cycles for a multi-minute build; a longer interval, or a couple of spaced checks, is enough). If no such mechanism exists in your host, at minimum say explicitly in your response that the task is still running and how the user can check on it themselves, instead of implying you'll follow up when you have no way to.
   - Ready-to-invoke scripts for the manual/no-task-id case live in `scripts/` (see below) — use them instead of re-deriving the pgrep/ps/lsof/sqlite3 diagnostic pipeline from scratch each session.
-- **Phase 5 — Verification & Review: NEVER trust the Final Report alone.** Inspect results with `kilo_workspace_status`, then actually **execute** what was built — reading the report or the diff is not verification, it's a summary. Across real delegation rounds, deviations that never surfaced from the report alone only showed up by running the code: a file committed that should have been gitignored, a cited source path that didn't exist anywhere in the codebase (invented for plausibility), a citation pointing at the right method but the wrong line, DB column types guessed from convention instead of read from the real DDL already available. Calibrate to what was built:
+- **Phase 5 — Verification & Review: NEVER trust the Final Report alone.**
+  Inspect results with `kilo_workspace_status`, then actually **execute** what was built — reading the report or the diff is not verification, it's a summary. Across real delegation rounds, deviations that never surfaced from the report alone only showed up by running the code: a file committed that should have been gitignored, a cited source path that didn't exist anywhere in the codebase (invented for plausibility), a citation pointing at the right method but the wrong line, DB column types guessed from convention instead of read from the real DDL already available. Calibrate to what was built:
   - **Backend**: actually start the app against a real seeded database, don't just read the JPA annotations — a schema validation mode that passes silently is much stronger evidence than a visual read. Hit the endpoints with real `curl` calls (200/401/etc.), don't assume them from the controller code.
   - **Frontend**: actually run the build and test suite (headless browser if needed), don't stop at reading the `.ts` files.
   - **Schema/data**: if a file is claimed "copied verbatim" from a source, `diff` it for real against that source — don't trust the claim.
   - **Infra**: if there's a `docker-compose.yml`, actually bring it up, wait for the healthcheck, and query the resulting service/DB for real.
   - See the `kilo-task-delegation` skill for calibrating verification depth to task risk in more detail.
-- **Phase 6 — Closure & Telemetry:** If defects are found, log them with `kilo_log_issue` (vital for continuous prompt/specification tuning) and request Kilo to fix them.
-  - **Merging: always checkout the target branch explicitly first.** Running `git merge --no-ff <feature-branch> -m "..." <target>` without checking out `<target>` first is a real, observed mistake — the trailing `<target>` argument gets interpreted as another branch to merge IN, not as the destination, so the merge silently lands on whatever branch you happened to be on. Correct sequence, every time: `git status --short` (clean) → `git checkout <target>` (explicit, never implicit) → `git merge --no-ff <feature-branch> -m "..."` → `git log --oneline --graph -6` (confirm the merge landed where intended). Remove the worktree once merged and no longer needed (`git worktree remove <path>`).
+- **Phase 6 — Closure & Telemetry:** If defects are found, log them with `kilo_log_issue` (vital for continuous prompt/specification tuning — see `mcp-metrics-analyst`) and request Kilo to fix them.
+  - **Merging: always checkout the target branch explicitly first.**
+    Running `git merge --no-ff <feature-branch> -m "..." <target>` without
+    checking out `<target>` first is a real, observed mistake — the
+    trailing `<target>` argument gets interpreted as another branch to
+    merge IN, not as the destination, so the merge silently lands on
+    whatever branch you happened to be on. Correct sequence, every time:
+    `git status --short` (clean) → `git checkout <target>` (explicit,
+    never implicit) → `git merge --no-ff <feature-branch> -m "..."` →
+    `git log --oneline --graph -6` (confirm the merge landed where
+    intended). Remove the worktree once merged and no longer needed
+    (`git worktree remove <path>`).
 
 Remember: the RAG index behind `kilo_rag_search` is a standing resource for your own exploration and Q&A too — use it even when you are not delegating anything.
 

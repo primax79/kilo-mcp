@@ -2,6 +2,7 @@
 name: mcp-metrics-analyst
 description: Evaluate kilo-mcp delegation efficiency - ROI analysis via kilo_metrics (delegation_cost_usd vs inline_estimate_usd), defect-pattern review from kilo_log_issue, and feedback-loop proposals for better task specifications. Use when asked whether delegation to Kilo is paying off.
 ---
+<!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
 
 # mcp-metrics-analyst
 

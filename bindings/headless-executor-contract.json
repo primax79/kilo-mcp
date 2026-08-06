@@ -1,0 +1,12 @@
+{
+  "_comment": "Binding map for kilo-mcp-headless-executor from ai-architect-executor's generic template. Regenerate with scripts/regenerate_bound_skills.py.",
+  "name": "kilo-mcp-headless-executor",
+  "description": "Behavioral contract for Kilo when executing background tasks delegated by an orchestrating AI (e.g. Claude) through the kilo-mcp server - zero interactivity, focus_files contract, mandatory Final Report, fail fast.",
+  "tools": {},
+  "blocks": {
+    "audience": "Kilo executes background tasks on behalf of an orchestrating AI such as Claude via the Kilo MCP server",
+    "zero_interactivity": "You are running in the background through an MCP server controlled by an orchestrating AI (e.g. Claude, Kilo, Roo Code). Do not ask the user questions. Do not offer choices. Make the most reasonable technical decision based on the Architect's instructions.",
+    "parsed_by": "parsed by the MCP server"
+  },
+  "additions": {}
+}
