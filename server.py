@@ -119,6 +119,36 @@ def _discover_active_kilo_server() -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+async def _kilo_server_create_session(server_url: str, password: Optional[str],
+                                    title: Optional[str] = None) -> Optional[str]:
+    """Create a new session directly on a running `kilo serve` instance
+    via `POST /session` or `/experimental/session`. Returns the created session_id."""
+    import urllib.request
+    import urllib.error
+
+    url = f"{server_url}/session"
+    payload = {}
+    if title:
+        payload["title"] = title
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    if password:
+        import base64
+        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+        req.add_header("Authorization", f"Basic {auth}")
+
+    try:
+        def _do_req():
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in (200, 201):
+                    res_data = json.loads(resp.read().decode("utf-8"))
+                    return res_data.get("id") or res_data.get("sessionID")
+                return None
+        return await asyncio.to_thread(_do_req)
+    except Exception:
+        return None
+
+
 async def _kilo_server_prompt_async(server_url: str, password: Optional[str],
                                     session_id: str, prompt_text: str) -> bool:
     """Send a prompt instruction directly to a running `kilo serve` session
@@ -926,9 +956,17 @@ async def kilo_implement(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
         f.write(full_content)
         prompt_file = f.name
+    # If connected to an active kilo serve instance, attempt immediate session creation via REST API
+    server_session_id = continue_session_id
+    srv_url, srv_pass = _discover_active_kilo_server()
+    if srv_url and not server_session_id:
+        created_sid = await _kilo_server_create_session(srv_url, srv_pass, title=f"MCP Task {run_id}")
+        if created_sid:
+            server_session_id = created_sid
+
     cmd = ["kilo", "run"]
-    if continue_session_id:
-        cmd.extend(["--session", continue_session_id])
+    if server_session_id:
+        cmd.extend(["--session", server_session_id])
     if agent:
         cmd.extend(["--agent", agent])
     if model:
@@ -957,16 +995,14 @@ async def kilo_implement(
         "pid": pid,
         "log_path": log_path,
         "prompt_file": prompt_file,
-        # Continuing a known session: record it up front so kilo_task_progress
-        # doesn't need to guess it from kilo.db (guessing would be ambiguous —
-        # the session's time_created predates this task's start).
-        "session_id": continue_session_id,
+        # Continuing or created session_id: record it up front so kilo_task_progress
+        # finds it immediately from the first millisecond.
+        "session_id": server_session_id,
     })
-    if continue_session_id:
-        _agent_manager_note_session(cwd, continue_session_id, agent_manager_worktree_id)
+    if server_session_id:
+        _agent_manager_note_session(cwd, server_session_id, agent_manager_worktree_id)
     else:
-        # Schedule lazy session linking so new background sessions immediately link
-        # to agent-manager.json and appear in VS Code's Agent Manager UI without delay.
+        # Schedule lazy session linking fallback if session creation via REST wasn't available
         try:
             loop = asyncio.get_running_loop()
             async def _lazy_link():
@@ -2040,7 +2076,7 @@ def _find_session_for_task(cwd: str, started_iso: str) -> Optional[str]:
     main repo root — see below) at or after a task's start time. Kilo creates
     the session row within ~1s of `kilo run` starting, well before any
     assistant output exists, so this is reliable even for a task that has
-    barely begun. A 5s buffer absorbs clock skew between this server's wall
+    barely begun. A 15s buffer absorbs clock skew between this server's wall
     clock and Kilo's own timestamps.
 
     Kilo records a session's `project.worktree` as the MAIN repository root,
@@ -2071,7 +2107,7 @@ def _find_session_for_task(cwd: str, started_iso: str) -> Optional[str]:
             "SELECT s.id, p.worktree FROM session s "
             "JOIN project p ON s.project_id = p.id "
             "WHERE s.time_created >= ? ORDER BY s.time_created ASC LIMIT 50",
-            (started_ms - 5000,),
+            (started_ms - 15000,),
         ).fetchall()
         con.close()
     except Exception:
