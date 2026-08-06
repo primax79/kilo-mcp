@@ -13,12 +13,55 @@ Ported from gcube-ai-toolkit/scripts/generate_skill_indices.py, same format.
 
 import os
 import json
+import sys
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PLUGIN_SKILL_MAPPINGS = [
     ('plugins/kilo-mcp', 'skills'),
 ]
+
+PROFILES = {'deep-reasoning', 'orchestration', 'bulk-execution', 'exploration'}
+
+
+def validate_skill_requirements():
+    """Kit-internal half of role validation (see ai-architect-executor's
+    interactive-role-setup/SKILL.md): every skill declares a valid profile,
+    none declares a model. Self-contained per repo on purpose — this generator
+    is already a per-repo ported copy, and a cross-repo import would break for
+    anyone installing this plugin standalone.
+    """
+    ok = True
+    for rel_plugin_dir, skills_sub in PLUGIN_SKILL_MAPPINGS:
+        plugin_dir = os.path.join(ROOT_DIR, rel_plugin_dir)
+        skills_dir = os.path.join(plugin_dir, skills_sub)
+        if not os.path.isdir(skills_dir):
+            continue
+        req_path = os.path.join(plugin_dir, 'skill-requirements.json')
+        requirements = {}
+        if os.path.isfile(req_path):
+            with open(req_path, encoding='utf-8') as f:
+                requirements = json.load(f)
+        for skill_name in sorted(os.listdir(skills_dir)):
+            skill_md = os.path.join(skills_dir, skill_name, 'SKILL.md')
+            if not os.path.isfile(skill_md):
+                continue
+            entry = requirements.get(skill_name)
+            if entry is None:
+                print(f"[roles] FAIL: '{skill_name}' has no skill-requirements.json entry")
+                ok = False
+                continue
+            if entry.get('profile') not in PROFILES:
+                print(f"[roles] FAIL: '{skill_name}' has invalid profile {entry.get('profile')!r}")
+                ok = False
+            if not entry.get('reason', '').strip():
+                print(f"[roles] FAIL: '{skill_name}' skill-requirements.json entry has no reason")
+                ok = False
+            if 'model' in entry:
+                print(f"[roles] FAIL: '{skill_name}' skill-requirements.json declares a model — "
+                      f"profiles only, never a model")
+                ok = False
+    return ok
 
 def generate_indices():
     plugin_level_count = 0
@@ -84,3 +127,5 @@ def generate_indices():
 
 if __name__ == "__main__":
     generate_indices()
+    if not validate_skill_requirements():
+        sys.exit(1)

@@ -1,0 +1,22 @@
+{
+  "kilo-mcp-conflict-resolver": {
+    "profile": "deep-reasoning",
+    "reason": "Same class as the generic conflict-resolver: a merge decision travestied as syntax reconciliation, no test catches a wrong call."
+  },
+  "kilo-mcp-headless-executor": {
+    "profile": "bulk-execution",
+    "reason": "Behavioral contract for Kilo running as the Executor over kilo-mcp — governs the high-volume, spec-driven implementation side."
+  },
+  "kilo-mcp-rag-explorer": {
+    "profile": "exploration",
+    "reason": "Read-only semantic search over the codebase index — high volume, low judgment, errors are immediately visible as an irrelevant result."
+  },
+  "mcp-metrics-analyst": {
+    "profile": "deep-reasoning",
+    "reason": "ROI analysis and defect-pattern review that feeds back into task-spec policy — a wrong conclusion has no downstream check."
+  },
+  "mcp-orchestrator": {
+    "profile": "orchestration",
+    "reason": "Discovery, isolation, dispatch to kilo_implement, polling, verification, bookkeeping — errors are loud and immediate (a stuck or failed task)."
+  }
+}
