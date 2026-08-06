@@ -87,15 +87,41 @@ async def run_mcp_tests(server_script: str):
                 # 7. Test 5: Controllo Avanzamento Task
                 print("\n--------------------------------------------------")
                 print(f"🧪 Test 5: Polling di `kilo_task_progress` per task_id: {task_id}")
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
                 res_prog = await session.call_tool(
                     "kilo_task_progress",
                     {"task_id": task_id},
                 )
                 print(f"Avanzamento:\n{res_prog.content[0].text}")
 
+            # 8. Test 6: Iniezione e aggiornamento TODO via MCP (`kilo_update_session_todo`)
+            test_session_id = "ses_mcp_test_demo_123"
             print("\n--------------------------------------------------")
-            print("🎉 Test completati!")
+            print(f"🧪 Test 6: Aggiornamento dei TODO per sessione mock '{test_session_id}'")
+            res_todo_update = await session.call_tool(
+                "kilo_update_session_todo",
+                {
+                    "session_id": test_session_id,
+                    "todos": [
+                        {"content": "Passaggio 1: Analizzare la spec", "status": "completed", "priority": "high"},
+                        {"content": "Passaggio 2: Scrivere il codice", "status": "in_progress", "priority": "high"},
+                        {"content": "Passaggio 3: Eseguire i test", "status": "pending", "priority": "medium"},
+                    ],
+                },
+            )
+            print(f"Risultato aggiornamento:\n{res_todo_update.content[0].text}")
+
+            # 9. Test 7: Lettura TODO via MCP (`kilo_get_session_todo`)
+            print("\n--------------------------------------------------")
+            print(f"🧪 Test 7: Lettura TODO per sessione '{test_session_id}'")
+            res_todo_get = await session.call_tool(
+                "kilo_get_session_todo",
+                {"session_id": test_session_id},
+            )
+            print(f"Checklist letta:\n{res_todo_get.content[0].text}")
+
+            print("\n--------------------------------------------------")
+            print("🎉 Tutti i test end-to-end completati con successo!")
 
 
 if __name__ == "__main__":

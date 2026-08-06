@@ -304,19 +304,24 @@ async def _kilo_server_fetch_session_events(server_url: str, password: Optional[
 def _write_db_todos(session_id: str, todos: list[dict]) -> bool:
     """Directly write/update todos for a session in Kilo's SQLite database (kilo.db)."""
     try:
+        os.makedirs(os.path.dirname(KILO_SESSION_DB), exist_ok=True)
+        now_ms = int(time.time() * 1000)
         con = sqlite3.connect(KILO_SESSION_DB, timeout=2)
         with con:
+            con.execute("PRAGMA foreign_keys = OFF")
             con.execute("DELETE FROM todo WHERE session_id = ?", (session_id,))
             for pos, item in enumerate(todos):
                 con.execute(
-                    "INSERT INTO todo (session_id, position, content, status, priority) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO todo (session_id, position, content, status, priority, time_created, time_updated) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         session_id,
                         pos,
                         item.get("content", ""),
                         item.get("status", "pending"),
                         item.get("priority", "medium"),
+                        now_ms,
+                        now_ms,
                     ),
                 )
         con.close()
@@ -2188,6 +2193,28 @@ async def kilo_update_session_todo(
 ) -> str:
     """Create or update the checklist/todo list for a Kilo session.
     Allows an orchestrator architect to inject a structured plan or adjust steps mid-task."""
+    # Attempt REST API todo update if server is active
+    srv_url, password = _discover_active_kilo_server()
+    if srv_url:
+        import urllib.request
+        url = f"{srv_url}/session/{session_id}/todo"
+        data = json.dumps({"todos": todos}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        if password:
+            import base64
+            auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+            req.add_header("Authorization", f"Basic {auth}")
+        try:
+            def _do_req():
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return resp.status in (200, 201, 202, 204)
+            ok_rest = await asyncio.to_thread(_do_req)
+            if ok_rest:
+                return f"Successfully updated {len(todos)} todo item(s) for session '{session_id}' via Server API."
+        except Exception:
+            pass
+
+    # Fallback: direct SQLite write
     ok = _write_db_todos(session_id, todos)
     if ok:
         return f"Successfully updated {len(todos)} todo item(s) for session '{session_id}'."
