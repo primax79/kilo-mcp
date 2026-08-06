@@ -161,6 +161,27 @@ test_server.py
     assert res3["outcome"] is None
     assert res3["files_changed"] == []
 
+    # Wordier phrasing between the label and the value - the previous
+    # \W{0,6} pattern required the gap to be *only* non-word characters and
+    # missed this outright (root cause of a real outcome=None on a clean
+    # process exit, seen in production telemetry with no captured example
+    # text to reproduce exactly - these are plausible variants of the same
+    # failure mode, not the literal report).
+    report5 = "Outcome, in the end, was a success after all.\nFiles changed: src/x.py"
+    res5 = server._parse_final_report(report5)
+    assert res5["outcome"] == "success"
+
+    report6 = "**Outcome (final status)**: failed - see below\nFiles changed: none"
+    res6 = server._parse_final_report(report6)
+    assert res6["outcome"] == "failed"
+
+    # Must not match across lines - a later, unrelated "success" many lines
+    # down must not get attributed to an "Outcome" label near the top with
+    # nothing conclusive right after it.
+    report7 = "Outcome: \nFiles changed: none\n" + ("filler\n" * 5) + "the deploy was a success"
+    res7 = server._parse_final_report(report7)
+    assert res7["outcome"] is None
+
 # ==============================================================================
 # 3. _measure_files
 # ==============================================================================

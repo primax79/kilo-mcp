@@ -215,7 +215,13 @@ def _append_jsonl(path: str, record: dict) -> None:
 def _parse_final_report(stdout: str) -> dict:
     """Extract outcome and changed-file list from Kilo's Final Report."""
     outcome = None
-    m = re.search(r"Outcome\W{0,6}(success|partial|failed)", stdout, re.IGNORECASE)
+    # Same line only (bounded by [^\n]), but tolerant of whatever sits between
+    # the "Outcome" label and its value - annotations, extra words, a second
+    # label like "(final status)". \W{0,6} previously required the gap to be
+    # *only* non-word characters, so anything wordier ("Outcome, in the end,
+    # was a success") missed entirely; confirmed against real telemetry where
+    # a clean process exit (exit_code 0, real output) still left outcome=None.
+    m = re.search(r"Outcome[^\n]{0,40}?\b(success|partial|failed)\b", stdout, re.IGNORECASE)
     if m:
         outcome = m.group(1).lower()
     files: list[str] = []
