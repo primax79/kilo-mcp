@@ -195,6 +195,78 @@ async def _kilo_server_stop_session(server_url: str, password: Optional[str],
     except Exception:
         return False
 
+
+async def _kilo_server_revert_session(server_url: str, password: Optional[str],
+                                      session_id: str, message_id: Optional[str] = None) -> bool:
+    """Revert a session to a previous state via `POST /session/:sessionID/revert`."""
+    import urllib.request
+
+    url = f"{server_url}/session/{session_id}/revert"
+    payload = {"messageID": message_id} if message_id else {}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    if password:
+        import base64
+        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+        req.add_header("Authorization", f"Basic {auth}")
+
+    try:
+        def _do_req():
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status in (200, 201, 202, 204)
+        return await asyncio.to_thread(_do_req)
+    except Exception:
+        return False
+
+
+async def _kilo_server_fork_session(server_url: str, password: Optional[str],
+                                    session_id: str, message_id: Optional[str] = None) -> Optional[str]:
+    """Fork a session via `POST /session/:sessionID/fork`. Returns the new session_id."""
+    import urllib.request
+
+    url = f"{server_url}/session/{session_id}/fork"
+    payload = {"messageID": message_id} if message_id else {}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    if password:
+        import base64
+        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+        req.add_header("Authorization", f"Basic {auth}")
+
+    try:
+        def _do_req():
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in (200, 201):
+                    res_data = json.loads(resp.read().decode("utf-8"))
+                    return res_data.get("id") or res_data.get("sessionID")
+                return None
+        return await asyncio.to_thread(_do_req)
+    except Exception:
+        return None
+
+
+async def _kilo_server_respond_question(server_url: str, password: Optional[str],
+                                         request_id: str, answers: list[str]) -> bool:
+    """Respond to an interactive question/prompt request via `POST /question/:requestID`."""
+    import urllib.request
+
+    url = f"{server_url}/question/{request_id}"
+    payload = {"answers": answers}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    if password:
+        import base64
+        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+        req.add_header("Authorization", f"Basic {auth}")
+
+    try:
+        def _do_req():
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status in (200, 201, 202, 204)
+        return await asyncio.to_thread(_do_req)
+    except Exception:
+        return False
+
 # Grace period kilo_task_cancel waits after SIGTERM before escalating to
 # SIGKILL. Not user-configurable (an implementation detail); a module-level
 # constant so tests can shorten it.
@@ -1983,6 +2055,67 @@ async def kilo_auth_status() -> str:
     """Check the authentication status of Kilo providers by running 'kilo auth list'."""
     returncode, stdout, stderr = await _run_kilo(["kilo", "auth", "list"], cwd=os.getcwd(), env=os.environ.copy())
     return f"Auth Status (exit code {returncode}):\n{stdout}\n{stderr}"
+
+
+@mcp.tool()
+async def kilo_session_revert(
+    session_id: Annotated[str, Field(description="The session_id of the Kilo session to revert")],
+    message_id: Annotated[Optional[str], Field(description="Optional target message_id to revert back to")] = None,
+) -> str:
+    """Revert a Kilo session back to a previous message/checkpoint.
+    Allows the orchestrator to undo changes or steps if Kilo took a wrong path."""
+    srv_url, password = _discover_active_kilo_server()
+    if not srv_url:
+        return "Error: No active `kilo serve` instance discovered for session revert."
+    ok = await _kilo_server_revert_session(srv_url, password, session_id, message_id)
+    if ok:
+        return f"Successfully reverted session '{session_id}'" + (f" to message '{message_id}'" if message_id else "") + "."
+    return f"Failed to revert session '{session_id}' via Kilo Server API."
+
+
+@mcp.tool()
+async def kilo_session_fork(
+    session_id: Annotated[str, Field(description="The session_id of the Kilo session to fork")],
+    message_id: Annotated[Optional[str], Field(description="Optional message_id to branch/fork from")] = None,
+) -> str:
+    """Fork an existing Kilo session at a specific checkpoint to explore an alternative implementation path in parallel."""
+    srv_url, password = _discover_active_kilo_server()
+    if not srv_url:
+        return "Error: No active `kilo serve` instance discovered for session fork."
+    new_sid = await _kilo_server_fork_session(srv_url, password, session_id, message_id)
+    if new_sid:
+        return f"Successfully forked session '{session_id}'. New forked session_id: {new_sid}"
+    return f"Failed to fork session '{session_id}' via Kilo Server API."
+
+
+@mcp.tool()
+async def kilo_respond_question(
+    request_id: Annotated[str, Field(description="The question requestID prompted by Kilo")],
+    answers: Annotated[list[str], Field(description="List of selected answer labels or text responses")],
+) -> str:
+    """Respond to an interactive question asked by Kilo during task execution, unblocking the session."""
+    srv_url, password = _discover_active_kilo_server()
+    if not srv_url:
+        return "Error: No active `kilo serve` instance discovered to answer question."
+    ok = await _kilo_server_respond_question(srv_url, password, request_id, answers)
+    if ok:
+        return f"Successfully submitted answer(s) for question request '{request_id}'."
+    return f"Failed to respond to question '{request_id}' via Kilo Server API."
+
+
+@mcp.tool()
+async def kilo_get_session_todo(
+    session_id: Annotated[str, Field(description="The session_id to read todos/plan for")],
+) -> str:
+    """Read the live plan and checklist (todo list) maintained by Kilo for a specific session."""
+    todos = _read_todos(session_id)
+    if not todos:
+        return f"No todo items recorded for session '{session_id}'."
+    mark = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+    lines = [f"# Todo list for session {session_id}"]
+    for t in todos:
+        lines.append(f"- {mark.get(t['status'], '[?]')} ({t['priority']}) {t['content']}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
