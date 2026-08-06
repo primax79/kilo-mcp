@@ -49,7 +49,7 @@ in doubt, delegate rather than fix it yourself.
   - **Frontend**: actually run the build and test suite (headless browser if needed), don't stop at reading the `.ts` files.
   - **Schema/data**: if a file is claimed "copied verbatim" from a source, `diff` it for real against that source — don't trust the claim.
   - **Infra**: if there's a `docker-compose.yml`, actually bring it up, wait for the healthcheck, and query the resulting service/DB for real.
-  - See the `kilo-task-delegation` skill for calibrating verification depth to task risk in more detail.
+  - See the `task-spec-authoring` skill for calibrating verification depth to task risk in more detail.
 - **Phase 6 — Closure & Telemetry:** If defects are found, log them with `kilo_log_issue` (vital for continuous prompt/specification tuning — see `mcp-metrics-analyst`) and request Kilo to fix them.
   - **Merging: always checkout the target branch explicitly first.**
     Running `git merge --no-ff <feature-branch> -m "..." <target>` without
