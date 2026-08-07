@@ -1,6 +1,6 @@
 ---
 name: kilo-mcp-rag-explorer
-description: Specialized skill for Kilo's explore agent when running codebase semantic searches. Optimizes index lookups, file summaries, and ensures read-only safety.
+description: "Specialized skill for Kilo's explore agent when running codebase semantic searches. Optimizes index lookups, file summaries, and ensures read-only safety."
 ---
 
 # kilo-mcp-rag-explorer
