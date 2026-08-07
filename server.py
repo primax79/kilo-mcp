@@ -2,6 +2,7 @@ from mcp.server.fastmcp import FastMCP
 import asyncio
 import fcntl
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,15 @@ import glob
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from pydantic import Field
+
+# stderr only: stdout is the MCP JSON-RPC framing channel for a stdio server,
+# so anything written there would corrupt the protocol stream.
+logger = logging.getLogger("kilo-mcp")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s [kilo-mcp] %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
 
 # Server-level instructions are delivered to every MCP client at initialize
 # time, so directives here reach any connected assistant on install — no
@@ -108,215 +118,297 @@ KILO_SERVER_URL = _cfg("KILO_SERVER_URL", "kilo", "server_url", "")
 KILO_SERVER_PASSWORD = _cfg("KILO_SERVER_PASSWORD", "kilo", "server_password", "")
 
 
-def _discover_active_kilo_server() -> tuple[Optional[str], Optional[str]]:
-    """Discover a running `kilo serve` instance on this machine by inspecting
-    running processes or environment variables. Returns (url, password)."""
+def _resolve_kilo_server_port(pid: str) -> Optional[str]:
+    """Resolve the real listening TCP port for a `kilo serve --port 0` process,
+    where the OS assigns an ephemeral port that `ps aux` cannot show."""
+    try:
+        res = subprocess.run(["lsof", "-Pan", "-p", pid, "-i", "tcp"],
+                              capture_output=True, text=True, timeout=5)
+    except Exception:
+        logger.warning("lsof port resolution failed for kilo serve pid=%s", pid, exc_info=True)
+        return None
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        if "LISTEN" not in line:
+            continue
+        m = re.search(r":(\d+)\s*\(LISTEN\)", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _list_active_kilo_servers() -> list[tuple[str, Optional[str]]]:
+    """Enumerate every running `kilo serve` instance on this machine. There can
+    be more than one at a time — observed in practice as one per open VS Code
+    window — and each is its own daemon with its own in-memory session state
+    even though they all persist to the same shared `kilo.db`. Returns a list
+    of (url, password), in `ps aux` order."""
     if KILO_SERVER_URL:
-        return KILO_SERVER_URL.rstrip("/"), KILO_SERVER_PASSWORD
+        return [(KILO_SERVER_URL.rstrip("/"), KILO_SERVER_PASSWORD)]
 
     try:
         res = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
-        if res.returncode == 0:
-            for line in res.stdout.splitlines():
-                if "kilo serve" in line:
-                    m_port = re.search(r"--port\s+(\d+)", line)
-                    if m_port and m_port.group(1) != "0":
-                        port = m_port.group(1)
-                        return f"http://127.0.0.1:{port}", KILO_SERVER_PASSWORD
     except Exception:
-        pass
+        logger.warning("`ps aux` discovery of kilo serve failed", exc_info=True)
+        return []
+
+    if res.returncode != 0:
+        return []
+
+    servers = []
+    for line in res.stdout.splitlines():
+        if "kilo serve" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        pid = parts[1]
+        m_port = re.search(r"--port\s+(\d+)", line)
+        port = m_port.group(1) if m_port else None
+        if port and port != "0":
+            servers.append((f"http://127.0.0.1:{port}", KILO_SERVER_PASSWORD))
+        elif port == "0":
+            real_port = _resolve_kilo_server_port(pid)
+            if real_port:
+                servers.append((f"http://127.0.0.1:{real_port}", KILO_SERVER_PASSWORD))
+            else:
+                logger.warning(
+                    "kilo serve pid=%s runs with --port 0 but lsof could not resolve its bound port", pid
+                )
+    return servers
+
+
+def _discover_active_kilo_server() -> tuple[Optional[str], Optional[str]]:
+    """Discover a single running `kilo serve` instance — only safe to use when
+    no specific existing session/request is involved (e.g. creating a brand
+    new session, where any live instance is equally valid). For an operation
+    scoped to an EXISTING session_id or request_id, use
+    `_try_all_kilo_servers` instead: with several instances running, 'the
+    first one found' is not necessarily the one that owns that session, and
+    calling the wrong one 404s silently even though the right instance is
+    simultaneously live."""
+    servers = _list_active_kilo_servers()
+    return servers[0] if servers else (None, None)
+
+
+async def _try_all_kilo_servers(op, *args):
+    """Try a session/request-scoped REST operation against every live `kilo
+    serve` instance in turn, returning the first (result, server_url) where
+    result is truthy, or (None, None) if none succeeded. `op` is one of the
+    `_kilo_server_*` async helpers below, called as `op(server_url, password,
+    *args)`."""
+    for srv_url, password in _list_active_kilo_servers():
+        result = await op(srv_url, password, *args)
+        if result:
+            return result, srv_url
     return None, None
+
+
+def _kilo_server_auth_header(password: Optional[str]) -> dict:
+    """Build the Basic-Auth header `kilo serve` expects, if a password is configured."""
+    if not password:
+        return {}
+    import base64
+    auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {auth}"}
+
+
+def _kilo_server_request(server_url: str, password: Optional[str], path: str,
+                          method: str = "GET", payload: Optional[dict] = None,
+                          timeout: float = 10, extra_headers: Optional[dict] = None) -> tuple[int, bytes]:
+    """Shared HTTP helper for the `kilo serve` REST API. Returns (status, body).
+    Raises on transport/HTTP failure — callers log and translate to their own
+    return-value contract (None/False on failure)."""
+    import urllib.request
+
+    headers = {"Content-Type": "application/json"}
+    headers.update(_kilo_server_auth_header(password))
+    if extra_headers:
+        headers.update(extra_headers)
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(f"{server_url}{path}", data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read()
 
 
 async def _kilo_server_create_session(server_url: str, password: Optional[str],
                                     title: Optional[str] = None) -> Optional[str]:
     """Create a new session directly on a running `kilo serve` instance
-    via `POST /session` or `/experimental/session`. Returns the created session_id."""
-    import urllib.request
-    import urllib.error
-
-    url = f"{server_url}/session"
-    payload = {}
-    if title:
-        payload["title"] = title
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    if password:
-        import base64
-        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
-        req.add_header("Authorization", f"Basic {auth}")
-
+    via `POST /session`. Returns the created session_id."""
+    payload = {"title": title} if title else {}
     try:
         def _do_req():
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status in (200, 201):
-                    res_data = json.loads(resp.read().decode("utf-8"))
-                    return res_data.get("id") or res_data.get("sessionID")
-                return None
+            status, body = _kilo_server_request(server_url, password, "/session", method="POST", payload=payload)
+            if status in (200, 201):
+                res_data = json.loads(body.decode("utf-8"))
+                return res_data.get("id") or res_data.get("sessionID")
+            return None
         return await asyncio.to_thread(_do_req)
     except Exception:
+        logger.warning("kilo serve create_session failed (url=%s)", server_url, exc_info=True)
         return None
 
 
 async def _kilo_server_prompt_async(server_url: str, password: Optional[str],
                                     session_id: str, prompt_text: str) -> bool:
     """Send a prompt instruction directly to a running `kilo serve` session
-    via its HTTP REST API (`/session/:sessionID/prompt_async` or `/session/:sessionID/message`).
-    Returns True if accepted."""
-    import urllib.request
-    import urllib.error
-
-    url = f"{server_url}/session/{session_id}/prompt_async"
-    data = json.dumps({"parts": [{"type": "text", "text": prompt_text}]}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    if password:
-        import base64
-        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
-        req.add_header("Authorization", f"Basic {auth}")
-
+    via `POST /session/:sessionID/prompt_async`. Returns True if accepted."""
+    payload = {"parts": [{"type": "text", "text": prompt_text}]}
     try:
         def _do_req():
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status in (200, 201, 202, 204)
+            status, _ = _kilo_server_request(server_url, password, f"/session/{session_id}/prompt_async",
+                                               method="POST", payload=payload)
+            return status in (200, 201, 202, 204)
         return await asyncio.to_thread(_do_req)
     except Exception:
+        logger.warning("kilo serve prompt_async failed (session=%s, url=%s)", session_id, server_url, exc_info=True)
         return False
 
 
 async def _kilo_server_stop_session(server_url: str, password: Optional[str],
                                     session_id: str) -> bool:
-    """Stop/abort a running session directly via `kilo serve` REST API
-    (`/session/:sessionID/abort` or `/session/:sessionID/stop`). Returns True on success."""
-    import urllib.request
-
-    url = f"{server_url}/session/{session_id}/abort"
-    req = urllib.request.Request(url, method="POST", headers={"Content-Type": "application/json"})
-    if password:
-        import base64
-        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
-        req.add_header("Authorization", f"Basic {auth}")
-
+    """Stop/abort a running session directly via `POST /session/:sessionID/abort`.
+    Returns True on success."""
     try:
         def _do_req():
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status in (200, 201, 202, 204)
+            status, _ = _kilo_server_request(server_url, password, f"/session/{session_id}/abort", method="POST")
+            return status in (200, 201, 202, 204)
         return await asyncio.to_thread(_do_req)
     except Exception:
+        logger.warning("kilo serve stop_session failed (session=%s, url=%s)", session_id, server_url, exc_info=True)
         return False
 
 
 async def _kilo_server_revert_session(server_url: str, password: Optional[str],
                                       session_id: str, message_id: Optional[str] = None) -> bool:
     """Revert a session to a previous state via `POST /session/:sessionID/revert`."""
-    import urllib.request
-
-    url = f"{server_url}/session/{session_id}/revert"
     payload = {"messageID": message_id} if message_id else {}
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    if password:
-        import base64
-        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
-        req.add_header("Authorization", f"Basic {auth}")
-
     try:
         def _do_req():
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status in (200, 201, 202, 204)
+            status, _ = _kilo_server_request(server_url, password, f"/session/{session_id}/revert",
+                                               method="POST", payload=payload)
+            return status in (200, 201, 202, 204)
         return await asyncio.to_thread(_do_req)
     except Exception:
+        logger.warning("kilo serve revert_session failed (session=%s, url=%s)", session_id, server_url, exc_info=True)
         return False
 
 
 async def _kilo_server_fork_session(server_url: str, password: Optional[str],
                                     session_id: str, message_id: Optional[str] = None) -> Optional[str]:
     """Fork a session via `POST /session/:sessionID/fork`. Returns the new session_id."""
-    import urllib.request
-
-    url = f"{server_url}/session/{session_id}/fork"
     payload = {"messageID": message_id} if message_id else {}
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    if password:
-        import base64
-        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
-        req.add_header("Authorization", f"Basic {auth}")
-
     try:
         def _do_req():
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status in (200, 201):
-                    res_data = json.loads(resp.read().decode("utf-8"))
-                    return res_data.get("id") or res_data.get("sessionID")
-                return None
+            status, body = _kilo_server_request(server_url, password, f"/session/{session_id}/fork",
+                                                   method="POST", payload=payload)
+            if status in (200, 201):
+                res_data = json.loads(body.decode("utf-8"))
+                return res_data.get("id") or res_data.get("sessionID")
+            return None
         return await asyncio.to_thread(_do_req)
     except Exception:
+        logger.warning("kilo serve fork_session failed (session=%s, url=%s)", session_id, server_url, exc_info=True)
         return None
 
 
 async def _kilo_server_respond_question(server_url: str, password: Optional[str],
                                          request_id: str, answers: list[str]) -> bool:
     """Respond to an interactive question/prompt request via `POST /question/:requestID`."""
-    import urllib.request
-
-    url = f"{server_url}/question/{request_id}"
     payload = {"answers": answers}
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    if password:
-        import base64
-        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
-        req.add_header("Authorization", f"Basic {auth}")
-
     try:
         def _do_req():
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status in (200, 201, 202, 204)
+            status, _ = _kilo_server_request(server_url, password, f"/question/{request_id}",
+                                               method="POST", payload=payload)
+            return status in (200, 201, 202, 204)
         return await asyncio.to_thread(_do_req)
     except Exception:
+        logger.warning("kilo serve respond_question failed (request=%s, url=%s)", request_id, server_url, exc_info=True)
+        return False
+
+
+async def _kilo_server_update_todo(server_url: str, password: Optional[str],
+                                    session_id: str, todos: list[dict]) -> bool:
+    """Push a todo list update directly via `POST /session/:sessionID/todo`."""
+    try:
+        def _do_req():
+            status, _ = _kilo_server_request(server_url, password, f"/session/{session_id}/todo",
+                                               method="POST", payload={"todos": todos}, timeout=5)
+            return status in (200, 201, 202, 204)
+        return await asyncio.to_thread(_do_req)
+    except Exception:
+        logger.warning("kilo serve update_todo failed (session=%s, url=%s)", session_id, server_url, exc_info=True)
         return False
 
 
 async def _kilo_server_fetch_session_events(server_url: str, password: Optional[str],
                                             session_id: str, timeout_s: float = 3.0) -> list[dict]:
     """Fetch recent live events (or SSE stream snapshot) for a session from `kilo serve` (`GET /event`).
-    Returns parsed event objects."""
+    Returns parsed event objects.
+
+    Reads incrementally off the socket and buffers across chunk boundaries
+    (SSE events are separated by a blank line, `\\n\\n`) until `timeout_s`
+    elapses, so an event isn't dropped just because it straddled two reads —
+    the previous version read one bounded 8KB chunk and lost anything past
+    it or split across it."""
+    import socket
     import urllib.request
 
-    url = f"{server_url}/event"
-    req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
-    if password:
-        import base64
-        auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
-        req.add_header("Authorization", f"Basic {auth}")
+    headers = {"Accept": "text/event-stream"}
+    headers.update(_kilo_server_auth_header(password))
+    req = urllib.request.Request(f"{server_url}/event", headers=headers)
 
     events = []
     try:
         def _read_sse():
+            deadline = time.monotonic() + timeout_s
+            buf = ""
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                # Read initial buffer from SSE stream
-                data = resp.read(8192).decode("utf-8", errors="replace")
-                for line in data.splitlines():
-                    if line.startswith("data:"):
-                        try:
-                            ev = json.loads(line[5:].strip())
+                while time.monotonic() < deadline:
+                    try:
+                        chunk = resp.read(8192)
+                    except (socket.timeout, TimeoutError):
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk.decode("utf-8", errors="replace")
+                    while "\n\n" in buf:
+                        raw_event, buf = buf.split("\n\n", 1)
+                        for line in raw_event.splitlines():
+                            if not line.startswith("data:"):
+                                continue
+                            try:
+                                ev = json.loads(line[5:].strip())
+                            except Exception:
+                                logger.debug("kilo serve SSE: dropped unparsable event line: %r", line, exc_info=True)
+                                continue
                             if isinstance(ev, dict) and (not session_id or ev.get("sessionID") == session_id or ev.get("session_id") == session_id):
                                 events.append(ev)
-                        except Exception:
-                            continue
         await asyncio.to_thread(_read_sse)
     except Exception:
-        pass
+        logger.warning("kilo serve fetch_session_events failed (session=%s, url=%s)", session_id, server_url, exc_info=True)
     return events
 
 
 def _write_db_todos(session_id: str, todos: list[dict]) -> bool:
-    """Directly write/update todos for a session in Kilo's SQLite database (kilo.db)."""
+    """Directly write/update todos for a session in Kilo's SQLite database (kilo.db).
+    Fallback path used by kilo_update_session_todo when no live `kilo serve` REST
+    endpoint was discovered — bypasses Kilo's own API. Foreign keys are disabled
+    below to tolerate writing todos for a session row that hasn't landed yet
+    (e.g. a race with kilo_implement's lazy session-linking); log it clearly
+    when that happens so a silent orphan write is at least visible."""
     try:
         os.makedirs(os.path.dirname(KILO_SESSION_DB), exist_ok=True)
         now_ms = int(time.time() * 1000)
         con = sqlite3.connect(KILO_SESSION_DB, timeout=2)
         with con:
+            if not con.execute("SELECT 1 FROM session WHERE id = ?", (session_id,)).fetchone():
+                logger.warning(
+                    "_write_db_todos: no `session` row yet for session_id=%s — writing "
+                    "todos ahead of session creation (FK disabled to tolerate this)",
+                    session_id,
+                )
             con.execute("PRAGMA foreign_keys = OFF")
             con.execute("DELETE FROM todo WHERE session_id = ?", (session_id,))
             for pos, item in enumerate(todos):
@@ -336,6 +428,7 @@ def _write_db_todos(session_id: str, todos: list[dict]) -> bool:
         con.close()
         return True
     except Exception:
+        logger.warning("_write_db_todos failed (session=%s)", session_id, exc_info=True)
         return False
 
 # Grace period kilo_task_cancel waits after SIGTERM before escalating to
@@ -1678,9 +1771,7 @@ async def kilo_task_cancel(
     # Try HTTP abort first if a running kilo serve instance and session_id are known
     session_id = record.get("session_id")
     if session_id:
-        srv_url, password = _discover_active_kilo_server()
-        if srv_url:
-            await _kilo_server_stop_session(srv_url, password, session_id)
+        await _try_all_kilo_servers(_kilo_server_stop_session, session_id)
 
     pid = record.get("pid")
     if not pid:
@@ -1969,8 +2060,26 @@ def _agent_manager_locked_update(root: str, mutate) -> None:
             fcntl.flock(lock_f, fcntl.LOCK_UN)
 
 
+def _resolve_parent_remote(cwd: str, parent_branch: str) -> Optional[str]:
+    """'origin' if `origin/<parent_branch>` exists as a remote-tracking ref, else
+    None. Mirrors the extension's own resolveRemote()+refExistsLocally() check
+    (WorktreeManager.ts) — Worktree.remote is only meant to be set when the
+    parent branch actually has a remote counterpart, since the UI uses it to
+    diff against `${remote}/${parentBranch}`; setting it unconditionally would
+    point that diff at a ref that may not exist."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "-q", f"refs/remotes/origin/{parent_branch}"],
+            cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+    except OSError:
+        return None
+    return "origin" if result.returncode == 0 else None
+
+
 def _agent_manager_register_worktree(root: str, *, branch: str, path: str,
-                                      parent_branch: str, label: Optional[str] = None) -> str:
+                                      parent_branch: str, label: Optional[str] = None,
+                                      remote: Optional[str] = None) -> str:
     """Add a worktree entry to agent-manager.json and return its synthetic id
     (used to link sessions to it via ManagedSession.worktreeId)."""
     wt_id = f"wt-mcp-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
@@ -1985,6 +2094,8 @@ def _agent_manager_register_worktree(root: str, *, branch: str, path: str,
         }
         if label:
             entry["label"] = label
+        if remote:
+            entry["remote"] = remote
         data["worktrees"][wt_id] = entry
         order = data.setdefault("worktreeOrder", [])
         if wt_id not in order:
@@ -2042,7 +2153,8 @@ def _agent_manager_note_session(cwd: Optional[str], session_id: Optional[str],
         if root:
             _agent_manager_register_session(root, session_id, worktree_id, cwd=cwd)
     except OSError:
-        pass
+        logger.warning("Agent Manager session registration failed (cwd=%s, session=%s) — "
+                        "session won't show up in the Agent Manager UI", cwd, session_id, exc_info=True)
 
 
 _WORKTREE_LOCKS: dict[str, asyncio.Lock] = {}
@@ -2060,10 +2172,15 @@ def _worktree_lock_for(cwd: str) -> asyncio.Lock:
 async def _create_worktree(cwd: str, branch_name: str, base_branch: Optional[str],
                             env: dict) -> tuple[Optional[str], int, str, str, Optional[str]]:
     """Shared core of kilo_create_worktree and kilo_implement's isolation='worktree'
-    path: `git worktree add -b <branch_name> .kilo-worktrees/<branch_name>` under
-    `cwd`. Returns (worktree_abspath_or_None_on_failure, returncode, stdout,
-    stderr, agent_manager_worktree_id_or_None)."""
-    worktree_rel = os.path.join(".kilo-worktrees", branch_name)
+    path: `git worktree add -b <branch_name> .kilo/worktrees/<branch_name>` under
+    `cwd`. Matches the Kilo VS Code extension's own WorktreeManager convention
+    (`KILO_DIR/worktrees`, not a top-level `.kilo-worktrees` — that older path
+    isn't covered by the extension's `ensureGitExclude()` patterns, so a
+    worktree created there shows up as untracked content to git and isn't
+    found by the extension's own `discoverWorktrees()` recovery scan).
+    Returns (worktree_abspath_or_None_on_failure, returncode, stdout, stderr,
+    agent_manager_worktree_id_or_None)."""
+    worktree_rel = os.path.join(".kilo", "worktrees", branch_name)
     cmd = ["git", "worktree", "add", "-b", branch_name, worktree_rel]
     if base_branch:
         cmd.append(base_branch)
@@ -2075,13 +2192,17 @@ async def _create_worktree(cwd: str, branch_name: str, base_branch: Optional[str
     if worktree_path:
         root = _agent_manager_root(cwd)
         if root:
+            parent_branch = base_branch or _current_branch(cwd) or "main"
             try:
                 agent_manager_worktree_id = _agent_manager_register_worktree(
                     root, branch=branch_name, path=worktree_path,
-                    parent_branch=base_branch or _current_branch(cwd) or "main",
+                    parent_branch=parent_branch,
+                    remote=_resolve_parent_remote(cwd, parent_branch),
                 )
             except OSError:
-                pass  # Agent Manager bookkeeping must never break worktree creation
+                logger.warning("Agent Manager worktree registration failed (root=%s, branch=%s) — "
+                                "worktree created fine, but won't show up in the Agent Manager UI",
+                                root, branch_name, exc_info=True)
 
     return worktree_path, returncode, stdout, stderr, agent_manager_worktree_id
 
@@ -2092,7 +2213,7 @@ async def kilo_create_worktree(
     base_branch: Annotated[Optional[str], Field(description="Optional base branch (default: current branch)")] = None,
     working_directory: Annotated[Optional[str], Field(description="Base repository directory")] = None,
 ) -> str:
-    """Create an isolated git worktree under .kilo-worktrees/<branch_name> (runs
+    """Create an isolated git worktree under .kilo/worktrees/<branch_name> (runs
     git directly, not Kilo). Each worktree gets its own new branch, so parallel
     kilo_implement runs on independent components never collide on files.
 
@@ -2135,13 +2256,11 @@ async def kilo_session_revert(
 ) -> str:
     """Revert a Kilo session back to a previous message/checkpoint.
     Allows the orchestrator to undo changes or steps if Kilo took a wrong path."""
-    srv_url, password = _discover_active_kilo_server()
-    if not srv_url:
-        return "Error: No active `kilo serve` instance discovered for session revert."
-    ok = await _kilo_server_revert_session(srv_url, password, session_id, message_id)
+    ok, _ = await _try_all_kilo_servers(_kilo_server_revert_session, session_id, message_id)
     if ok:
         return f"Successfully reverted session '{session_id}'" + (f" to message '{message_id}'" if message_id else "") + "."
-    return f"Failed to revert session '{session_id}' via Kilo Server API."
+    return (f"Failed to revert session '{session_id}' via Kilo Server API "
+            f"(tried {len(_list_active_kilo_servers())} active instance(s)).")
 
 
 @mcp.tool()
@@ -2150,13 +2269,11 @@ async def kilo_session_fork(
     message_id: Annotated[Optional[str], Field(description="Optional message_id to branch/fork from")] = None,
 ) -> str:
     """Fork an existing Kilo session at a specific checkpoint to explore an alternative implementation path in parallel."""
-    srv_url, password = _discover_active_kilo_server()
-    if not srv_url:
-        return "Error: No active `kilo serve` instance discovered for session fork."
-    new_sid = await _kilo_server_fork_session(srv_url, password, session_id, message_id)
+    new_sid, _ = await _try_all_kilo_servers(_kilo_server_fork_session, session_id, message_id)
     if new_sid:
         return f"Successfully forked session '{session_id}'. New forked session_id: {new_sid}"
-    return f"Failed to fork session '{session_id}' via Kilo Server API."
+    return (f"Failed to fork session '{session_id}' via Kilo Server API "
+            f"(tried {len(_list_active_kilo_servers())} active instance(s)).")
 
 
 @mcp.tool()
@@ -2165,13 +2282,11 @@ async def kilo_respond_question(
     answers: Annotated[list[str], Field(description="List of selected answer labels or text responses")],
 ) -> str:
     """Respond to an interactive question asked by Kilo during task execution, unblocking the session."""
-    srv_url, password = _discover_active_kilo_server()
-    if not srv_url:
-        return "Error: No active `kilo serve` instance discovered to answer question."
-    ok = await _kilo_server_respond_question(srv_url, password, request_id, answers)
+    ok, _ = await _try_all_kilo_servers(_kilo_server_respond_question, request_id, answers)
     if ok:
         return f"Successfully submitted answer(s) for question request '{request_id}'."
-    return f"Failed to respond to question '{request_id}' via Kilo Server API."
+    return (f"Failed to respond to question '{request_id}' via Kilo Server API "
+            f"(tried {len(_list_active_kilo_servers())} active instance(s)).")
 
 
 @mcp.tool()
@@ -2202,26 +2317,10 @@ async def kilo_update_session_todo(
 ) -> str:
     """Create or update the checklist/todo list for a Kilo session.
     Allows an orchestrator architect to inject a structured plan or adjust steps mid-task."""
-    # Attempt REST API todo update if server is active
-    srv_url, password = _discover_active_kilo_server()
-    if srv_url:
-        import urllib.request
-        url = f"{srv_url}/session/{session_id}/todo"
-        data = json.dumps({"todos": todos}).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-        if password:
-            import base64
-            auth = base64.b64encode(f":{password}".encode("utf-8")).decode("utf-8")
-            req.add_header("Authorization", f"Basic {auth}")
-        try:
-            def _do_req():
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    return resp.status in (200, 201, 202, 204)
-            ok_rest = await asyncio.to_thread(_do_req)
-            if ok_rest:
-                return f"Successfully updated {len(todos)} todo item(s) for session '{session_id}' via Server API."
-        except Exception:
-            pass
+    # Attempt REST API todo update against whichever live instance owns this session
+    ok_rest, _ = await _try_all_kilo_servers(_kilo_server_update_todo, session_id, todos)
+    if ok_rest:
+        return f"Successfully updated {len(todos)} todo item(s) for session '{session_id}' via Server API."
 
     # Fallback: direct SQLite write
     ok = _write_db_todos(session_id, todos)
@@ -2328,7 +2427,7 @@ def _find_session_for_task(cwd: str, started_iso: str) -> Optional[str]:
     NOT the specific git worktree subdirectory `kilo run` was actually
     launched in — confirmed by querying kilo.db directly: every session
     launched via `kilo_implement(isolation='worktree')` recorded its parent
-    repo's path, never the `.kilo-worktrees/<branch>` path passed as `cwd`.
+    repo's path, never the `.kilo/worktrees/<branch>` path passed as `cwd`.
     Matching only against the literal `cwd` therefore NEVER resolved for any
     isolated-worktree task (session_id stayed 'unknown' in every such task
     tested live) — this falls back to the main repo root (via
