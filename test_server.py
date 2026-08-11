@@ -530,7 +530,7 @@ def test_kilo_create_worktree(tmp_path, mock_run_kilo_custom):
     assert call["cwd"] == cwd
     assert call["cmd"] == [
         "git", "worktree", "add", "-b", "feat-x",
-        os.path.join(".kilo-worktrees", "feat-x"),
+        os.path.join(".kilo", "worktrees", "feat-x"),
     ]
     assert "Exit code: 0" in res
 
@@ -805,7 +805,7 @@ def test_find_session_for_task_matches_main_repo_root_for_worktree_cwd(tmp_path,
     does (worktree = main repo root) and calls the session lookup with cwd
     set to a real linked worktree subdirectory."""
     repo = _init_git_repo(tmp_path / "repo")
-    worktree_path = os.path.join(repo, ".kilo-worktrees", "feat-z")
+    worktree_path = os.path.join(repo, ".kilo", "worktrees", "feat-z")
     subprocess.run(
         ["git", "-C", repo, "worktree", "add", "-b", "feat-z", worktree_path],
         check=True, capture_output=True,
@@ -1035,10 +1035,10 @@ def test_kilo_implement_isolation_worktree(tmp_path, fake_data_dir, mock_run_kil
     assert worktree_call["cwd"] == cwd
     assert worktree_call["cmd"] == [
         "git", "worktree", "add", "-b", "feat-z",
-        os.path.join(".kilo-worktrees", "feat-z"),
+        os.path.join(".kilo", "worktrees", "feat-z"),
     ]
     kilo_call = mock_run_kilo_custom.calls[1]
-    assert kilo_call["cwd"] == os.path.join(cwd, ".kilo-worktrees", "feat-z")
+    assert kilo_call["cwd"] == os.path.join(cwd, ".kilo", "worktrees", "feat-z")
     assert "Outcome: success" in res
 
 
@@ -1051,7 +1051,7 @@ def test_kilo_implement_isolation_worktree_default_branch_name(tmp_path, fake_da
     worktree_call = mock_run_kilo_custom.calls[0]
     branch = worktree_call["cmd"][4]
     assert branch.startswith("kilo/")
-    assert worktree_call["cmd"][-1] == os.path.join(".kilo-worktrees", branch)
+    assert worktree_call["cmd"][-1] == os.path.join(".kilo", "worktrees", branch)
 
 
 def test_kilo_implement_isolation_worktree_base_branch(tmp_path, fake_data_dir, mock_run_kilo_custom):
@@ -1201,7 +1201,7 @@ def test_agent_manager_root_resolves_main_repo_for_worktree(tmp_path):
     at the main repo's .kilo/, never inside a worktree (confirmed by reading
     WorktreeStateManager.ts: it's constructed once with the workspace root)."""
     repo = _init_git_repo(tmp_path / "repo")
-    worktree_path = os.path.join(repo, ".kilo-worktrees", "feat-x")
+    worktree_path = os.path.join(repo, ".kilo", "worktrees", "feat-x")
     subprocess.run(
         ["git", "-C", repo, "worktree", "add", "-b", "feat-x", worktree_path],
         check=True, capture_output=True,
@@ -1278,7 +1278,7 @@ def test_agent_manager_register_session_links_by_cwd_path_match(tmp_path):
     under "local" in the Agent Manager UI instead of nested under the
     worktree."""
     root = str(tmp_path)
-    wt_path = os.path.join(root, ".kilo-worktrees", "feat-x")
+    wt_path = os.path.join(root, ".kilo", "worktrees", "feat-x")
     wt_id = server._agent_manager_register_worktree(
         root, branch="feat-x", path=wt_path, parent_branch="main"
     )
@@ -1298,7 +1298,7 @@ def test_agent_manager_register_session_upgrades_stale_null_link(tmp_path):
     the real worktree link by a later call — but a session already linked
     to a real worktree must never be touched again."""
     root = str(tmp_path)
-    wt_path = os.path.join(root, ".kilo-worktrees", "feat-y")
+    wt_path = os.path.join(root, ".kilo", "worktrees", "feat-y")
 
     # First call: session registered before we know its worktree (worktreeId ends up null).
     server._agent_manager_register_session(root, "ses_late", None)
