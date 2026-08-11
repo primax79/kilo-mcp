@@ -54,10 +54,10 @@ cd ~/.local/share/kilo-mcp-server
 This MCP server includes specialized skills (`kilo-mcp-headless-executor`, `kilo-mcp-conflict-resolver`, `kilo-mcp-rag-explorer`) designed to optimize execution when orchestrated by an AI assistant. Install them into your global Kilo configuration:
 
 ```bash
-uv run --no-project --with mcp python server.py --install-skills
+uv run --no-project --with "mcp<2" python server.py --install-skills
 ```
 
-(The `--with mcp` flag is required even for skill installation because `server.py` imports the MCP SDK at module load.)
+(The `--with "mcp<2"` flag is required even for skill installation because `server.py` imports the MCP SDK at module load.)
 
 ### Step 2b: Orchestrator-Side Skills (optional)
 
@@ -72,7 +72,7 @@ cp -R .claude/skills/mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.clau
 If you are using **Claude Code**, you can register the server globally. Ensure you point to the `server.py` file using `uv`:
 
 ```bash
-claude mcp add kilo-mcp --scope user -- uv run --no-project --with mcp python ~/.local/share/kilo-mcp-server/server.py
+claude mcp add kilo-mcp --scope user -- uv run --no-project --with "mcp<2" python ~/.local/share/kilo-mcp-server/server.py
 ```
 
 *(If you use Claude Desktop, you will need to add the `uv run` command structure to your `claude_desktop_config.json` as detailed in the README.md).*
@@ -169,11 +169,11 @@ This section is a deterministic checklist for an AI agent (e.g. Claude in auto m
 | 0c | uv present | `uv --version` | prints a version | **STOP — ask the operator** |
 | 0d | Python ≥ 3.11 | `python3 -c 'import tomllib'` | no error | proceed anyway (config file support is lost; env vars still work) — inform the operator |
 | 1 | Clone | `git clone <GIT_REPO_URL_FOR_KILO_MCP> ~/.local/share/kilo-mcp-server` | exit 0 | report the git error |
-| 2 | Kilo skills | `cd ~/.local/share/kilo-mcp-server && uv run --no-project --with mcp python server.py --install-skills` | output lists the 3 `kilo-mcp-*` skills | report; check `uv`/network |
+| 2 | Kilo skills | `cd ~/.local/share/kilo-mcp-server && uv run --no-project --with "mcp<2" python server.py --install-skills` | output lists the 3 `kilo-mcp-*` skills | report; check `uv`/network |
 | 3 | Claude skills | `mkdir -p ~/.claude/skills && cp -R .claude/skills/mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.claude/skills/` | dirs exist under `~/.claude/skills/` | report |
 | 4 | Config | copy `kilo-mcp.example.toml` to `~/.config/kilo-mcp/config.toml` | file exists, valid TOML | report |
 | 4b | Kilo pricing | — | — | **ASK the operator** whether their Kilo API keys are free (keep `0.0`) or paid (set real `input/output_cost_per_mtok`) |
-| 5 | Register | `claude mcp add kilo-mcp --scope user -- uv run --no-project --with mcp python ~/.local/share/kilo-mcp-server/server.py` | exit 0 | report |
+| 5 | Register | `claude mcp add kilo-mcp --scope user -- uv run --no-project --with "mcp<2" python ~/.local/share/kilo-mcp-server/server.py` | exit 0 | report |
 | 6 | Verify | `claude mcp list` | `kilo-mcp … ✔ Connected` | run the server command manually and report its stderr |
 | 7 | RAG (optional) | section 3 above | expected `ws-*` collection exists in Qdrant | inform the operator that `kilo_rag_search` will fall back to text search until the IDE extension indexes the workspace |
 
