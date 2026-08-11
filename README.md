@@ -96,7 +96,7 @@ One command, from anywhere. `--scope user` makes the server available in all you
 
 ```bash
 claude mcp add kilo-mcp --scope user -- \
-  uv run --no-project --with "mcp<2" python /absolute/path/to/kilo-mcp/server.py
+  uv run --no-project --with "mcp>=2" python /absolute/path/to/kilo-mcp/server.py
 ```
 
 #### Option B — Claude Desktop
@@ -117,7 +117,7 @@ Add the following to the `mcpServers` section, replacing `/absolute/path/to/...`
         "run",
         "--no-project",
         "--with",
-        "mcp<2",
+        "mcp>=2",
         "python",
         "/absolute/path/to/kilo-mcp-server/server.py"
       ]
@@ -133,10 +133,10 @@ Server settings can be passed here too via an `"env"` block (e.g. `{"KILO_MCP_TI
 The server speaks standard MCP over **stdio**. Point your client at:
 
 ```bash
-uv run --no-project --with "mcp<2" python /absolute/path/to/kilo-mcp/server.py
+uv run --no-project --with "mcp>=2" python /absolute/path/to/kilo-mcp/server.py
 ```
 
-(or plain `python server.py` in any environment where `pip install "mcp>=1.0.0"` has been run).
+(or plain `python server.py` in any environment where `pip install "mcp>=2.0.0"` has been run).
 
 ### Verify the installation
 
@@ -197,11 +197,11 @@ https://raw.githubusercontent.com/primax79/kilo-mcp/main/plugins/executor-side/s
 ```
 
 A legacy path also still works, copying the skills straight from this
-checkout without any marketplace registration (`--with "mcp<2"` is needed
+checkout without any marketplace registration (`--with "mcp>=2"` is needed
 because `server.py` imports the MCP SDK at module load):
 
 ```bash
-uv run --no-project --with "mcp<2" python server.py --install-skills
+uv run --no-project --with "mcp>=2" python server.py --install-skills
 ```
 
 Then, in a conversation, ask Claude to *"list the available Kilo models"* — a correct setup answers through the `kilo_list_models` tool. If the tools are missing, restart the client (stdio servers are spawned per session) and check that `kilo --version` and `uv --version` work in a fresh terminal.

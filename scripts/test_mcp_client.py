@@ -25,7 +25,7 @@ async def run_mcp_tests(server_script: str):
 
     server_params = StdioServerParameters(
         command="uv",
-        args=["run", "--no-project", "--with", "mcp", "python", server_script],
+        args=["run", "--no-project", "--with", "mcp>=2", "python", server_script],
         env=os.environ.copy(),
     )
 
