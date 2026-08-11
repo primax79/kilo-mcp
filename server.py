@@ -71,20 +71,86 @@ mcp = FastMCP("KiloCode Server" if not _IS_RAG_ONLY else "KiloCode RAG Server", 
 #   2. kilo-mcp.toml next to this server.py
 #   3. ~/.config/kilo-mcp/config.toml
 # ---------------------------------------------------------------------------
-def _load_config_file() -> dict:
-    try:
-        import tomllib  # Python 3.11+
-    except ImportError:
-        return {}
+def _config_file_candidates() -> list[str]:
     candidates = []
     if os.environ.get("KILO_MCP_CONFIG"):
         candidates.append(os.environ["KILO_MCP_CONFIG"])
     candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "kilo-mcp.toml"))
     candidates.append(os.path.expanduser("~/.config/kilo-mcp/config.toml"))
-    for path in candidates:
-        try:
+    return candidates
+
+
+def _minimal_toml_load(path: str) -> dict:
+    """Fallback reader for when `tomllib` is unavailable (Python <3.11 and no
+    `tomli` installed) — real case observed: `uv run --no-project` (required
+    to avoid uv trying to install this checkout as a package — see README)
+    ignores pyproject.toml's `requires-python` and can silently resolve to a
+    pre-3.11 interpreter, at which point the previous tomllib-or-nothing
+    loader silently returned {} and every config file setting was ignored
+    with no error at all.
+
+    Only covers what this server's own config keys actually use: `[section]`
+    headers, `key = "quoted string"`, `key = \"\"\"triple-quoted\"\"\"`
+    (for `delegation_policy`), and bare int/float — no arrays, inline
+    tables, or nested sections. That is deliberately not a general TOML
+    parser; if the config file needs more than this, install on Python 3.11+
+    instead of extending it."""
+    result: dict = {}
+    section = result
+    with open(path, "r") as f:
+        lines = f.readlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        i += 1
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = re.match(r"^\[([^\]]+)\]$", stripped)
+        if m:
+            section = result.setdefault(m.group(1).strip(), {})
+            continue
+        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$', stripped)
+        if not m:
+            continue
+        key, raw = m.group(1), m.group(2).strip()
+        if raw.startswith('"""'):
+            body = raw[3:]
+            if body.endswith('"""'):
+                value = body[:-3]
+            else:
+                parts = [body]
+                while i < len(lines) and '"""' not in lines[i]:
+                    parts.append(lines[i].rstrip("\n"))
+                    i += 1
+                if i < len(lines):
+                    parts.append(lines[i].split('"""')[0])
+                    i += 1
+                value = "\n".join(parts).strip("\n")
+        elif raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+            value = raw[1:-1]
+        else:
+            try:
+                value = int(raw)
+            except ValueError:
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = raw
+        section[key] = value
+    return result
+
+
+def _load_config_file() -> dict:
+    try:
+        import tomllib  # Python 3.11+
+        def _read(path):
             with open(path, "rb") as f:
-                cfg = tomllib.load(f)
+                return tomllib.load(f)
+    except ImportError:
+        _read = _minimal_toml_load
+    for path in _config_file_candidates():
+        try:
+            cfg = _read(path)
             cfg["_source"] = path
             return cfg
         except FileNotFoundError:
@@ -92,6 +158,58 @@ def _load_config_file() -> dict:
         except Exception as e:  # malformed file: fail loudly, not silently
             raise RuntimeError(f"Invalid kilo-mcp config file {path}: {e}") from e
     return {}
+
+
+def _upsert_toml_string_key(path: str, section: str, key: str, value: str) -> None:
+    """Set `[section]\\nkey = "value"` in the TOML file at `path`, creating the
+    file/section/key as needed and leaving everything else untouched.
+
+    Deliberately not a general TOML writer (the stdlib has no TOML writer,
+    and pulling in a dependency for this single call site isn't worth it):
+    only handles the flat `key = "quoted string"` shape this server's own
+    config keys use, via targeted line insertion/replacement on the raw
+    text so existing comments and ordering survive."""
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    section_header = f"[{section}]"
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    section_re = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+    new_line = f'{key} = "{value}"\n'
+
+    section_start = None
+    for i, line in enumerate(lines):
+        m = section_re.match(line)
+        if m and m.group(1).strip() == section:
+            section_start = i
+            break
+
+    if section_start is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        if lines:
+            lines.append("\n")
+        lines.append(section_header + "\n")
+        lines.append(new_line)
+    else:
+        section_end = len(lines)
+        for j in range(section_start + 1, len(lines)):
+            if section_re.match(lines[j]):
+                section_end = j
+                break
+        for j in range(section_start + 1, section_end):
+            if key_re.match(lines[j]):
+                lines[j] = new_line
+                break
+        else:
+            lines.insert(section_start + 1, new_line)
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        f.writelines(lines)
 
 
 _CONFIG = _load_config_file()
@@ -436,10 +554,22 @@ def _write_db_todos(session_id: str, todos: list[dict]) -> bool:
 # constant so tests can shorten it.
 _CANCEL_GRACE_S = 2.0
 
-# Default model used by kilo_implement when the caller does not override it.
-# Must be a valid provider/model id as reported by `kilo models`.
+# Default model used by kilo_implement when the caller does not override it —
+# the "simple/routine task" tier. Must be a valid provider/model id as
+# reported by `kilo models`.
 DEFAULT_MODEL = _cfg("KILO_MCP_DEFAULT_MODEL", "kilo", "default_model",
-                     "google/gemini-3.5-flash")
+                     "google/gemini-flash-latest")
+
+# The "complex/high-risk task" tier: a stronger (usually costlier) model, for
+# tasks with subtle failure modes — read-modify-write races, ambiguous specs,
+# security-sensitive edits, multi-step reasoning — where the connected
+# assistant should NOT reach for the same model it uses for trivial edits.
+# Falls back to DEFAULT_MODEL when unset, so this is fully opt-in. Which
+# providers/models exist at all is environment-specific (see
+# `kilo_list_models`) — kilo-mcp itself stays provider-agnostic; run
+# `--configure-models` to set both tiers interactively.
+COMPLEX_MODEL = _cfg("KILO_MCP_COMPLEX_MODEL", "kilo", "complex_model",
+                     DEFAULT_MODEL)
 
 # What Kilo's own model tokens cost the operator (USD per million tokens).
 # Defaults to 0 (free) — true for operators whose Kilo API keys are provided
@@ -1012,8 +1142,15 @@ async def kilo_implement(
         str,
         Field(
             description="Model id in `provider/model` form. MUST be a real id "
-            "from kilo_list_models (e.g. 'google/gemini-3.5-flash'); an "
-            "unknown id makes the run fail. Defaults to " + DEFAULT_MODEL + "."
+            "from kilo_list_models; an unknown id makes the run fail. This "
+            "environment has two configured tiers — pick by task risk, don't "
+            "just reuse whatever model you (the connected assistant) happen "
+            "to be: simple/routine tasks (mechanical edits, low risk) -> "
+            + DEFAULT_MODEL + "; complex/high-risk tasks (subtle bugs, "
+            "read-modify-write races, security-sensitive edits, multi-step "
+            "reasoning) -> " + COMPLEX_MODEL + ". Defaults to " + DEFAULT_MODEL +
+            ". Run `kilo-mcp --configure-models` to change these tiers, or "
+            "kilo_list_models for the full catalog."
         ),
     ] = DEFAULT_MODEL,
     focus_files: Annotated[
@@ -2637,10 +2774,68 @@ def install_skills():
                 print(f"Installed skill: {skill_dir}")
     print("Installation complete.")
 
+
+def configure_models_interactive():
+    """Interactively set the `default_model` (simple/routine tasks) and
+    `complex_model` (complex/high-risk tasks) config keys.
+
+    Lists whatever `kilo models` reports for THIS environment (kilo-mcp
+    itself never hardcodes a provider) and persists the two answers to the
+    resolved config file, so the connected assistant reads them straight out
+    of kilo_implement's tool description instead of guessing a model id and
+    discovering it doesn't exist."""
+    try:
+        res = subprocess.run(["kilo", "models"], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        print("Error: the 'kilo' executable was not found in the PATH.")
+        return
+    except Exception as e:
+        print(f"Error listing Kilo models: {e}")
+        return
+
+    models = sorted(set(ln.strip() for ln in res.stdout.splitlines() if "/" in ln))
+    if not models:
+        print("No models reported by `kilo models` — is a provider authenticated? "
+              "(`kilo auth login`)")
+        return
+
+    print(f"Available Kilo models ({len(models)}):")
+    for m in models:
+        print(f"  - {m}")
+    print()
+
+    def ask(label: str, current: str) -> str:
+        while True:
+            raw = input(f"{label} [current: {current}]: ").strip()
+            if not raw:
+                return current
+            if raw in models:
+                return raw
+            confirm = input(f"'{raw}' is not in the list above — use it anyway? [y/N]: ").strip().lower()
+            if confirm == "y":
+                return raw
+            print("Let's try again.")
+
+    simple = ask("Model for SIMPLE/routine tasks (mechanical edits, low risk)", DEFAULT_MODEL)
+    complex_ = ask("Model for COMPLEX/high-risk tasks (subtle bugs, security-sensitive, "
+                   "multi-step reasoning)", COMPLEX_MODEL)
+
+    target = os.environ.get("KILO_MCP_CONFIG") or _CONFIG.get("_source") or _config_file_candidates()[-1]
+    _upsert_toml_string_key(target, "kilo", "default_model", simple)
+    _upsert_toml_string_key(target, "kilo", "complex_model", complex_)
+    print(f"\nSaved to {target}:")
+    print(f"  default_model = \"{simple}\"")
+    print(f"  complex_model = \"{complex_}\"")
+    print("\nRestart the MCP server (or the client that spawns it) for the new tiers to take effect.")
+
+
 def main() -> None:
     """Console-script entry point."""
     if "--install-skills" in sys.argv:
         install_skills()
+        return
+    if "--configure-models" in sys.argv:
+        configure_models_interactive()
         return
     mcp.run()
 

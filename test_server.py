@@ -1352,3 +1352,151 @@ def test_kilo_task_progress_registers_session_in_agent_manager(tmp_path, monkeyp
         data = json.load(f)
     assert "ses_progress" in data["sessions"]
     assert data["sessions"]["ses_progress"]["worktreeId"] is None
+
+
+# ---------------------------------------------------------------------------
+# Model tiers config (default_model/complex_model): fallback TOML reader,
+# targeted upsert writer, --configure-models interactive flow.
+# ---------------------------------------------------------------------------
+
+def test_minimal_toml_load_parses_strings_numbers_and_sections(tmp_path):
+    """Regression test for a real, silent bug found live 2026-08-11: `uv run
+    --no-project` (required to avoid uv trying to build this checkout as a
+    package) ignores pyproject.toml's requires-python and can resolve to a
+    pre-3.11 interpreter with no `tomllib` — at which point the old
+    tomllib-or-{} loader silently dropped every config file setting with no
+    error. _minimal_toml_load is the fallback that keeps config files working
+    on those interpreters; this pins its actual parsing behavior."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '# a comment\n'
+        '\n'
+        '[kilo]\n'
+        'timeout = 1800\n'
+        'default_model = "google/gemini-3.5-flash"\n'
+        'output_cost_per_mtok = 0.0\n'
+        'delegation_policy = """\n'
+        'line one\n'
+        'line two\n'
+        '"""\n'
+        '\n'
+        '[metrics]\n'
+        'chars_per_token = 4.0\n'
+    )
+    cfg = server._minimal_toml_load(str(cfg_path))
+    assert cfg["kilo"]["timeout"] == 1800
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
+    assert cfg["kilo"]["output_cost_per_mtok"] == 0.0
+    assert cfg["kilo"]["delegation_policy"] == "line one\nline two"
+    assert cfg["metrics"]["chars_per_token"] == 4.0
+
+
+def test_load_config_file_uses_fallback_when_tomllib_missing(tmp_path, monkeypatch):
+    """_load_config_file must fall back to _minimal_toml_load (instead of
+    silently returning {}) when tomllib cannot be imported."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[kilo]\ndefault_model = "google/gemini-3.1-pro-preview"\n')
+    monkeypatch.setattr(server, "_config_file_candidates", lambda: [str(cfg_path)])
+
+    real_import = __import__
+    def blocked_import(name, *a, **kw):
+        if name == "tomllib":
+            raise ImportError("simulated: no tomllib on this interpreter")
+        return real_import(name, *a, **kw)
+    monkeypatch.setattr("builtins.__import__", blocked_import)
+
+    cfg = server._load_config_file()
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.1-pro-preview"
+    assert cfg["_source"] == str(cfg_path)
+
+
+def test_upsert_toml_string_key_creates_file_and_section(tmp_path):
+    path = str(tmp_path / "new.toml")
+    server._upsert_toml_string_key(path, "kilo", "default_model", "google/gemini-3.5-flash")
+    cfg = server._minimal_toml_load(path)
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
+
+
+def test_upsert_toml_string_key_replaces_existing_and_preserves_rest(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[kilo]\n'
+        'timeout = 1800\n'
+        'default_model = "google/gemini-3.5-flash"\n'
+        '\n'
+        '[metrics]\n'
+        'chars_per_token = 4.0\n'
+    )
+    server._upsert_toml_string_key(str(path), "kilo", "default_model", "google/gemini-3.1-pro-preview")
+    text = path.read_text()
+    assert 'default_model = "google/gemini-3.1-pro-preview"' in text
+    assert "timeout = 1800" in text  # untouched sibling key
+    assert "[metrics]" in text and "chars_per_token = 4.0" in text  # untouched section
+
+    cfg = server._minimal_toml_load(str(path))
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.1-pro-preview"
+    assert cfg["kilo"]["timeout"] == 1800
+
+
+def test_upsert_toml_string_key_adds_new_key_to_existing_section(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[kilo]\ndefault_model = "google/gemini-3.5-flash"\n')
+    server._upsert_toml_string_key(str(path), "kilo", "complex_model", "google/gemini-3.1-pro-preview")
+    cfg = server._minimal_toml_load(str(path))
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
+    assert cfg["kilo"]["complex_model"] == "google/gemini-3.1-pro-preview"
+
+
+def test_configure_models_interactive_writes_both_tiers(tmp_path, monkeypatch, capsys):
+    """End-to-end: lists whatever `kilo models` reports (kilo-mcp never
+    hardcodes a provider), takes the two tier answers, and persists them to
+    the target config file so kilo_implement's tool description reflects
+    them on next server start — without touching unrelated existing keys."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[kilo]\ntimeout = 1800\n')
+    monkeypatch.setenv("KILO_MCP_CONFIG", str(cfg_path))
+    monkeypatch.setattr(server, "_CONFIG", {})
+
+    fake_models = "google/gemini-3.5-flash\ngoogle/gemini-3.1-pro-preview\nnot-a-model-line\n"
+    def fake_run(cmd, **kwargs):
+        assert cmd == ["kilo", "models"]
+        return subprocess.CompletedProcess(cmd, 0, stdout=fake_models, stderr="")
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+    answers = iter(["google/gemini-3.5-flash", "google/gemini-3.1-pro-preview"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    server.configure_models_interactive()
+
+    cfg = server._minimal_toml_load(str(cfg_path))
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
+    assert cfg["kilo"]["complex_model"] == "google/gemini-3.1-pro-preview"
+    assert cfg["kilo"]["timeout"] == 1800  # untouched pre-existing key
+    assert str(cfg_path) in capsys.readouterr().out
+
+
+def test_configure_models_interactive_reprompts_on_unlisted_id(tmp_path, monkeypatch):
+    """An id the user types that isn't in `kilo models`' output must be
+    re-prompted, not silently accepted or written — unless explicitly
+    confirmed, since it would otherwise make every kilo_implement call fail."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[kilo]\n')
+    monkeypatch.setenv("KILO_MCP_CONFIG", str(cfg_path))
+    monkeypatch.setattr(server, "_CONFIG", {})
+
+    fake_models = "google/gemini-3.5-flash\n"
+    monkeypatch.setattr(
+        server.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=fake_models, stderr="")
+    )
+
+    # First answer for the "simple" prompt is a typo'd id -> declines to use
+    # it anyway -> re-prompted -> gives the real id. Second question: blank
+    # (keeps current/default).
+    answers = iter(["google/gemini-typo", "n", "google/gemini-3.5-flash", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    server.configure_models_interactive()
+
+    cfg = server._minimal_toml_load(str(cfg_path))
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"

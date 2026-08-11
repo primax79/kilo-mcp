@@ -15,9 +15,24 @@
 # env: KILO_MCP_TIMEOUT
 timeout = 1800
 
-# Default provider/model id for kilo_implement (must exist in `kilo models`).
+# Default provider/model id for kilo_implement (must exist in `kilo models`) —
+# the "simple/routine task" tier. Prefer a rolling "-latest" alias when your
+# provider offers one (e.g. Gemini's `gemini-flash-latest`) so this tier
+# tracks new releases without needing to be re-pinned by hand.
 # env: KILO_MCP_DEFAULT_MODEL
-default_model = "google/gemini-3.5-flash"
+default_model = "google/gemini-flash-latest"
+
+# The "complex/high-risk task" tier: a stronger model for tasks with subtle
+# failure modes (read-modify-write races, ambiguous specs, security-sensitive
+# edits, multi-step reasoning). Falls back to default_model when unset.
+# kilo-mcp itself stays provider-agnostic — which providers/models exist at
+# all depends on your own `kilo auth login`. Run
+# `uv run --no-project --with "mcp<2" python server.py --configure-models`
+# (or `kilo-mcp --configure-models` if installed as a tool) to list the
+# models you actually have available and set both tiers interactively,
+# instead of editing this by hand.
+# env: KILO_MCP_COMPLEX_MODEL
+complex_model = "google/gemini-3.1-pro-preview"
 
 # What Kilo's model tokens cost YOU (USD per million tokens). Default 0.0 =
 # free, which is right only if your Kilo API keys are provided at no charge

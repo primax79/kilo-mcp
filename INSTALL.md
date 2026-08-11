@@ -88,7 +88,15 @@ cp kilo-mcp.example.toml ~/.config/kilo-mcp/config.toml
 
 Two keys deserve a conscious decision (see the comments in the file):
 
-- `[kilo] default_model` — must be a real id from `kilo models`.
+- `[kilo] default_model` / `complex_model` — the simple-task and complex-task
+  model tiers; both must be real ids from `kilo models`. Set them
+  interactively instead of hand-editing, so kilo-mcp lists exactly what you
+  authenticated with `kilo auth login` (it never assumes a provider):
+
+  ```bash
+  uv run --no-project --with "mcp<2" python server.py --configure-models
+  ```
+
 - `[kilo] input_cost_per_mtok` / `output_cost_per_mtok` — leave `0.0` **only** if your Kilo API keys are provided at no charge; otherwise set your real Kilo token rates so the delegation policy and cost metrics reflect reality. **This is an operator decision — if you are an AI agent performing this install, ask the operator.**
 
 ### Step 5: Verify

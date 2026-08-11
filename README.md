@@ -68,7 +68,13 @@ Config file search order:
 2. `kilo-mcp.toml` next to `server.py` (per-checkout, gitignored)
 3. `~/.config/kilo-mcp/config.toml` (per-user)
 
-Copy [kilo-mcp.example.toml](kilo-mcp.example.toml) to one of those locations and edit — it documents every key (`[kilo]` timeout, default model, Kilo token pricing, delegation policy; `[metrics]` data dir, Claude pricing, inline-cost heuristics) and the matching env var names. Config file support requires Python ≥ 3.11 (`tomllib`); on 3.10 only env vars and defaults apply.
+Copy [kilo-mcp.example.toml](kilo-mcp.example.toml) to one of those locations and edit — it documents every key (`[kilo]` timeout, model tiers, Kilo token pricing, delegation policy; `[metrics]` data dir, Claude pricing, inline-cost heuristics) and the matching env var names. Config files parse with `tomllib` on Python ≥ 3.11, and with a small built-in fallback reader (covering the flat key/section shapes this server's own keys use) on 3.10 — either way, the file is actually read; only a genuinely unsupported TOML shape (arrays, inline tables) would need a 3.11+ interpreter.
+
+**Model tiers**: `default_model` (simple/routine tasks) and `complex_model` (subtle bugs, security-sensitive edits, multi-step reasoning) are surfaced directly in `kilo_implement`'s tool description, so the connected assistant picks the right one for the task's risk instead of guessing a model id (e.g. one from its own provider) and discovering it doesn't exist on Kilo. kilo-mcp itself is provider-agnostic — it never hardcodes which providers/models exist. Set both interactively, from whatever `kilo models` actually reports for your own `kilo auth login`:
+
+```bash
+uv run --no-project --with "mcp<2" python server.py --configure-models
+```
 
 ### Kilo Configuration & Credentials (shared with the IDE extensions)
 
@@ -241,7 +247,7 @@ The core execution tool. Claude uses this to delegate work.
 - `task_instructions` *(string, required)*: The detailed markdown-formatted specifications. The server routes this through a temporary file bridge (avoids OS argument-size limits and gives Kilo a re-readable spec) and appends a **mandatory Final Report contract** — Outcome / Files changed / Verification / Issues — so Claude can review the run systematically.
 - `working_directory` *(string, optional)*: Where Kilo should run. Defaults to the current directory.
 - `agent` *(string, optional)*: The Kilo agent to use (e.g., `code`, `explore`).
-- `model` *(string, optional)*: Model override in `provider/model` form, as listed by `kilo models` (defaults to `google/gemini-3.5-flash`).
+- `model` *(string, optional)*: Model override in `provider/model` form, as listed by `kilo models`. Defaults to the configured `default_model` tier (see [Server Configuration](#server-configuration) — `default_model`/`complex_model`, out of the box `google/gemini-flash-latest`).
 - `focus_files` *(list[str], optional)*: Files Kilo must read before starting.
 - `execution_hints` *(string, optional)*: Strategic hints, constraints, or configurations for Kilo's execution style.
 - `skills_to_load` *(list[str], optional)*: Specific skills Kilo must utilize.
