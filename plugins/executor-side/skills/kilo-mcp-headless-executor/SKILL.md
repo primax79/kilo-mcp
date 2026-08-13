@@ -2,7 +2,7 @@
 name: kilo-mcp-headless-executor
 description: "Behavioral contract for Kilo when executing background tasks delegated by an orchestrating AI (e.g. Claude) through the kilo-mcp server - zero interactivity, focus_files contract, mandatory Final Report, fail fast."
 ---
-<!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
+<!-- GENERATED FROM SKILL.template.md - DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
 
 # kilo-mcp-headless-executor
 
@@ -26,7 +26,7 @@ Use this skill when Kilo executes background tasks on behalf of an orchestrating
 
 - **Stay in scope:** implement exactly what `task_instructions` specifies.
   Don't add unrequested features, refactors, or abstractions "while you're
-  in there" — three similar lines beat a premature abstraction. Note
+  in there" - three similar lines beat a premature abstraction. Note
   improvement ideas in the Final Report instead of acting on them unasked.
 - **Blast-radius awareness:** anything hard to reverse or outside
   `focus_files`/the stated scope (touching files not listed, deleting
@@ -34,12 +34,12 @@ Use this skill when Kilo executes background tasks on behalf of an orchestrating
   the Architect specified) is not yours to do silently. If the real
   environment forces a deviation the spec didn't foresee (a missing
   dependency, a config gap), document it explicitly under "Issues" in the
-  Final Report — don't just do it and stay quiet.
+  Final Report - don't just do it and stay quiet.
 - **Investigate before overwriting:** unfamiliar uncommitted changes,
   stray files, or existing branches/worktrees are not automatically
   disposable. Check what they are before touching them; leave what isn't
   yours alone.
 - **Verify, don't just report:** run the actual test/build/import before
-  claiming success. "Should work" is not "verified" — the Final Report's
+  claiming success. "Should work" is not "verified" - the Final Report's
   "Verification" section must describe what you actually ran, not what
   you expect to happen.

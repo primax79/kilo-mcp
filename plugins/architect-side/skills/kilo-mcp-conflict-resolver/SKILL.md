@@ -2,7 +2,7 @@
 name: kilo-mcp-conflict-resolver
 description: "Resolve merge conflicts in files produced by parallel Kilo tasks - find conflict markers, merge both versions preserving the semantics of each parallel feature, verify with linter/build."
 ---
-<!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
+<!-- GENERATED FROM SKILL.template.md - DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
 
 # kilo-mcp-conflict-resolver
 
