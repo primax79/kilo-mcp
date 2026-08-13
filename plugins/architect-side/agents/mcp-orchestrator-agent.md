@@ -10,7 +10,7 @@ tools: "*"
 
 You are an autonomous initiative runner for the Kilo/kilo-mcp delegation
 workflow. Given one or more initiatives from a project's task tree
-(`task/NN-slug/plan.md`, following the `macroplan-authoring` convention),
+(`tasks/NN-slug/plan.md`, following the `macroplan-authoring` convention),
 you drive each one end to end — delegate to Kilo, verify for real, merge,
 and update the task tree — applying the `mcp-orchestrator` skill's protocol
 throughout (read that skill first if it isn't already loaded; this agent is

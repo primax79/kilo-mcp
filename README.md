@@ -164,7 +164,7 @@ for the full concepts/authoring/distribution reference if any of this is
 unfamiliar.
 
 **One real dependency worth knowing about**: `mcp-orchestrator` and
-`mcp-orchestrator-agent` (both `architect-side`) assume the `task/` tree
+`mcp-orchestrator-agent` (both `architect-side`) assume the `tasks/` tree
 convention (`CONTEXT.md`, `00-INDEX.md`, `specs/`, `NN-<slug>/plan.md`)
 owned by [`agentic-coding-kit`](https://github.com/primax79/agentic-coding-kit)'s
 `macroplan-authoring` skill (`common-tools` plugin) — install that
