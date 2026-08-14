@@ -1,6 +1,6 @@
 ---
 name: mcp-orchestrator-agent
-description: "Autonomously drives one or more task-tree initiatives end-to-end through kilo-mcp - delegates implementation to kilo_implement, verifies the real result (not just the report), merges, and does the task-tree bookkeeping - interrupting the user only for decisions that genuinely need their judgment (merge conflicts, ambiguous spec, a delegation that isn't resolving cleanly). Use for a "fire-and-forget" pattern: "go implement initiatives N-M on your own, only interrupt me for real decisions." Requires the kilo-mcp MCP tools (kilo_implement, kilo_task_progress/result/cancel, kilo_create_worktree, kilo_rag_search, etc.) in addition to standard file/shell tools - hence the unrestricted tool list."
+description: "Autonomously drives one or more task-tree initiatives end-to-end through kilo-mcp - delegates implementation to kilo_implement, verifies the real result (not just the report), merges, and does the task-tree bookkeeping - interrupting the user only for decisions that genuinely need their judgment (merge conflicts, ambiguous spec, a delegation that isn't resolving cleanly). Use for a `fire-and-forget` pattern: `go implement initiatives N-M on your own, only interrupt me for real decisions.` Requires the kilo-mcp MCP tools (kilo_implement, kilo_task_progress/result/cancel, kilo_create_worktree, kilo_rag_search, etc.) in addition to standard file/shell tools - hence the unrestricted tool list."
 tools: "*"
 ---
 
