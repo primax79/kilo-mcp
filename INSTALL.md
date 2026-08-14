@@ -88,7 +88,7 @@ cp kilo-mcp.example.toml ~/.config/kilo-mcp/config.toml
 
 Two keys deserve a conscious decision (see the comments in the file):
 
-- `[kilo] default_model` / `complex_model` — the simple-task and complex-task
+- `[kilo] default_model` / `complex_model` - the simple-task and complex-task
   model tiers; both must be real ids from `kilo models`. Set them
   interactively instead of hand-editing, so kilo-mcp lists exactly what you
   authenticated with `kilo auth login` (it never assumes a provider):
@@ -97,7 +97,7 @@ Two keys deserve a conscious decision (see the comments in the file):
   uv run --no-project --with "mcp<2" python server.py --configure-models
   ```
 
-- `[kilo] input_cost_per_mtok` / `output_cost_per_mtok` — leave `0.0` **only** if your Kilo API keys are provided at no charge; otherwise set your real Kilo token rates so the delegation policy and cost metrics reflect reality. **This is an operator decision — if you are an AI agent performing this install, ask the operator.**
+- `[kilo] input_cost_per_mtok` / `output_cost_per_mtok` - leave `0.0` **only** if your Kilo API keys are provided at no charge; otherwise set your real Kilo token rates so the delegation policy and cost metrics reflect reality. **This is an operator decision - if you are an AI agent performing this install, ask the operator.**
 
 ### Step 5: Verify
 
@@ -105,17 +105,17 @@ Two keys deserve a conscious decision (see the comments in the file):
 claude mcp list          # kilo-mcp must show "✔ Connected"
 ```
 
-> ⚠️ **The kilo-mcp tools only appear in NEW Claude sessions.** The session that ran `claude mcp add` will NOT see them — this is expected, not a failure. Verify with `claude mcp list` (above); do not retry the installation because the tools are not visible in the current session. In a fresh session, ask Claude to *"list the available Kilo models"* — a correct setup answers through the `kilo_list_models` tool.
+> ⚠️ **The kilo-mcp tools only appear in NEW Claude sessions.** The session that ran `claude mcp add` will NOT see them - this is expected, not a failure. Verify with `claude mcp list` (above); do not retry the installation because the tools are not visible in the current session. In a fresh session, ask Claude to *"list the available Kilo models"* - a correct setup answers through the `kilo_list_models` tool.
 
 ---
 
 ## 3. Kilo RAG (Semantic Index) Configuration
 
-The `kilo_rag_search` tool queries the semantic index that **the Kilo IDE extension** (VS Code / JetBrains) builds and maintains. The CLI — and therefore this MCP server — only *reads* that index. Without this setup, `kilo_rag_search` silently degrades to plain text/glob search.
+The `kilo_rag_search` tool queries the semantic index that **the Kilo IDE extension** (VS Code / JetBrains) builds and maintains. The CLI - and therefore this MCP server - only *reads* that index. Without this setup, `kilo_rag_search` silently degrades to plain text/glob search.
 
 Requirements:
 
-1. **A running Qdrant instance** (vector store), e.g. via Docker Compose — create a `compose.yml` in a directory of your choice (e.g. `~/devel/qdrant_rag/`):
+1. **A running Qdrant instance** (vector store), e.g. via Docker Compose - create a `compose.yml` in a directory of your choice (e.g. `~/devel/qdrant_rag/`):
 
    ```yaml
    services:
@@ -131,9 +131,9 @@ Requirements:
        restart: unless-stopped
    ```
 
-   then start it with `docker compose up -d`. Any host port works — `16333` here avoids clashing with other Qdrant instances on the default `6333`; the bind-mounted volume persists the index across restarts.
+   then start it with `docker compose up -d`. Any host port works - `16333` here avoids clashing with other Qdrant instances on the default `6333`; the bind-mounted volume persists the index across restarts.
 
-2. **An embedder API key** — the default provider is Google (`gemini-embedding-001`).
+2. **An embedder API key** - the default provider is Google (`gemini-embedding-001`).
 
 3. **Indexing enabled in the Kilo config** (`~/.config/kilo/kilo.jsonc`, shared by the CLI and the IDE extension):
 
@@ -153,7 +153,7 @@ Requirements:
    }
    ```
 
-4. **Open the workspace in the Kilo IDE extension at least once** — the extension's file-watcher performs the actual indexing. Each workspace gets a Qdrant collection named `ws-<first 16 hex chars of sha256(absolute workspace path)>`; because the collection is keyed by the **exact** absolute path, the `working_directory` passed to `kilo_rag_search` must match the path the extension indexed.
+4. **Open the workspace in the Kilo IDE extension at least once** - the extension's file-watcher performs the actual indexing. Each workspace gets a Qdrant collection named `ws-<first 16 hex chars of sha256(absolute workspace path)>`; because the collection is keyed by the **exact** absolute path, the `working_directory` passed to `kilo_rag_search` must match the path the extension indexed.
 
 Verify the index exists for a workspace:
 
@@ -168,26 +168,26 @@ The second command prints the collection name to look for in the first command's
 
 ## 4. Unattended Install (for AI agents)
 
-This section is a deterministic checklist for an AI agent (e.g. Claude in auto mode) performing this installation autonomously. Execute the steps in order; each has a success criterion. **Stop and ask the operator** where marked — do not guess.
+This section is a deterministic checklist for an AI agent (e.g. Claude in auto mode) performing this installation autonomously. Execute the steps in order; each has a success criterion. **Stop and ask the operator** where marked - do not guess.
 
 | # | Step | Command | Success criterion | On failure |
 | --- | ------ | --------- | ------------------- | ------------ |
-| 0a | Kilo CLI present | `kilo --version` | prints a version | **STOP — ask the operator** to install it (`brew install Kilo-Org/tap/kilo`); do not install CLIs unasked |
-| 0b | Kilo authenticated | `kilo auth list` | at least one provider listed | **STOP — ask the operator**: `kilo auth login` is an interactive OAuth flow an agent cannot complete |
-| 0c | uv present | `uv --version` | prints a version | **STOP — ask the operator** |
-| 0d | Python ≥ 3.11 | `python3 -c 'import tomllib'` | no error | proceed anyway (config file support is lost; env vars still work) — inform the operator |
+| 0a | Kilo CLI present | `kilo --version` | prints a version | **STOP - ask the operator** to install it (`brew install Kilo-Org/tap/kilo`); do not install CLIs unasked |
+| 0b | Kilo authenticated | `kilo auth list` | at least one provider listed | **STOP - ask the operator**: `kilo auth login` is an interactive OAuth flow an agent cannot complete |
+| 0c | uv present | `uv --version` | prints a version | **STOP - ask the operator** |
+| 0d | Python ≥ 3.11 | `python3 -c 'import tomllib'` | no error | proceed anyway (config file support is lost; env vars still work) - inform the operator |
 | 1 | Clone | `git clone <GIT_REPO_URL_FOR_KILO_MCP> ~/.local/share/kilo-mcp-server` | exit 0 | report the git error |
 | 2 | Kilo skills | `cd ~/.local/share/kilo-mcp-server && uv run --no-project --with "mcp>=2" python server.py --install-skills` | output lists the 3 `kilo-mcp-*` skills | report; check `uv`/network |
 | 3 | Claude skills | `mkdir -p ~/.claude/skills && cp -R .claude/skills/mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.claude/skills/` | dirs exist under `~/.claude/skills/` | report |
 | 4 | Config | copy `kilo-mcp.example.toml` to `~/.config/kilo-mcp/config.toml` | file exists, valid TOML | report |
-| 4b | Kilo pricing | — | — | **ASK the operator** whether their Kilo API keys are free (keep `0.0`) or paid (set real `input/output_cost_per_mtok`) |
+| 4b | Kilo pricing | - | - | **ASK the operator** whether their Kilo API keys are free (keep `0.0`) or paid (set real `input/output_cost_per_mtok`) |
 | 5 | Register | `claude mcp add kilo-mcp --scope user -- uv run --no-project --with "mcp>=2" python ~/.local/share/kilo-mcp-server/server.py` | exit 0 | report |
 | 6 | Verify | `claude mcp list` | `kilo-mcp … ✔ Connected` | run the server command manually and report its stderr |
 | 7 | RAG (optional) | section 3 above | expected `ws-*` collection exists in Qdrant | inform the operator that `kilo_rag_search` will fall back to text search until the IDE extension indexes the workspace |
 
 Reminders for the installing agent:
 
-- The kilo-mcp **tools will not appear in your own session** (step 6's `claude mcp list` is the correct check — see Step 5 above). Do not loop retrying the install because you cannot call `kilo_list_models` yourself.
+- The kilo-mcp **tools will not appear in your own session** (step 6's `claude mcp list` is the correct check - see Step 5 above). Do not loop retrying the install because you cannot call `kilo_list_models` yourself.
 - All steps are idempotent: re-running the installer, the copies, or `claude mcp add` on an existing setup is safe.
 - Never write API keys into files inside the cloned repository; secrets belong in `~/.config/kilo/kilo.jsonc` (Kilo) or the operator's environment.
 
@@ -195,4 +195,4 @@ Reminders for the installing agent:
 
 ### Installing as a package (not recommended yet)
 
-The project ships a `pyproject.toml` with a `kilo-mcp` console script, so `uv tool install git+<GIT_REPO_URL_FOR_KILO_MCP>` technically works — **but the packaged install does not include the `skills/` directory**, so `kilo-mcp --install-skills` would find nothing to install. Until packaging bundles the skills, the `git clone` method above is the canonical one.
+The project ships a `pyproject.toml` with a `kilo-mcp` console script, so `uv tool install git+<GIT_REPO_URL_FOR_KILO_MCP>` technically works - **but the packaged install does not include the `skills/` directory**, so `kilo-mcp --install-skills` would find nothing to install. Until packaging bundles the skills, the `git clone` method above is the canonical one.

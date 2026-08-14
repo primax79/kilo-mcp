@@ -3,7 +3,7 @@
 This replicates exactly what `kilo_implement` does, step by step, without the
 MCP server in the loop at all. Use it to isolate whether a problem is in the
 `kilo` CLI / environment (network, provider, a competing `kilo serve` daemon)
-or in how `server.py` invokes things — if the manual steps hang the same way,
+or in how `server.py` invokes things - if the manual steps hang the same way,
 it's not our server's fault.
 
 Either run `run_manual_task.py` (does all of this automatically, with live
@@ -34,7 +34,7 @@ git add README.md && git commit -q -m init
 
 ## 2. Write the task spec to a temp file (the "temp-file bridge")
 
-This is `task-spec.md` in this folder — already built with the exact section
+This is `task-spec.md` in this folder - already built with the exact section
 structure `kilo_implement` produces (Task Instructions + the mandatory Final
 Report contract). Copy it to a temp file, mirroring what the server does:
 
@@ -44,7 +44,7 @@ cp /Users/Alfredo/devel/kilo-mcp-server/manual-test/task-spec.md "$PROMPT_FILE"
 echo "$PROMPT_FILE"
 ```
 
-## 3. Launch `kilo run` — identical invocation to `kilo_implement`
+## 3. Launch `kilo run` - identical invocation to `kilo_implement`
 
 ```bash
 kilo run --agent code --model google/gemini-3.5-flash \
@@ -54,10 +54,10 @@ KILO_PID=$!
 echo "launched pid $KILO_PID"
 ```
 
-This returns your shell prompt immediately — the manual equivalent of
+This returns your shell prompt immediately - the manual equivalent of
 `background=true`. `$KILO_PID` is what you'll monitor and, if needed, cancel.
 
-## 4. Monitor it — same checks as `kilo_task_status` / `kilo_task_progress`
+## 4. Monitor it - same checks as `kilo_task_status` / `kilo_task_progress`
 
 ```bash
 # OS-level heuristic (kilo_task_status equivalent)
@@ -65,7 +65,7 @@ ps -p "$KILO_PID" -o etime=,time=          # elapsed vs CPU time
 lsof -a -p "$KILO_PID" -i                  # network connections (empty = not talking to the model)
 lsof -a -p "$KILO_PID" -d cwd -Fn           # confirm its working directory
 
-# Fine-grained live progress (kilo_task_progress equivalent) — find the session:
+# Fine-grained live progress (kilo_task_progress equivalent) - find the session:
 sqlite3 "file:$HOME/.local/share/kilo/kilo.db?mode=ro" -readonly \
   "SELECT s.id, s.title, s.cost, s.tokens_input, s.tokens_output
    FROM session s JOIN project p ON s.project_id = p.id
@@ -88,7 +88,7 @@ Or just use the packaged script, which does all of the above in one shot:
 
 **What to watch for (from the live investigation on 2026-07-14):** a process
 can show `network: yes` (an established TCP connection) for minutes while CPU
-time barely increases and no session ever appears in `kilo.db` — i.e. the
+time barely increases and no session ever appears in `kilo.db` - i.e. the
 connection is open but no data is actually flowing. Don't treat "network: yes"
 alone as proof of real progress; cross-check CPU time growth and session
 creation too.
@@ -106,7 +106,7 @@ cat "$SCRATCH/saluto.txt" 2>/dev/null
 ## 6. Cancel it if needed (kilo_task_cancel equivalent)
 
 ```bash
-/Users/Alfredo/devel/kilo-mcp-server/.claude/skills/mcp-orchestrator/scripts/kill-kilo-task.sh "$KILO_PID" "stuck — no session after N minutes"
+/Users/Alfredo/devel/kilo-mcp-server/.claude/skills/mcp-orchestrator/scripts/kill-kilo-task.sh "$KILO_PID" "stuck - no session after N minutes"
 ```
 
 or by hand:

@@ -6,25 +6,25 @@ This document proposed a `kilo_orchestrator_*` toolset that was not yet
 implemented when it was written. Since then `~/devel/kilo-mcp-server`
 (`server.py`) has covered most of that toolset under different names, plus
 three background-execution reliability bugs have been fixed and verified
-live — updated map so as not to restart from scratch:
+live - updated map so as not to restart from scratch:
 
 | Proposed here                       | Status                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kilo_orchestrator_create_worktree` | ✅ Implemented — `kilo_create_worktree` / `kilo_implement(isolation='worktree')`, with an internal anti-race lock on `.git/index.lock`. In addition (not proposed here): automatically registers the worktree in `.kilo/agent-manager.json`.                                                                                    |
-| `kilo_orchestrator_remove_worktree` | ❌ Not implemented — no tool removes a worktree; `git worktree remove` remains manual (documented in `KILO_CLI_WORKTREE_GUIDE.md` §2.5).                                                                                                                                                                                        |
-| `kilo_orchestrator_spawn_agent`     | ✅ Implemented — `kilo_implement(background=true)`, the default. Synchronous session creation via Kilo Server REST API with SQLite fallback; runs as a detached OS process (`setsid`).                                                                                                                                          |
-| `kilo_orchestrator_list_sessions`   | ✅ Implemented — `kilo_task_status` (OS-level heuristic) and `kilo_task_progress` (live plan/commentary) plus `kilo_get_session_todo` / `kilo_update_session_todo` for active session checklist inspection and injection.                                                                                                |
-| `kilo_orchestrator_prompt_agent`    | ✅ Implemented — `kilo_implement(continue_session_id=...)` and REST-based prompt injection via `_kilo_server_prompt_async`. Additional control via `kilo_session_revert`, `kilo_session_fork`, `kilo_respond_question`.                                                                                                          |
-| `kilo_orchestrator_get_logs`        | ✅ Implemented — `kilo_task_progress` returns live commentary/todo progress, and `_kilo_server_fetch_session_events` connects to the native SSE stream (`GET /event`).                                                                                                                                                         |
-| `kilo_orchestrator_merge_task`      | ❌ Not implemented, deliberately — merging stays a manual step with explicit verification (real build/tests, not just Kilo's report) before merging, per the discipline described in `KILO_CLI_WORKTREE_GUIDE.md` §2.4/§2.5. Automating it would risk skipping exactly that verification.                                     |
+| `kilo_orchestrator_create_worktree` | ✅ Implemented - `kilo_create_worktree` / `kilo_implement(isolation='worktree')`, with an internal anti-race lock on `.git/index.lock`. In addition (not proposed here): automatically registers the worktree in `.kilo/agent-manager.json`.                                                                                    |
+| `kilo_orchestrator_remove_worktree` | ❌ Not implemented - no tool removes a worktree; `git worktree remove` remains manual (documented in `KILO_CLI_WORKTREE_GUIDE.md` §2.5).                                                                                                                                                                                        |
+| `kilo_orchestrator_spawn_agent`     | ✅ Implemented - `kilo_implement(background=true)`, the default. Synchronous session creation via Kilo Server REST API with SQLite fallback; runs as a detached OS process (`setsid`).                                                                                                                                          |
+| `kilo_orchestrator_list_sessions`   | ✅ Implemented - `kilo_task_status` (OS-level heuristic) and `kilo_task_progress` (live plan/commentary) plus `kilo_get_session_todo` / `kilo_update_session_todo` for active session checklist inspection and injection.                                                                                                |
+| `kilo_orchestrator_prompt_agent`    | ✅ Implemented - `kilo_implement(continue_session_id=...)` and REST-based prompt injection via `_kilo_server_prompt_async`. Additional control via `kilo_session_revert`, `kilo_session_fork`, `kilo_respond_question`.                                                                                                          |
+| `kilo_orchestrator_get_logs`        | ✅ Implemented - `kilo_task_progress` returns live commentary/todo progress, and `_kilo_server_fetch_session_events` connects to the native SSE stream (`GET /event`).                                                                                                                                                         |
+| `kilo_orchestrator_merge_task`      | ❌ Not implemented, deliberately - merging stays a manual step with explicit verification (real build/tests, not just Kilo's report) before merging, per the discipline described in `KILO_CLI_WORKTREE_GUIDE.md` §2.4/§2.5. Automating it would risk skipping exactly that verification.                                     |
 
 Not proposed here, added on 2026-07-29: automatic registration of
 worktrees/sessions in `.kilo/agent-manager.json` (visibility in VS Code's
-Agent Manager UI, best-effort — see `README.md` §Agent Manager
+Agent Manager UI, best-effort - see `README.md` §Agent Manager
 Integration and `ARCHITECTURE.md` §9). This partially covers the
 "visible orchestration" goal that this document originally set out as its
 motivation (§1), without needing the `kilo_orchestrator_*` toolset
-proposed below — that toolset remains an option if an explicit
+proposed below - that toolset remains an option if an explicit
 orchestration API is ever needed instead of just cosmetic visibility.
 
 ---

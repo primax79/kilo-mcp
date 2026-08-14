@@ -1,9 +1,9 @@
-# Diagnosing kilo job state — ready-to-invoke scripts and commands
+# Diagnosing kilo job state - ready-to-invoke scripts and commands
 
 Three ways to check on a `kilo run` job, from quickest to most detailed. All
 are read-only except the kill commands at the end.
 
-## 1. Packaged scripts (recommended — no need to remember any of this)
+## 1. Packaged scripts (recommended - no need to remember any of this)
 
 ```bash
 # List every running `kilo run` process with elapsed/CPU/network + a
@@ -20,7 +20,7 @@ are read-only except the kill commands at the end.
 # Any kilo run process at all?
 pgrep -fl "kilo run"
 
-# Any other kilo-related process (daemons, MCP server instances, etc.) —
+# Any other kilo-related process (daemons, MCP server instances, etc.) -
 # useful to spot contention, e.g. multiple `kilo serve` daemons running:
 ps aux | grep -i kilo | grep -v grep
 
@@ -58,7 +58,7 @@ sqlite3 "file:$HOME/.local/share/kilo/kilo.db?mode=ro" -readonly \
 kill -TERM <PID>; sleep 2; kill -0 <PID> 2>/dev/null && kill -KILL <PID>
 ```
 
-## 3. Python (same helpers server.py's tools use — for scripting/automation)
+## 3. Python (same helpers server.py's tools use - for scripting/automation)
 
 Run these from the repo root with the project's venv active
 (`source .venv/bin/activate` or prefix with `.venv/bin/python3`).
@@ -80,7 +80,7 @@ print(asyncio.run(server.kilo_task_progress(task_id="<TASK_ID>")))
 print(asyncio.run(server.kilo_task_result(task_id="<TASK_ID>")))
 print(asyncio.run(server.kilo_task_cancel(task_id="<TASK_ID>", reason="stuck")))
 
-# Lower-level building blocks, usable without any task_id at all — just a
+# Lower-level building blocks, usable without any task_id at all - just a
 # workspace path and a rough start time (ISO string or "now"):
 from datetime import datetime, timezone
 started = datetime.now(timezone.utc).isoformat()
@@ -107,15 +107,15 @@ print(asyncio.run(server.kilo_task_status()))
 
 A process can report `network: yes` (an open TCP connection) for several
 minutes while:
-- CPU time barely increases (e.g. 2.8s → 2.9s over 70+ seconds — essentially
+- CPU time barely increases (e.g. 2.8s → 2.9s over 70+ seconds - essentially
   idle, not computing)
 - no session ever appears in `kilo.db` for that workspace (i.e. not even the
   first token of a model response has arrived)
 
-`network: yes` on its own is **not proof of real progress** — it only means a
+`network: yes` on its own is **not proof of real progress** - it only means a
 TCP handshake completed, not that data is flowing. Cross-check CPU time growth
 and session/todo activity before concluding a task is healthy. Conversely,
-don't conclude "stuck" from a single heuristic either — see
+don't conclude "stuck" from a single heuristic either - see
 [MANUAL_STEPS.md](MANUAL_STEPS.md) for a way to reproduce and confirm outside
 the MCP server entirely, and check `ps aux | grep -i kilo` for contention from
 other `kilo serve` daemons or stray processes before assuming the CLI itself
