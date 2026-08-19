@@ -1380,7 +1380,7 @@ async def kilo_implement(
             loop = asyncio.get_running_loop()
             async def _lazy_link():
                 await asyncio.sleep(1.5)
-                sid = _find_session_for_task(cwd, datetime.now(timezone.utc).isoformat())
+                sid = _find_session_for_task(cwd, datetime.now(timezone.utc).isoformat(), run_id)
                 if sid:
                     _agent_manager_note_session(cwd, sid, agent_manager_worktree_id)
             loop.create_task(_lazy_link())
@@ -1624,7 +1624,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
 
         # Resolve the Kilo session id so the caller can steer/inspect it later
         # (kilo_task_progress, or continue_session_id on a follow-up call).
-        session_id = continue_session_id or _find_session_for_task(cwd, started_wall)
+        session_id = continue_session_id or _find_session_for_task(cwd, started_wall, run_id)
         if session_id:
             _agent_manager_note_session(cwd, session_id, agent_manager_worktree_id)
 
@@ -1705,7 +1705,7 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     cwd = record.get("working_directory")
     session_id = record.get("session_id")
     if not session_id and cwd:
-        session_id = _find_session_for_task(cwd, record.get("started", ""))
+        session_id = _find_session_for_task(cwd, record.get("started", ""), task_id)
 
     report = _parse_final_report(log_content) if log_content else {"outcome": "unknown", "files_changed": []}
     final_status = "completed" if report["outcome"] in ("success", "partial") else "failed"
@@ -1830,7 +1830,7 @@ async def kilo_task_progress(
     cwd = record.get("working_directory")
     session_id = record.get("session_id")
     if not session_id and cwd:
-        session_id = _find_session_for_task(cwd, record.get("started", ""))
+        session_id = _find_session_for_task(cwd, record.get("started", ""), task_id)
         if session_id:
             _write_task_record(task_id, {"session_id": session_id})
             _agent_manager_note_session(cwd, session_id, record.get("agent_manager_worktree_id"))
@@ -2500,6 +2500,15 @@ async def kilo_workspace_status(
 
 KILO_SESSION_DB = os.path.expanduser("~/.local/share/kilo/kilo.db")
 
+# run_id -> session_id, for _find_session_for_task's dedup. In-memory,
+# process-lifetime only (a server restart loses it, same as every other
+# in-memory task-tracking state here) — see that function's docstring for
+# why this exists: without it, concurrent isolation='worktree' tasks against
+# the same repo can resolve to the identical session_id, since Kilo records
+# them all under the same project.worktree row and the only remaining signal
+# is time-window ordering.
+_SESSION_CLAIMS: dict[str, str] = {}
+
 
 def _parse_ps_time(t: str) -> float:
     """Parse ps etime/time format ([[dd-]hh:]mm:ss[.ff]) into seconds."""
@@ -2552,7 +2561,7 @@ def _recent_kilo_sessions(limit: int = 15) -> list[tuple]:
         return []
 
 
-def _find_session_for_task(cwd: str, started_iso: str) -> Optional[str]:
+def _find_session_for_task(cwd: str, started_iso: str, run_id: str) -> Optional[str]:
     """Best-effort match: the earliest Kilo session created in `cwd` (or its
     main repo root — see below) at or after a task's start time. Kilo creates
     the session row within ~1s of `kilo run` starting, well before any
@@ -2569,11 +2578,31 @@ def _find_session_for_task(cwd: str, started_iso: str) -> Optional[str]:
     isolated-worktree task (session_id stayed 'unknown' in every such task
     tested live) — this falls back to the main repo root (via
     `_agent_manager_root`'s git-common-dir resolution) to fix the common
-    case. It's fuzzier under heavy parallelism: multiple concurrent
-    isolation='worktree' tasks against the SAME repo all normalize to the
-    same DB row's `worktree` value, so disambiguating between them degrades
-    to time-window ordering alone — still a large improvement over never
-    resolving at all."""
+    case.
+
+    `run_id` makes this dedup-safe under real parallelism (confirmed live
+    2026-08-19: three concurrent `kilo_implement` calls — two isolated in
+    different worktrees, one not — against the same repo all resolved to
+    the identical session_id before this fix, because they all matched the
+    same collapsed `project.worktree` row and nothing excluded a candidate
+    already attributed elsewhere). `_SESSION_CLAIMS` remembers, per `run_id`,
+    which `session_id` was already resolved: a repeat call for the SAME
+    `run_id` (e.g. the lazy Agent-Manager link shortly after launch, and the
+    real resolution at task completion, minutes later) returns the cached
+    value directly without re-querying; a call for a DIFFERENT, concurrent
+    `run_id` skips any candidate row already claimed by another `run_id`
+    before picking (and claiming) the next one. This removes the duplicate-
+    reporting symptom entirely. It does not — and structurally cannot, from
+    this side alone — guarantee that the *specific* row assigned to a given
+    `run_id` is the one that literally executed it, when several sessions
+    against the same repo were created within the same few-second window:
+    with `project.worktree` collapsed to one value by Kilo itself, ordering
+    by `time_created` is the only remaining signal, and under heavy
+    parallelism that ordering may not match real launch order 1:1. Still a
+    large improvement over the previous behavior (guaranteed collision, not
+    just possible misattribution)."""
+    if run_id in _SESSION_CLAIMS:
+        return _SESSION_CLAIMS[run_id]
     try:
         started_ms = datetime.fromisoformat(started_iso).timestamp() * 1000
     except (ValueError, TypeError):
@@ -2593,8 +2622,12 @@ def _find_session_for_task(cwd: str, started_iso: str) -> Optional[str]:
         con.close()
     except Exception:
         return None
+    claimed = set(_SESSION_CLAIMS.values())
     for sid, worktree in rows:
+        if sid in claimed:
+            continue
         if worktree and os.path.realpath(worktree) in targets:
+            _SESSION_CLAIMS[run_id] = sid
             return sid
     return None
 

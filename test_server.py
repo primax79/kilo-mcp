@@ -783,6 +783,7 @@ def _make_fake_kilo_db(path, worktree, session_id, time_created_ms, todos=None, 
 
 
 def test_find_session_for_task(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_SESSION_CLAIMS", {})
     db_path = tmp_path / "kilo.db"
     started = "2026-07-14T10:00:00+00:00"
     started_ms = int(datetime.fromisoformat(started).timestamp() * 1000)
@@ -790,9 +791,9 @@ def test_find_session_for_task(tmp_path, monkeypatch):
                        time_created_ms=started_ms + 1000)
     monkeypatch.setattr(server, "KILO_SESSION_DB", str(db_path))
 
-    assert server._find_session_for_task(str(tmp_path), started) == "ses_abc"
+    assert server._find_session_for_task(str(tmp_path), started, "run_a") == "ses_abc"
     # a directory that doesn't match any project's worktree finds nothing
-    assert server._find_session_for_task(str(tmp_path / "other"), started) is None
+    assert server._find_session_for_task(str(tmp_path / "other"), started, "run_b") is None
 
 
 def test_find_session_for_task_matches_main_repo_root_for_worktree_cwd(tmp_path, monkeypatch):
@@ -804,6 +805,7 @@ def test_find_session_for_task_matches_main_repo_root_for_worktree_cwd(tmp_path,
     resolved for any isolated task. This seeds the DB the way Kilo actually
     does (worktree = main repo root) and calls the session lookup with cwd
     set to a real linked worktree subdirectory."""
+    monkeypatch.setattr(server, "_SESSION_CLAIMS", {})
     repo = _init_git_repo(tmp_path / "repo")
     worktree_path = os.path.join(repo, ".kilo", "worktrees", "feat-z")
     subprocess.run(
@@ -819,7 +821,55 @@ def test_find_session_for_task_matches_main_repo_root_for_worktree_cwd(tmp_path,
                        time_created_ms=started_ms + 1000)
     monkeypatch.setattr(server, "KILO_SESSION_DB", str(db_path))
 
-    assert server._find_session_for_task(worktree_path, started) == "ses_isolated"
+    assert server._find_session_for_task(worktree_path, started, "run_iso") == "ses_isolated"
+
+
+def test_find_session_for_task_dedups_concurrent_runs_against_same_repo(tmp_path, monkeypatch):
+    """Regression test for a real bug found live 2026-08-19: three
+    near-simultaneous kilo_implement calls against the same repo (two
+    isolated in different worktrees, one not) all resolved to the identical
+    session_id, because Kilo records every one of them under the same
+    collapsed project.worktree row and, before this fix, nothing excluded a
+    session already attributed to another run_id — matching degraded to
+    'return the first/earliest row', the same row, every time. This seeds
+    two distinct session rows for the same worktree, close together in
+    time, and asserts two different run_ids each claim a distinct one."""
+    monkeypatch.setattr(server, "_SESSION_CLAIMS", {})
+    db_path = tmp_path / "kilo.db"
+    started = "2026-08-19T10:00:00+00:00"
+    started_ms = int(datetime.fromisoformat(started).timestamp() * 1000)
+    con = sqlite3.connect(str(db_path))
+    con.execute("CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT)")
+    con.execute(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, "
+        "time_created INTEGER, time_updated INTEGER, cost REAL, "
+        "tokens_input INTEGER, tokens_output INTEGER)"
+    )
+    con.execute("INSERT INTO project VALUES (?, ?)", ("proj1", str(tmp_path)))
+    # Two sessions, same collapsed worktree, ~200ms apart — exactly what
+    # Kilo produces for two concurrent isolation='worktree' tasks.
+    con.execute(
+        "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("ses_first", "proj1", "t1", started_ms + 500, started_ms + 500, 0.01, 10, 5),
+    )
+    con.execute(
+        "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("ses_second", "proj1", "t2", started_ms + 700, started_ms + 700, 0.01, 10, 5),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(server, "KILO_SESSION_DB", str(db_path))
+
+    first = server._find_session_for_task(str(tmp_path), started, "run_x")
+    second = server._find_session_for_task(str(tmp_path), started, "run_y")
+
+    assert first == "ses_first"
+    assert second == "ses_second"
+    assert first != second
+
+    # Idempotent: re-resolving the SAME run_id returns its own claim, not
+    # whatever the DB would now match first.
+    assert server._find_session_for_task(str(tmp_path), started, "run_x") == "ses_first"
 
 
 def test_read_todos_and_texts_and_summary(tmp_path, monkeypatch):
@@ -1338,7 +1388,7 @@ def test_kilo_task_progress_registers_session_in_agent_manager(tmp_path, monkeyp
     .kilo/agent-manager.json (the actual feature this section covers)."""
     repo = _init_git_repo(tmp_path / "repo")
     monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
-    monkeypatch.setattr(server, "_find_session_for_task", lambda cwd, started: "ses_progress")
+    monkeypatch.setattr(server, "_find_session_for_task", lambda cwd, started, run_id: "ses_progress")
     server._write_task_record("t9", {
         "status": "running", "working_directory": repo,
         "started": "2026-07-14T00:00:00+00:00",
