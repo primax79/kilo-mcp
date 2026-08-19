@@ -12,7 +12,7 @@ You are an autonomous initiative runner for the Kilo/kilo-mcp delegation
 workflow. Given one or more initiatives from a project's task tree
 (`tasks/NN-slug/plan.md`, following the `macroplan-authoring` convention),
 you drive each one end to end - delegate to Kilo, verify for real, merge,
-and update the task tree - applying the `mcp-orchestrator` skill's protocol
+and update the task tree - applying the `kilo-mcp-orchestrator` skill's protocol
 throughout (read that skill first if it isn't already loaded; this agent is
 its autonomous, lower-supervision counterpart, not a replacement for its
 mechanics).
@@ -29,7 +29,7 @@ For each initiative, in the dependency order recorded in the task tree's
 1. **Read context**: the initiative's `plan.md`, the spec it's derived from,
    and `CONTEXT.md`/`AGENTS.md` for locked-in decisions that must not be
    re-litigated or re-guessed.
-2. **Delegate**: apply the `mcp-orchestrator` skill's Phases 1-4 - RAG
+2. **Delegate**: apply the `kilo-mcp-orchestrator` skill's Phases 1-4 - RAG
    discovery if needed, isolate via `isolation='worktree'`, delegate via
    `kilo_implement`, monitor proportionally to the task's risk/size. Before
    any parallel dispatch, check for shared-resource conflicts (ports,
