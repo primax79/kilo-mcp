@@ -85,6 +85,58 @@ in doubt, delegate rather than fix it yourself.
     intended). Remove the worktree once merged and no longer needed
     (`git worktree remove <path>`).
 
+## Analysis/exploration requests need the same specification rigor as implementation requests
+
+"Analyze this project" is not a complete `kilo_implement` spec - it's
+exactly as underspecified as "implement improvements," and Kilo handed
+either will return the cheapest thing that technically satisfies it.
+Observed live: a request to analyze a project came back as a few-line
+document restating what the project is about and summarizing
+task-progress status - content already sitting in the README and the
+status file, not analysis. Kilo didn't fail the request; the request
+never said what analysis meant.
+
+Before dispatching an analysis/exploration `kilo_implement` call
+(report-shaped output, no code change, `agent='explore'` or `'code'`
+with no writes expected), put at least this into `task_instructions`:
+
+- **Scope, explicitly bounded.** Not "the project" - name the
+  subsystem(s)/directories/entry points in scope (pair with
+  `focus_files` from `kilo_rag_search`), and whether the boundary is
+  static (read the source) or behavioral (also run it, hit its
+  endpoints, execute its tests). An unbounded scope invites a
+  README-level summary because that's the only thing that fits any
+  possible boundary.
+- **Depth, named on a scale, not left implicit.** "Skim and summarize"
+  and "trace every call site of X across the codebase" are both
+  legitimate asks, but they produce completely different reports and
+  cost - pick one and say so in `execution_hints`. Silence defaults to
+  the shallow end, every time.
+- **The problem categories actually wanted**, by name: correctness bugs,
+  security exposure, performance/scaling limits, architectural coupling,
+  test-coverage gaps, dependency/supply-chain risk, dead code, API
+  inconsistency, whatever is relevant - a generic "find issues" produces
+  a generic wrap-up. Every claimed problem must cite the real
+  file/line/symbol it comes from, not a generality inferred from the
+  README or a directory listing - the same grounding discipline
+  `task-spec-authoring` requires for code-changing tasks, applied to
+  findings instead of diffs.
+- **The deliverable's shape.** How many findings, what evidence per
+  finding (citation, reproduction, severity), whether a verdict/priority
+  ranking is expected, whether comparison against a baseline/spec/other
+  codebase is in scope.
+- **A negative instruction against restating existing docs.** Explicitly
+  tell Kilo not to reproduce content already available in the
+  README/status file/docs as if it were a finding - that's the specific
+  failure mode observed live, and it's cheap to rule out by name in the
+  prompt.
+
+Verification for an analysis deliverable follows the same Phase 5
+discipline as code: skim-checking the report's own claims isn't
+verification. Spot-check a sample of its findings against the real
+file/line it cites via `kilo_workspace_status`/a direct read, the same
+way a code diff gets actually executed rather than just read.
+
 Remember: the RAG index behind `kilo_rag_search` is a standing resource for your own exploration and Q&A too — use it even when you are not delegating anything.
 
 **Agent Manager visibility is automatic, not something you manage.** `kilo_create_worktree` and `kilo_implement(isolation='worktree')` register the worktree — and later its session, once resolved — into `.kilo/agent-manager.json` on their own (as of 2026-07-29). You don't need to ask whether to do this, back up the file, or hand-edit it. The one caveat: a task launched before a kilo-mcp-server fix/restart doesn't benefit retroactively once it's already `completed` — if a worktree shows without a linked session, check whether it predates the current server process rather than assuming the mechanism is broken.
