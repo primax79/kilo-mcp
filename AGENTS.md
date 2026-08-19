@@ -31,17 +31,19 @@ the workspace root's `AGENTS.md` (one level up) for the sibling-repo map.
 
 ## Mandatory rules
 
-- **Never hand-edit a bound skill's methodology directly.** `orchestration-methodology`,
-  `headless-executor-contract`, `conflict-resolver`, and
-  `delegation-roi-analysis` are generated from `ai-architect-executor`'s
-  `SKILL.template.md` sources. If the methodology itself needs to change,
-  edit it there and re-run `scripts/regenerate_bound_skills.py` here — a
-  direct edit to the generated file will be silently overwritten on the
-  next regen. Binding-specific detail (real tool names, this server's own
-  parameters) lives in `bindings/*.json`, not in prose you'd hand-edit.
-  `task-spec-authoring`, `task-delegation`, `interactive-role-setup`,
-  `mcp-orchestrator`, `mcp-metrics-analyst`, `kilo-mcp-conflict-resolver`,
-  `kilo-mcp-headless-executor`, `kilo-mcp-rag-explorer` have no generated
+- **Never hand-edit a bound skill's methodology directly.** This repo's
+  concrete `kilo-mcp-orchestrator`, `mcp-metrics-analyst`,
+  `kilo-mcp-conflict-resolver`, and `kilo-mcp-headless-executor` skills
+  are generated (via `bindings/*.json`) from `ai-architect-executor`'s
+  generic `orchestration-methodology`, `delegation-roi-analysis`,
+  `conflict-resolver`, and `headless-executor-contract` `SKILL.template.md`
+  sources respectively. If the methodology itself needs to change, edit
+  the generic template there and re-run `scripts/regenerate_bound_skills.py`
+  here — a direct edit to any of these four concrete `SKILL.md` files will
+  be silently overwritten on the next regen. Binding-specific detail (real
+  tool names, this server's own parameters) lives in `bindings/*.json`, not
+  in prose you'd hand-edit. `task-spec-authoring`, `task-delegation`,
+  `interactive-role-setup`, and `kilo-mcp-rag-explorer` have no generated
   counterpart — edit those directly.
 - **Adding/renaming a tool in `server.py`** (new `@mcp.tool()`) means
   updating: the tool's docstring (surfaced to the connected client), the

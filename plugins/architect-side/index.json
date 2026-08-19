@@ -7,17 +7,17 @@
       ]
     },
     {
-      "name": "skills/mcp-metrics-analyst",
-      "files": [
-        "SKILL.md"
-      ]
-    },
-    {
-      "name": "skills/mcp-orchestrator",
+      "name": "skills/kilo-mcp-orchestrator",
       "files": [
         "SKILL.md",
         "scripts/diagnose-kilo-tasks.sh",
         "scripts/kill-kilo-task.sh"
+      ]
+    },
+    {
+      "name": "skills/mcp-metrics-analyst",
+      "files": [
+        "SKILL.md"
       ]
     }
   ]

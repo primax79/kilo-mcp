@@ -1,7 +1,7 @@
 {
   "skills": [
     {
-      "name": "mcp-orchestrator",
+      "name": "kilo-mcp-orchestrator",
       "files": [
         "SKILL.md",
         "scripts/diagnose-kilo-tasks.sh",

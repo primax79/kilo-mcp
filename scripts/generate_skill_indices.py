@@ -3,7 +3,7 @@
 generate_skill_indices.py - Generates Kilo-compatible index.json files at:
 1. Plugin Level (e.g. plugins/architect-side/index.json)
 2. Skills Directory Level (e.g. plugins/architect-side/skills/index.json)
-3. Individual Skill Level (e.g. plugins/architect-side/skills/mcp-orchestrator/index.json)
+3. Individual Skill Level (e.g. plugins/architect-side/skills/kilo-mcp-orchestrator/index.json)
 
 Ensures all forms of Kilo 'skills.urls' inputs work seamlessly regardless of
 trailing path level (point it at any of the three, Kilo resolves the same set).

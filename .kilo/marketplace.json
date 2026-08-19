@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "plugins": [
     {
-      "name": "mcp-orchestrator",
+      "name": "kilo-mcp-orchestrator",
       "description": "Orchestrate Kilo through the kilo-mcp server",
-      "source": "./plugins/architect-side/skills/mcp-orchestrator"
+      "source": "./plugins/architect-side/skills/kilo-mcp-orchestrator"
     },
     {
       "name": "mcp-metrics-analyst",

@@ -61,10 +61,10 @@ uv run --no-project --with "mcp>=2" python server.py --install-skills
 
 ### Step 2b: Orchestrator-Side Skills (optional)
 
-The repository also bundles two skills for **Claude / Orchestrators** under `.claude/skills/` (and under `plugins/architect-side/skills/`): `mcp-orchestrator` (the 5-phase delegation workflow) and `mcp-metrics-analyst` (ROI and defect analysis). When using Claude Code, they are picked up automatically as project skills. To make them available globally in Claude Code, copy them to your global Claude skills directory:
+The repository also bundles two skills for **Claude / Orchestrators** under `.claude/skills/` (and under `plugins/architect-side/skills/`): `kilo-mcp-orchestrator` (the 5-phase delegation workflow) and `mcp-metrics-analyst` (ROI and defect analysis). When using Claude Code, they are picked up automatically as project skills. To make them available globally in Claude Code, copy them to your global Claude skills directory:
 
 ```bash
-cp -R .claude/skills/mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.claude/skills/
+cp -R .claude/skills/kilo-mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.claude/skills/
 ```
 
 ### Step 3: Register the MCP Server
@@ -178,7 +178,7 @@ This section is a deterministic checklist for an AI agent (e.g. Claude in auto m
 | 0d | Python ≥ 3.11 | `python3 -c 'import tomllib'` | no error | proceed anyway (config file support is lost; env vars still work) - inform the operator |
 | 1 | Clone | `git clone <GIT_REPO_URL_FOR_KILO_MCP> ~/.local/share/kilo-mcp-server` | exit 0 | report the git error |
 | 2 | Kilo skills | `cd ~/.local/share/kilo-mcp-server && uv run --no-project --with "mcp>=2" python server.py --install-skills` | output lists the 3 `kilo-mcp-*` skills | report; check `uv`/network |
-| 3 | Claude skills | `mkdir -p ~/.claude/skills && cp -R .claude/skills/mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.claude/skills/` | dirs exist under `~/.claude/skills/` | report |
+| 3 | Claude skills | `mkdir -p ~/.claude/skills && cp -R .claude/skills/kilo-mcp-orchestrator .claude/skills/mcp-metrics-analyst ~/.claude/skills/` | dirs exist under `~/.claude/skills/` | report |
 | 4 | Config | copy `kilo-mcp.example.toml` to `~/.config/kilo-mcp/config.toml` | file exists, valid TOML | report |
 | 4b | Kilo pricing | - | - | **ASK the operator** whether their Kilo API keys are free (keep `0.0`) or paid (set real `input/output_cost_per_mtok`) |
 | 5 | Register | `claude mcp add kilo-mcp --scope user -- uv run --no-project --with "mcp>=2" python ~/.local/share/kilo-mcp-server/server.py` | exit 0 | report |

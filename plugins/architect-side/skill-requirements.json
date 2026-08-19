@@ -7,7 +7,7 @@
     "profile": "deep-reasoning",
     "reason": "ROI analysis and defect-pattern review that feeds back into task-spec policy — a wrong conclusion has no downstream check."
   },
-  "mcp-orchestrator": {
+  "kilo-mcp-orchestrator": {
     "profile": "orchestration",
     "reason": "Discovery, isolation, dispatch to kilo_implement, polling, verification, bookkeeping — errors are loud and immediate (a stuck or failed task)."
   }

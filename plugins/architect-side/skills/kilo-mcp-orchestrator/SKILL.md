@@ -1,10 +1,10 @@
 ---
-name: mcp-orchestrator
+name: kilo-mcp-orchestrator
 description: "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, and defect telemetry. Use when coordinating development work through the kilo-mcp tools."
 ---
 <!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
 
-# mcp-orchestrator
+# kilo-mcp-orchestrator
 
 This skill is designed for an Orchestrating AI (e.g. Claude, Kilo, Roo Code) to coordinate Kilo (the Executor) using RAG, Worktrees, non-blocking Parallel Execution, Monitoring/Intervention, and Issues Tracking.
 
@@ -87,55 +87,56 @@ in doubt, delegate rather than fix it yourself.
 
 ## Analysis/exploration requests need the same specification rigor as implementation requests
 
-"Analyze this project" is not a complete `kilo_implement` spec - it's
-exactly as underspecified as "implement improvements," and Kilo handed
-either will return the cheapest thing that technically satisfies it.
-Observed live: a request to analyze a project came back as a few-line
-document restating what the project is about and summarizing
-task-progress status - content already sitting in the README and the
-status file, not analysis. Kilo didn't fail the request; the request
-never said what analysis meant.
+"Analyze this project" is not a complete task spec - it's exactly as
+underspecified as "improve the code," and an Executor handed either will
+return the cheapest thing that technically satisfies it. Observed live: a
+request to analyze a project came back as a few-line document restating
+what the project is about and summarizing task-progress status - content
+already sitting in the README and the status file, not analysis. The
+Executor didn't fail the request; the request never said what analysis
+meant.
 
-Before dispatching an analysis/exploration `kilo_implement` call
-(report-shaped output, no code change, `agent='explore'` or `'code'`
-with no writes expected), put at least this into `task_instructions`:
+Before dispatching an analysis/exploration task (report-shaped output, no
+code change), state at least:
 
 - **Scope, explicitly bounded.** Not "the project" - name the
-  subsystem(s)/directories/entry points in scope (pair with
-  `focus_files` from `kilo_rag_search`), and whether the boundary is
-  static (read the source) or behavioral (also run it, hit its
-  endpoints, execute its tests). An unbounded scope invites a
+  subsystem(s)/directories/entry points in scope, and whether the
+  boundary is static (read the source) or behavioral (also run it, hit
+  its endpoints, execute its tests). An unbounded scope invites a
   README-level summary because that's the only thing that fits any
   possible boundary.
-- **Depth, named on a scale, not left implicit.** "Skim and summarize"
-  and "trace every call site of X across the codebase" are both
-  legitimate asks, but they produce completely different reports and
-  cost - pick one and say so in `execution_hints`. Silence defaults to
-  the shallow end, every time.
+- **Depth, named on a scale, not left implicit.** "Skim and summarize" and
+  "trace every call site of X across the codebase" are both legitimate
+  asks, but they produce completely different reports and cost - pick one
+  and say so. Silence defaults to the shallow end, every time.
 - **The problem categories actually wanted**, by name: correctness bugs,
   security exposure, performance/scaling limits, architectural coupling,
   test-coverage gaps, dependency/supply-chain risk, dead code, API
-  inconsistency, whatever is relevant - a generic "find issues" produces
-  a generic wrap-up. Every claimed problem must cite the real
-  file/line/symbol it comes from, not a generality inferred from the
-  README or a directory listing - the same grounding discipline
-  `task-spec-authoring` requires for code-changing tasks, applied to
-  findings instead of diffs.
+  inconsistency, whatever is relevant - a generic "find issues" produces a
+  generic wrap-up. This is the same negative-claim/grounding discipline
+  `task-spec-authoring` requires for code-changing
+  tasks, applied to findings instead of diffs: every claimed problem must
+  cite the real file/line/symbol it comes from, not a generality inferred
+  from the README or a directory listing.
 - **The deliverable's shape.** How many findings, what evidence per
   finding (citation, reproduction, severity), whether a verdict/priority
   ranking is expected, whether comparison against a baseline/spec/other
-  codebase is in scope.
+  codebase is in scope. If you want the same structure a spec/task review
+  uses (executive assessment, findings by severity, per-area
+  recommendations, final verdict - see
+  `task-spec-authoring`'s review format), say
+  that explicitly rather than assuming the Executor will reach for it on
+  its own.
 - **A negative instruction against restating existing docs.** Explicitly
-  tell Kilo not to reproduce content already available in the
+  tell the Executor not to reproduce content already available in the
   README/status file/docs as if it were a finding - that's the specific
-  failure mode observed live, and it's cheap to rule out by name in the
-  prompt.
+  failure mode observed live, and it's cheap to rule out by name.
 
 Verification for an analysis deliverable follows the same Phase 5
 discipline as code: skim-checking the report's own claims isn't
 verification. Spot-check a sample of its findings against the real
-file/line it cites via `kilo_workspace_status`/a direct read, the same
-way a code diff gets actually executed rather than just read.
+file/line it cites, the same way a code diff gets actually executed
+rather than just read.
 
 Remember: the RAG index behind `kilo_rag_search` is a standing resource for your own exploration and Q&A too — use it even when you are not delegating anything.
 

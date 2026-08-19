@@ -1,11 +1,11 @@
 {
   "items": [
     {
-      "id": "mcp-orchestrator",
+      "id": "kilo-mcp-orchestrator",
       "description": "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, and defect telemetry. Use when coordinating development work through the kilo-mcp tools.",
       "category": "architect-side",
-      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/architect-side/skills/mcp-orchestrator",
-      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/mcp-orchestrator.tar.gz"
+      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/architect-side/skills/kilo-mcp-orchestrator",
+      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-orchestrator.tar.gz"
     },
     {
       "id": "mcp-metrics-analyst",

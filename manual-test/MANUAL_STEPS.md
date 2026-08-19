@@ -83,7 +83,7 @@ sqlite3 "file:$HOME/.local/share/kilo/kilo.db?mode=ro" -readonly \
 Or just use the packaged script, which does all of the above in one shot:
 
 ```bash
-/Users/Alfredo/devel/kilo-mcp-server/.claude/skills/mcp-orchestrator/scripts/diagnose-kilo-tasks.sh "$SCRATCH"
+/Users/Alfredo/devel/kilo-mcp-server/.claude/skills/kilo-mcp-orchestrator/scripts/diagnose-kilo-tasks.sh "$SCRATCH"
 ```
 
 **What to watch for (from the live investigation on 2026-07-14):** a process
@@ -106,7 +106,7 @@ cat "$SCRATCH/saluto.txt" 2>/dev/null
 ## 6. Cancel it if needed (kilo_task_cancel equivalent)
 
 ```bash
-/Users/Alfredo/devel/kilo-mcp-server/.claude/skills/mcp-orchestrator/scripts/kill-kilo-task.sh "$KILO_PID" "stuck - no session after N minutes"
+/Users/Alfredo/devel/kilo-mcp-server/.claude/skills/kilo-mcp-orchestrator/scripts/kill-kilo-task.sh "$KILO_PID" "stuck - no session after N minutes"
 ```
 
 or by hand:

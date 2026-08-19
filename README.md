@@ -151,7 +151,7 @@ Two plugins, the concrete Kilo binding of the generic
 [Architect/Executor pattern](https://github.com/primax79/ai-architect-executor) -
 install the side(s) you need:
 
-- **`architect-side`**: `mcp-orchestrator`, `mcp-metrics-analyst`,
+- **`architect-side`**: `kilo-mcp-orchestrator`, `mcp-metrics-analyst`,
   `kilo-mcp-conflict-resolver`, plus the `mcp-orchestrator-agent` subagent.
   For the orchestrating AI delegating to Kilo via MCP.
 - **`executor-side`**: `kilo-mcp-headless-executor`, `kilo-mcp-rag-explorer`.
@@ -163,7 +163,7 @@ this family - see [`agentic-coding-kit`'s docs](https://github.com/primax79/agen
 for the full concepts/authoring/distribution reference if any of this is
 unfamiliar.
 
-**One real dependency worth knowing about**: `mcp-orchestrator` and
+**One real dependency worth knowing about**: `kilo-mcp-orchestrator` and
 `mcp-orchestrator-agent` (both `architect-side`) assume the `tasks/` tree
 convention (`CONTEXT.md`, `00-INDEX.md`, `specs/`, `NN-<slug>/plan.md`)
 owned by [`agentic-coding-kit`](https://github.com/primax79/agentic-coding-kit)'s
@@ -341,7 +341,7 @@ Report the git status (`git status -s`) of a working directory or worktree - use
 
 ### `kilo_task_status`
 
-Coarse, OS-level diagnosis of running `kilo run` tasks - including delegations with no known `task_id` (e.g. launched from *other* sessions, or before this server tracked tasks). For each process it reports elapsed vs CPU time, network activity, the matching Kilo session's last update from `~/.local/share/kilo/kilo.db` (read-only), and a verdict: **WORKING** (recent session writes, or a long model call in flight), **STARTING** (younger than 2 minutes), or **LIKELY STUCK** (minutes old, no CPU, no network, no session - kill the PID and the calling session receives the exit). For a `task_id` you launched yourself, prefer `kilo_task_progress` - it reads Kilo's actual plan and commentary, not just a heuristic. The same diagnostic (plus a standalone kill script) is also available outside the MCP tool call as `scripts/diagnose-kilo-tasks.sh` / `scripts/kill-kilo-task.sh` in the `mcp-orchestrator` skill.
+Coarse, OS-level diagnosis of running `kilo run` tasks - including delegations with no known `task_id` (e.g. launched from *other* sessions, or before this server tracked tasks). For each process it reports elapsed vs CPU time, network activity, the matching Kilo session's last update from `~/.local/share/kilo/kilo.db` (read-only), and a verdict: **WORKING** (recent session writes, or a long model call in flight), **STARTING** (younger than 2 minutes), or **LIKELY STUCK** (minutes old, no CPU, no network, no session - kill the PID and the calling session receives the exit). For a `task_id` you launched yourself, prefer `kilo_task_progress` - it reads Kilo's actual plan and commentary, not just a heuristic. The same diagnostic (plus a standalone kill script) is also available outside the MCP tool call as `scripts/diagnose-kilo-tasks.sh` / `scripts/kill-kilo-task.sh` in the `kilo-mcp-orchestrator` skill.
 
 **Parameters:** `working_directory` *(optional - filter to one workspace)*.
 

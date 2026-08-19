@@ -8,10 +8,10 @@ are read-only except the kill commands at the end.
 ```bash
 # List every running `kilo run` process with elapsed/CPU/network + a
 # WORKING / STARTING / LIKELY STUCK verdict. Optionally filter by workspace:
-.claude/skills/mcp-orchestrator/scripts/diagnose-kilo-tasks.sh [working_directory]
+.claude/skills/kilo-mcp-orchestrator/scripts/diagnose-kilo-tasks.sh [working_directory]
 
 # Cleanly stop one (SIGTERM, then SIGKILL after a grace period):
-.claude/skills/mcp-orchestrator/scripts/kill-kilo-task.sh <pid> "<reason>"
+.claude/skills/kilo-mcp-orchestrator/scripts/kill-kilo-task.sh <pid> "<reason>"
 ```
 
 ## 2. Raw bash one-liners

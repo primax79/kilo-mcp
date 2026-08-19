@@ -3,14 +3,14 @@
   "dependencies": [
     {
       "repo": "https://github.com/primax79/ai-architect-executor",
-      "reason": "mcp-orchestrator, mcp-metrics-analyst, and kilo-mcp-conflict-resolver are generated from that repo's SKILL.template.md sources plus this repo's own bindings/*.json - see scripts/regenerate_bound_skills.py.",
+      "reason": "kilo-mcp-orchestrator, mcp-metrics-analyst, and kilo-mcp-conflict-resolver are generated from that repo's SKILL.template.md sources plus this repo's own bindings/*.json - see scripts/regenerate_bound_skills.py.",
       "checked_by": "scripts/regenerate_bound_skills.py"
     },
     {
       "plugin": "common-tools",
       "repo": "https://github.com/primax79/agentic-coding-kit",
       "skill": "macroplan-authoring",
-      "reason": "mcp-orchestrator and mcp-orchestrator-agent reference the task/ tree convention (CONTEXT.md, 00-INDEX.md, specs/, NN-<slug>/plan.md, summary.md) that skill owns - inherited from ai-architect-executor's generic template and referenced directly in mcp-orchestrator-agent.md's bookkeeping step."
+      "reason": "kilo-mcp-orchestrator and mcp-orchestrator-agent reference the task/ tree convention (CONTEXT.md, 00-INDEX.md, specs/, NN-<slug>/plan.md, summary.md) that skill owns - inherited from ai-architect-executor's generic template and referenced directly in mcp-orchestrator-agent.md's bookkeeping step."
     }
   ]
 }
