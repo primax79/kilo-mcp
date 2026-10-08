@@ -180,12 +180,7 @@ claude plugin marketplace add https://github.com/primax79/kilo-mcp.git
 /plugin install architect-side   # or executor-side, or both
 ```
 
-**Kilo Code**, either via `kilo-plugin-manager` (covers the agent too):
-
-```bash
-python3 ~/.kilo/skills/kilo-plugin-manager/scripts/plugin_manager.py add https://github.com/primax79/kilo-mcp.git --name kilo-mcp
-python3 ~/.kilo/skills/kilo-plugin-manager/scripts/plugin_manager.py install architect-side@kilo-mcp
-```
+**Kilo Code**: install with the AI Swissknife VS Code extension (or its CLI) (covers the agent too),
 
 or Kilo's native Skill URLs (skills only, no extra tooling - paste into
 Settings UI **Local Config** or `.kilo/kilo.jsonc`'s `skills.urls`, one URL

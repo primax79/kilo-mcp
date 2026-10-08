@@ -4,35 +4,7 @@ This document explains how to install Kilo skills, agents, and the MCP server fr
 
 ## 1. Installing Skills and Agents from a Git Repository
 
-Kilo Code provides a native way to manage plugins, skills, and agents from Git repositories via the `kilo-plugin-manager` skill. This system emulates the Claude Code plugin marketplace, allowing for centralized installation and updates.
-
-If you have the `kilo-plugin-manager` skill installed, you can use its Python script to manage your marketplace.
-
-### Add a Git Repository (Marketplace)
-
-To register a new marketplace from a Git URL:
-
-```bash
-python3 ~/.kilo/skills/kilo-plugin-manager/scripts/plugin_manager.py add <GIT_REPO_URL> --name <marketplace-name>
-```
-
-### List Available Plugins
-
-To see what plugins (skills and agents) are offered by the registered marketplaces:
-
-```bash
-python3 ~/.kilo/skills/kilo-plugin-manager/scripts/plugin_manager.py list
-```
-
-### Install a Specific Skill
-
-To install a skill globally on your machine:
-
-```bash
-python3 ~/.kilo/skills/kilo-plugin-manager/scripts/plugin_manager.py install <skill-name>@<marketplace-name>
-```
-
-*(The manager handles creating the necessary symlinks in `~/.kilo/skills/` and automatically translates any agents from Claude format to Kilo format if needed).*
+For Kilo Code, install the skills and agents with the AI Swissknife VS Code extension (or its CLI).
 
 ---
 
