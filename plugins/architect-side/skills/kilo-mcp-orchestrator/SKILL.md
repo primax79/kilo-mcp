@@ -150,20 +150,24 @@ and it occupies your context while it waits.
 - **Capture first, then continue.** As soon as the work will not be finished
   and verified in the current turn, write it down as a task in the repository's
   `tasks/` tree, following the emergent-task rules of the `macroplan-authoring`
-  convention: one folder per task with its definition, context and progress, a
-  unique id, and a priority with a reason. Then go back to what you were doing.
+  convention: a task file (a folder with its context and progress once it has
+  any), a unique id, a priority with a reason, and a one-line entry in the
+  registry. Then go back to what you were doing.
   The reply cites the task by id and path; a "next steps" paragraph in the chat
   is not a substitute.
 - **Not only for delegation.** The same capture applies to work you will do
   yourself, and to work for a person. The executor is a field of the task, not
   a reason to skip writing it. Your own tasks go through the same states and
   are not done until their Verification has been run.
-- **The task folder is the hand-off.** When the task is later given to an
-  Executor or to a fresh session, point it at the task folder. Do not
-  re-explain the task from your memory: if something is missing from the
-  folder, add it there first.
+- **The task is the hand-off.** When the task is later given to an Executor
+  or to a fresh session, give it the task's `handoff` line and point it at the
+  task's files. Do not re-explain the task from your memory: if something is
+  missing, add it to the task first.
+- **Verified is not yours to set on your own work.** Only someone other than
+  the executor marks a task verified, after re-running its Verification. This
+  applies to the tasks you executed yourself too.
 - **Keep your context lean.** After capturing a task, keep only its one-line
-  entry in the registry. Read its folder again only when you pick it up.
+  entry in the registry. Read its files again only when you pick it up.
 
 Remember: the RAG index behind `kilo_rag_search` is a standing resource for your own exploration and Q&A too — use it even when you are not delegating anything.
 
