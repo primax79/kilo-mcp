@@ -1,6 +1,6 @@
 ---
 name: kilo-mcp-orchestrator
-description: "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, and defect telemetry. Use when coordinating development work through the kilo-mcp tools."
+description: "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, defect telemetry, and capture of work that emerges mid-session as task files in the repository (whoever will execute it, including the orchestrator itself). Use when coordinating development work through the kilo-mcp tools, or when new tasks appear during a working session."
 ---
 <!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
 
@@ -137,6 +137,33 @@ discipline as code: skim-checking the report's own claims isn't
 verification. Spot-check a sample of its findings against the real
 file/line it cites, the same way a code diff gets actually executed
 rather than just read.
+
+## Work that emerges mid-session: capture it, whoever will do it
+
+New work keeps appearing while you orchestrate: the user asks for something
+aside from the current task, a review finds a defect out of scope, an
+Executor's report raises a follow-up, a decision waits on someone, a peer
+session hands something over. Work that exists only in the conversation is
+lost at the end of the session or at compaction. Nobody else can pick it up,
+and it occupies your context while it waits.
+
+- **Capture first, then continue.** As soon as the work will not be finished
+  and verified in the current turn, write it down as a task in the repository's
+  `tasks/` tree, following the emergent-task rules of the `macroplan-authoring`
+  convention: one folder per task with its definition, context and progress, a
+  unique id, and a priority with a reason. Then go back to what you were doing.
+  The reply cites the task by id and path; a "next steps" paragraph in the chat
+  is not a substitute.
+- **Not only for delegation.** The same capture applies to work you will do
+  yourself, and to work for a person. The executor is a field of the task, not
+  a reason to skip writing it. Your own tasks go through the same states and
+  are not done until their Verification has been run.
+- **The task folder is the hand-off.** When the task is later given to an
+  Executor or to a fresh session, point it at the task folder. Do not
+  re-explain the task from your memory: if something is missing from the
+  folder, add it there first.
+- **Keep your context lean.** After capturing a task, keep only its one-line
+  entry in the registry. Read its folder again only when you pick it up.
 
 Remember: the RAG index behind `kilo_rag_search` is a standing resource for your own exploration and Q&A too — use it even when you are not delegating anything.
 

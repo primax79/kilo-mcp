@@ -2,7 +2,7 @@
   "_comment": "Binding map for kilo-mcp-orchestrator (Kilo-specific concrete binding of orchestration-methodology) from ai-architect-executor's generic template. Regenerate with scripts/regenerate_bound_skills.py.",
   "name": "kilo-mcp-orchestrator",
   "plugin": "architect-side",
-  "description": "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, and defect telemetry. Use when coordinating development work through the kilo-mcp tools.",
+  "description": "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, defect telemetry, and capture of work that emerges mid-session as task files in the repository (whoever will execute it, including the orchestrator itself). Use when coordinating development work through the kilo-mcp tools, or when new tasks appear during a working session.",
   "tools": {
     "implement_call": "`kilo_implement`",
     "implement_call_cap": "`kilo_implement`",
