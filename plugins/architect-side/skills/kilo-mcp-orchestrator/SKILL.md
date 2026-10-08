@@ -163,9 +163,11 @@ and it occupies your context while it waits.
   or to a fresh session, give it the task's `handoff` line and point it at the
   task's files. Do not re-explain the task from your memory: if something is
   missing, add it to the task first.
-- **Verified is not yours to set on your own work.** Only someone other than
-  the executor marks a task verified, after re-running its Verification. This
-  applies to the tasks you executed yourself too.
+- **Verified is not yours to set on your own work, unless the user approves.**
+  Someone other than the executor marks a task verified, after re-running its
+  Verification; the executor may do it only once the user has explicitly
+  approved the result in conversation (record when and what in the task's
+  PROGRESS.md). This applies to the tasks you executed yourself too.
 - **Keep your context lean.** After capturing a task, keep only its one-line
   entry in the registry. Read its files again only when you pick it up.
 

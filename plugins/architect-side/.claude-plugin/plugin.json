@@ -1,6 +1,6 @@
 {
   "name": "architect-side",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Architect-side skills for orchestrating Kilo through the kilo-mcp server: orchestrator methodology, ROI metrics, conflict resolution, plus the mcp-orchestrator-agent subagent. Install this if you're the orchestrating AI delegating work to Kilo via MCP.",
   "author": {
     "name": "Alfredo Oliviero"
