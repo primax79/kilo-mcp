@@ -98,6 +98,31 @@ in doubt, delegate rather than fix it yourself.
     successful merge, but also whenever a run is **cancelled** or
     **discarded** (`dropped`), so stale worktrees never linger on disk.
 
+## Economic Rules and Cost Control in Orchestration
+
+Software engineering agents operate in multi-turn loops where context accumulates rapidly (30k–200k tokens per turn). Empirical production data across 573 runs ($532 total shadow spend) proves that an unconstrained agent can burn $200+/day on routine tasks. Always enforce these **7 binding economic rules**:
+
+1. **Incremental Dispatch, Not Scheduled Full Passes:**
+   Only dispatch an agent task on a component or repository when its pinned Git commit hash has changed. Never re-scan or re-delegate across a repository corpus on a timer (a full pass on 640 repos costs ~$1,440–$2,470; commit-triggered runs reduce annual spend by 98%).
+2. **Flash / Bulk Model by Default, Frontier on Demand:**
+   Use the `bulk-execution` model (e.g. `Gemini 3.8 Flash`, `Claude Sonnet`, `GPT-5-Codex-Mini`) by default for implementation and exploration (~$2.25/component). Promote to `deep-reasoning` (e.g. `Gemini 4 Argon`, `Claude Opus`) only where the stronger model materially changes the verdict: independent verification of high/critical findings, complex architectural specs, and subtle semantic conflict resolution. Empirical production data shows a real-world ~1.7× cost difference per component.
+3. **Maximize Implicit Cache via Byte-Stable Prompt Prefixes:**
+   In real production runs, fresh (uncached) input accounted for **47% of total model spend**, while implicit caching served 89% of read tokens at 20× less cost. Keep invariant prompt text (grounding rules, methodology, templates) strictly at the beginning of prompts, byte-identical across runs. Put variable context (file paths, diffs, task details) at the very end.
+4. **Session Reuse for Review → Refutation / Fixes (`continue_session_id`):**
+   When an agent reviews code and then refutes or fixes findings, reuse the same session (`continue_session_id` / `--resume`) rather than spawning a fresh sandbox. Running review and refutation in separate sandboxes re-reads the entire codebase from scratch, wasting ~$67 in duplicate uncached input per 100 components.
+5. **Driver-Level Budget Guardrails:**
+   Monitor cumulative session cost (`kilo.db`, `kilo_metrics`) and pause dispatch when a configured daily or per-run cost ceiling is reached. Never let an autonomous loop run unmonitored.
+6. **Asynchronous Batch Path for Latency-Tolerant Bulk Scans:**
+   For large-scale, non-interactive sweeps, prefer asynchronous Batch APIs (-50% cost reduction). Split "bulk background scan" (batchable, asynchronous) from "interactive developer orchestration" (synchronous).
+7. **Factor in Scheduled Price Step-Ups:**
+   Track model pricing deadlines (e.g. `Gemini 4 Argon` doubles on 2026-12-01 to $4 in / $20 out; `Gemini 3.8 Flash` holds its promotional $0.75 in / $3.75 out rate until 2026-12-31, providing a **5.33× price advantage** during December 2026).
+
+### Official Online Model Pricing Documentation
+- **Google Gemini API:** [`https://ai.google.dev/gemini-api/docs/pricing`](https://ai.google.dev/gemini-api/docs/pricing)
+- **Anthropic Claude API:** [`https://www.anthropic.com/pricing`](https://www.anthropic.com/pricing)
+- **OpenAI API:** [`https://openai.com/api/pricing/`](https://openai.com/api/pricing/)
+- **Comprehensive Cost Analysis Report:** [`docs/07-gemini-pricing-and-role-cost-analysis.md`](../../../docs/07-gemini-pricing-and-role-cost-analysis.md)
+
 ## Analysis/exploration requests need the same specification rigor as implementation requests
 
 "Analyze this project" is not a complete task spec - it's exactly as
