@@ -15,7 +15,7 @@ This is the **Kilo-specific binding** of a protocol-agnostic pattern -
 the abstract phases (discovery, isolation, delegation, monitoring,
 verification, closure) and the headless-worker behavioral contract this
 server implements are documented tool-agnostically in
-[`ai-architect-executor`](https://github.com/primax79/ai-architect-executor);
+[`ai-orchestration`](https://github.com/primax79/ai-orchestration);
 this repo is what makes that pattern concrete for Kilo Code over MCP.
 General Claude Code/Kilo Code plugin & marketplace concepts (skills, agents,
 `.claude-plugin/marketplace.json`, Kilo's Skill URLs) are covered in
@@ -33,7 +33,7 @@ rather than repeated here.
 - **💸 Configurable Cost Model & Delegation Policy**: Whether Kilo execution is free depends on the operator - some have provider API keys supplied at no charge, others pay per token. Set `[kilo] input_cost_per_mtok` / `output_cost_per_mtok` (default `0.0` = free) to your real Kilo rates: the built-in delegation policy automatically switches between a free-Kilo model (only orchestrator tokens matter) and a paid-Kilo model (Kilo's own agentic loop joins the comparison), and cost estimates include Kilo's execution cost. The `delegation_policy` setting still overrides the injected policy text entirely, so the orchestrator self-selects *when* delegating (short spec + review) beats doing the work inline; tune it without touching code.
 - **📊 Metrics & Feedback Loop**: Every run is recorded to `metrics.jsonl` (duration, outcome parsed from Kilo's Final Report, generated-code volume, real delegation cost vs estimated inline cost). Defects found during review are logged via `kilo_log_issue` to `issues.jsonl`, and `kilo_metrics` aggregates everything - surfacing the exact cost breakdown (orchestrator spec+review vs. Kilo execution) so you can see whether delegation pays off and which defect categories the prompts must start guarding against.
 - **🤖 Agent & Skill Discovery**: Exposes tools for the orchestrator to dynamically discover available Kilo agents (e.g., `code`, `explore`) and custom skills configured in your local or global `.kilo/` directories.
-- **🛡️ Advanced Orchestration**: Support for git worktrees (`kilo_create_worktree`) to allow parallel feature implementations, advanced workspace checks (`kilo_workspace_status`), provider status checks (`kilo_auth_status`), and custom command execution (`kilo_run_command`). Included are skills (`kilo-mcp-headless-executor`, `kilo-mcp-conflict-resolver`, and `kilo-mcp-rag-explorer`) to improve parallel agent work, headless task completion, and fast semantic search.
+- **🛡️ Advanced Orchestration**: Support for git worktrees (`kilo_create_worktree`) to allow parallel feature implementations, advanced workspace checks (`kilo_workspace_status`), provider status checks (`kilo_auth_status`), and custom command execution (`kilo_run_command`). Included are skills (`kilo-mcp-executor-contract`, `kilo-mcp-conflict-resolver`, and `kilo-mcp-rag-explorer`) to improve parallel agent work, headless task completion, and fast semantic search.
 - **🎯 Precise Context Injection**: The orchestrator can pass specific files as `focus_files`, ensuring Kilo reads the exact context needed before making changes.
 - **⚙️ Dynamic Configuration**: Claude can inject environment variables into the Kilo subprocess at runtime (e.g. debugging flags) to shape Kilo's execution environment; the server itself is configured via a layered env-var/TOML/default scheme.
 - **🛡️ Non-Interactive by Default**: Safely runs Kilo in background subprocesses without hanging on interactive CLI prompts.
@@ -148,13 +148,13 @@ claude mcp get kilo-mcp
 ### Install Companion Skills
 
 Two plugins, the concrete Kilo binding of the generic
-[Architect/Executor pattern](https://github.com/primax79/ai-architect-executor) -
+[Architect/Executor pattern](https://github.com/primax79/ai-orchestration) -
 install the side(s) you need:
 
-- **`architect-side`**: `kilo-mcp-orchestrator`, `mcp-metrics-analyst`,
-  `kilo-mcp-conflict-resolver`, plus the `mcp-orchestrator-agent` subagent.
+- **`architect-side`**: `kilo-mcp-orchestrator`, `kilo-mcp-metrics-analyst`,
+  `kilo-mcp-conflict-resolver`, plus the `kilo-mcp-orchestrator-agent` subagent.
   For the orchestrating AI delegating to Kilo via MCP.
-- **`executor-side`**: `kilo-mcp-headless-executor`, `kilo-mcp-rag-explorer`.
+- **`executor-side`**: `kilo-mcp-executor-contract`, `kilo-mcp-rag-explorer`.
   For the Kilo side.
 
 This repo is itself a Claude Code / Kilo Code plugin marketplace
@@ -164,12 +164,12 @@ for the full concepts/authoring/distribution reference if any of this is
 unfamiliar.
 
 **One real dependency worth knowing about**: `kilo-mcp-orchestrator` and
-`mcp-orchestrator-agent` (both `architect-side`) assume the `tasks/` tree
+`kilo-mcp-orchestrator-agent` (both `architect-side`) assume the `tasks/` tree
 convention (`CONTEXT.md`, `00-INDEX.md`, `specs/`, `NN-<slug>/plan.md`)
-owned by [`agentic-coding-kit`](https://github.com/primax79/agentic-coding-kit)'s
-`macroplan-authoring` skill (`common-tools` plugin) - install that
+owned by [`ai-orchestration`](https://github.com/primax79/ai-orchestration)'s
+`task-pipeline` skill (`architect-side` plugin) - install that
 alongside this one if you delegate multi-step/multi-session work through
-macroplans. See `plugins/architect-side/dependencies.json` and
+task pipelines. See `plugins/architect-side/dependencies.json` and
 `plugins/executor-side/dependencies.json` for the machine-readable record
 (informational only - neither tool's installer enforces it today).
 
@@ -252,6 +252,12 @@ The core execution tool. Claude uses this to delegate work.
 - `isolation` *(`"worktree"`, optional)*: Auto-creates a git worktree + new branch under `working_directory` (`.kilo/worktrees/<branch>`) and runs Kilo there instead of directly in `working_directory` - the one-call equivalent of calling `kilo_create_worktree` yourself first. **`kilo_implement` has no isolation and no locking by default** (see [Concurrency & Isolation](#concurrency--isolation) below) - pass this for anything beyond a single trivial edit, and always for parallel calls against the same repo. The worktree (and later the session, once resolved) are also registered in `.kilo/agent-manager.json` best-effort - see [Agent Manager Integration](#agent-manager-integration).
 - `worktree_branch` / `worktree_base_branch` *(string, optional)*: Branch name (default `kilo/<task_id>`) and base branch/commit for the worktree created by `isolation='worktree'`. Ignored unless `isolation` is set.
 
+### `kilo_task_wait`
+
+Await a background `kilo_implement` task until it reaches a terminal state (`completed`, `failed`, `cancelled`, `error`), or until `timeout_seconds` elapses, polling and reconciling orphaned processes from their log files every 2 seconds. When the task finishes, returns the full `kilo_task_result` report; on timeout, returns a clear status summary with live progress and elapsed seconds without raising.
+
+**Parameters:** `task_id` *(required)*, `timeout_seconds` *(optional, int)*.
+
 ### `kilo_task_result`
 
 Fetch the outcome of a background delegation by `task_id`: returns the full Final Report (including the resolved `session_id`) once completed, a "still running" pointer to `kilo_task_progress`/`kilo_task_status`, or the cancellation note if it was stopped. If the task's process has already exited but nobody reconciled its record yet (e.g. the server that launched it restarted mid-run), the record is **self-healed from its log file** on this call - reconstructing the Final Report instead of reporting "running" forever. Task records persist under `KILO_MCP_DATA_DIR/tasks/`.
@@ -276,9 +282,15 @@ Records a defect found while reviewing Kilo-generated code (linked to the `run_i
 
 **Parameters:** `run_id` *(required)*, `category` *(kebab-case defect class, e.g. `missing-edge-case`, `ignored-instruction`)*, `description` *(required)*, `severity` *(`minor`|`major`|`critical`)*, `file` *(optional)*.
 
+### `kilo_log_decision`
+
+Records an orchestration branch decision (`delegate` | `inline` | `escalate` | `discarded`) to `decisions.jsonl` under `KILO_MCP_DATA_DIR`, so `kilo_metrics` and `kilo-mcp-metrics-analyst` can evaluate actual delegation decisions, inline follow-up rates, and discarded runs.
+
+**Parameters:** `branch` *(required: `delegate`|`inline`|`escalate`|`discarded`)*, `reason` *(required)*, `task_ref` *(optional)*, `followup_needed` *(optional bool, default `false`)*, `run_id` *(optional)*.
+
 ### `kilo_metrics`
 
-Aggregates usage over a look-back window: runs and outcomes, generated code volume, **real cost of delegating** (surfacing the breakdown: "cost of delegating: $X (Claude spec+review $Y + Kilo execution $Z)", or noting if Kilo execution was at no cost) **vs estimated cost of generating inline**, and logged defects by category. Raw JSONL data stays in `KILO_MCP_DATA_DIR` for ad-hoc analysis (`jq`, pandas, …).
+Aggregates usage over a look-back window: runs and outcomes, generated code volume, **real cost of delegating** (surfacing the breakdown: "cost of delegating: $X (Claude spec+review $Y + Kilo execution $Z)", or noting if Kilo execution was at no cost) **vs estimated cost of generating inline**, recorded orchestration decisions (`delegate`, `inline`, `escalate`, `discarded`, and `inline_followup_needed`), and logged defects by category. Raw JSONL data stays in `KILO_MCP_DATA_DIR` for ad-hoc analysis (`jq`, pandas, …).
 
 **Parameters:** `days` *(optional, default 30)*.
 

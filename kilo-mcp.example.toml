@@ -50,8 +50,12 @@ output_cost_per_mtok = 0.0
 # free-Kilo policy when both are 0.0, paid-Kilo policy otherwise).
 # env: KILO_MCP_DELEGATION_POLICY
 # delegation_policy = """
-# DELEGATE large, well-specifiable multi-file work; do small edits yourself.
-# Always review the returned report.
+# DELEGATE multi-file changes, bulk/mechanical generation, and well-specifiable work.
+# DO IT INLINE ONLY when ALL of the following hold: single file, <10 lines changed,
+# no logic or signature change, and the file is already in context.
+# ESCALATE after 2 failed delegation/corrective attempts on the same task (cancel or
+# switch to a stronger model / manual resolution rather than looping).
+# Always review the returned report and log the decision via kilo_log_decision.
 # """
 
 [metrics]

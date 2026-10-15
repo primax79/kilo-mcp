@@ -2,8 +2,8 @@
   "_comment": "Not a Claude Code/Kilo-native manifest - see plugins/architect-side/dependencies.json for the full rationale.",
   "dependencies": [
     {
-      "repo": "https://github.com/primax79/ai-architect-executor",
-      "reason": "kilo-mcp-headless-executor is generated from that repo's SKILL.template.md source plus this repo's own bindings/headless-executor-contract.json - see scripts/regenerate_bound_skills.py. kilo-mcp-rag-explorer has no generic counterpart and is unaffected.",
+      "repo": "https://github.com/primax79/ai-orchestration",
+      "reason": "kilo-mcp-executor-contract is generated from that repo's SKILL.template.md source plus this repo's own bindings/executor-contract.json - see scripts/regenerate_bound_skills.py. kilo-mcp-rag-explorer has no generic counterpart and is unaffected.",
       "checked_by": "scripts/regenerate_bound_skills.py"
     }
   ]

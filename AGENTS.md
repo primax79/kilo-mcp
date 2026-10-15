@@ -4,7 +4,7 @@ MCP server (`server.py`) that lets an orchestrating AI (Claude, Kilo, Roo
 Code, any MCP client) delegate implementation work to Kilo Code, plus the
 Kilo-specific `architect-side`/`executor-side` skill plugins. This is the
 concrete **Kilo binding** of the protocol-agnostic pattern documented in
-[`ai-architect-executor`](../ai-architect-executor) — see that repo's
+[`ai-orchestration`](../ai-orchestration) — see that repo's
 `AGENTS.md` before editing methodology, not just tool names, here. Full
 tool reference, config, and design rationale: [`README.md`](README.md),
 [`ARCHITECTURE.md`](ARCHITECTURE.md). Part of the `primax79/*` family — see
@@ -13,18 +13,19 @@ the workspace root's `AGENTS.md` (one level up) for the sibling-repo map.
 ## Layout
 
 - `server.py` — the MCP server itself. All tools (`kilo_implement`,
-  `kilo_task_progress`, `kilo_create_worktree`, etc.) live here.
+  `kilo_task_wait`, `kilo_task_progress`, `kilo_create_worktree`,
+  `kilo_log_decision`, etc.) live here.
 - `test_server.py` — pytest suite (fixtures isolate `DATA_DIR`/metrics into
   `tmp_path`, mock `_run_kilo` for subprocess-level tests).
 - `plugins/architect-side/`, `plugins/executor-side/` — the concrete Kilo
   skills, most of which are **generated**, not hand-authored (see below).
 - `bindings/*.json` — per-skill data (real tool names, concrete examples)
-  fed into the template from `ai-architect-executor` to produce the bound
+  fed into the template from `ai-orchestration` to produce the bound
   skill.
 - `scripts/regenerate_bound_skills.py` — regenerates
-  `orchestration-methodology`, `headless-executor-contract`,
-  `conflict-resolver`, `delegation-roi-analysis` from
-  `ai-architect-executor`'s templates + this repo's `bindings/*.json`.
+  `kilo-mcp-orchestrator`, `kilo-mcp-executor-contract`,
+  `kilo-mcp-conflict-resolver`, `kilo-mcp-metrics-analyst` from
+  `ai-orchestration`'s templates + this repo's `bindings/*.json`.
 - `scripts/generate_skill_indices.py` — regenerates every `index.json`.
 - `kilo-mcp.example.toml` — documents every config key; the real
   `kilo-mcp.toml` is gitignored per-checkout.
@@ -32,18 +33,18 @@ the workspace root's `AGENTS.md` (one level up) for the sibling-repo map.
 ## Mandatory rules
 
 - **Never hand-edit a bound skill's methodology directly.** This repo's
-  concrete `kilo-mcp-orchestrator`, `mcp-metrics-analyst`,
-  `kilo-mcp-conflict-resolver`, and `kilo-mcp-headless-executor` skills
-  are generated (via `bindings/*.json`) from `ai-architect-executor`'s
-  generic `orchestration-methodology`, `delegation-roi-analysis`,
-  `conflict-resolver`, and `headless-executor-contract` `SKILL.template.md`
+  concrete `kilo-mcp-orchestrator`, `kilo-mcp-metrics-analyst`,
+  `kilo-mcp-conflict-resolver`, and `kilo-mcp-executor-contract` skills
+  are generated (via `bindings/*.json`) from `ai-orchestration`'s
+  generic `orchestration-workflow`, `orchestration-metrics`,
+  `conflict-resolver`, and `executor-contract` `SKILL.template.md`
   sources respectively. If the methodology itself needs to change, edit
   the generic template there and re-run `scripts/regenerate_bound_skills.py`
   here — a direct edit to any of these four concrete `SKILL.md` files will
   be silently overwritten on the next regen. Binding-specific detail (real
   tool names, this server's own parameters) lives in `bindings/*.json`, not
-  in prose you'd hand-edit. `task-spec-authoring`, `task-delegation`,
-  `interactive-role-setup`, and `kilo-mcp-rag-explorer` have no generated
+  in prose you'd hand-edit. `task-pipeline`, `task-spec-authoring`, `task-worktree-ops`,
+  `orchestration-setup`, and `kilo-mcp-rag-explorer` have no generated
   counterpart — edit those directly.
 - **Adding/renaming a tool in `server.py`** (new `@mcp.tool()`) means
   updating: the tool's docstring (surfaced to the connected client), the

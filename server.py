@@ -38,12 +38,12 @@ IMPORTANT — the indexing resource is yours to use directly: kilo_rag_search re
 - Phase 1 — Discovery & RAG: explore with kilo_rag_search; check capabilities with kilo_list_models and kilo_auth_status.
 - Phase 2 — Isolation: kilo_implement has NO isolation and NO locking by default — it runs directly in working_directory (defaulting to the server's own cwd) with nothing preventing a concurrent writer (another kilo_implement call, or your own git commands) from racing it in the same tree. Pass isolation='worktree' on kilo_implement (or call kilo_create_worktree yourself first) for anything beyond a single trivial edit, and always when dispatching parallel tasks against the same repo. If you skip isolation, kilo_implement still warns you when another task is already running against the exact same working_directory — do not proceed past that warning without a plan (wait, isolate, or pick a different directory).
 - Phase 3 — Delegation: call kilo_implement in parallel across the worktrees. It runs in the BACKGROUND BY DEFAULT and returns a task_id immediately — the conversation is never blocked waiting for Kilo.
-- Phase 4 — Monitoring & intervention: scale how closely you watch a task to its complexity/risk. Small, well-scoped delegations need only a final kilo_task_result check. Large, multi-file, or high-risk ones are worth polling periodically with kilo_task_progress (Kilo's own live plan/todo list, recent commentary, running cost — read from its session database, not a heuristic); kilo_task_status gives a quicker but coarser OS-level signal. If a task drifts off-spec or looks stuck, kilo_task_cancel stops it, and a corrective kilo_implement call with continue_session_id resumes the same session with corrective instructions instead of starting blind.
+- Phase 4 — Monitoring & intervention: scale how closely you watch a task to its complexity/risk. Small, well-scoped delegations can be awaited deterministically with kilo_task_wait (which polls and reconciles orphaned processes from their log files, returning kilo_task_result when done or live progress on timeout). Large, multi-file, or high-risk ones are worth polling periodically with kilo_task_progress (Kilo's own live plan/todo list, recent commentary, running cost — read from its session database, not a heuristic); kilo_task_status gives a quicker but coarser OS-level signal. If a task drifts off-spec or looks stuck, kilo_task_cancel stops it, and a corrective kilo_implement call with continue_session_id resumes the same session with corrective instructions instead of starting blind.
 - Phase 5 — Verification & review: inspect results with kilo_workspace_status and review every Final Report.
-- Phase 6 — Closure & telemetry: log defects found during review with kilo_log_issue.
+- Phase 6 — Closure & telemetry: log orchestration decisions with kilo_log_decision and defects found during review with kilo_log_issue.
 
 ## Metrics analysis (for the connected assistant)
-- Call kilo_metrics to analyze ROI (delegation_cost_usd vs inline_estimate_usd).
+- Call kilo_metrics to analyze ROI (delegation_cost_usd vs inline_estimate_usd) and decision branches (kilo_log_decision).
 - Review kilo_log_issue defects to improve future specs."""
 
 _SERVER_INSTRUCTIONS_RAG_ONLY = """kilo-mcp (RAG-Only Search Engine) exposes the local Kilo Code semantic codebase index.
@@ -651,8 +651,16 @@ DELEGATION_POLICY = _cfg("KILO_MCP_DELEGATION_POLICY", "kilo", "delegation_polic
 DATA_DIR = os.path.expanduser(_cfg(
     "KILO_MCP_DATA_DIR", "metrics", "data_dir", "~/.local/share/kilo-mcp"
 ))
+_DEFAULT_DATA_DIR = DATA_DIR
 METRICS_FILE = os.path.join(DATA_DIR, "metrics.jsonl")
 ISSUES_FILE = os.path.join(DATA_DIR, "issues.jsonl")
+DECISIONS_FILE = os.path.join(DATA_DIR, "decisions.jsonl")
+
+
+def _decisions_file_path() -> str:
+    if DATA_DIR != _DEFAULT_DATA_DIR and DECISIONS_FILE == os.path.join(_DEFAULT_DATA_DIR, "decisions.jsonl"):
+        return os.path.join(DATA_DIR, "decisions.jsonl")
+    return DECISIONS_FILE
 
 CLAUDE_INPUT_PER_MTOK = _cfg("KILO_MCP_CLAUDE_INPUT_PER_MTOK", "metrics",
                              "claude_input_per_mtok", 5.0, float)
@@ -1790,6 +1798,60 @@ async def kilo_task_result(
     return record.get("result", f"Task {task_id} ended with status '{status}' and no stored result.")
 
 
+_TERMINAL_TASK_STATES = ("completed", "failed", "cancelled", "error")
+
+
+@mcp.tool()
+async def kilo_task_wait(
+    task_id: Annotated[
+        str,
+        Field(description="The task_id returned by kilo_implement when "
+              "launched with background=true (the default)."),
+    ],
+    timeout_seconds: Annotated[
+        Optional[int],
+        Field(description="Maximum seconds to wait before returning a status "
+              "summary. Defaults to None (wait up to KILO_TIMEOUT)."),
+    ] = None,
+) -> str:
+    """Wait until a background kilo_implement task reaches a terminal state
+    (completed, failed, cancelled, error) or `timeout_seconds` elapses, polling
+    every 2 seconds and reconciling orphaned processes from their log files via
+    _reconcile_task_if_orphaned.
+
+    When terminal, returns the full kilo_task_result output. On timeout, does
+    not raise: returns a clear status message with current progress and elapsed
+    seconds.
+    """
+    record = _read_task_record(task_id)
+    if record is None:
+        return f"Unknown task_id '{task_id}'. (Records live in {TASKS_DIR})"
+
+    effective_timeout = KILO_TIMEOUT if timeout_seconds is None else max(0, int(timeout_seconds))
+    started = time.monotonic()
+
+    while True:
+        record = _read_task_record(task_id)
+        if record is None:
+            return f"Unknown task_id '{task_id}'. (Records live in {TASKS_DIR})"
+        record = _reconcile_task_if_orphaned(task_id, record)
+        status = record.get("status")
+        if status in _TERMINAL_TASK_STATES or status != "running":
+            return await kilo_task_result(task_id=task_id)
+
+        elapsed = time.monotonic() - started
+        if elapsed >= effective_timeout:
+            progress = await kilo_task_progress(task_id=task_id)
+            return (
+                f"Task {task_id} is still running after waiting {int(round(elapsed))}s "
+                f"(timeout_seconds={effective_timeout}s; started {record.get('started')}, "
+                f"workspace {record.get('working_directory')}, pid {record.get('pid')}).\n\n"
+                f"{progress}"
+            )
+
+        await asyncio.sleep(2.0)
+
+
 @mcp.tool()
 async def kilo_task_progress(
     task_id: Annotated[
@@ -1991,6 +2053,60 @@ async def kilo_log_issue(
     return f"Issue logged for run {run_id} ({record['category']}, {record['severity']})."
 
 
+_VALID_DECISION_BRANCHES = {"delegate", "inline", "escalate", "discarded"}
+
+
+@mcp.tool()
+def kilo_log_decision(
+    branch: Annotated[
+        str,
+        Field(
+            description="Orchestration branch taken: 'delegate' | 'inline' | 'escalate' | 'discarded'."
+        ),
+    ],
+    reason: Annotated[
+        str,
+        Field(description="Why this branch was chosen (or why a run was escalated/discarded)."),
+    ],
+    task_ref: Annotated[
+        str,
+        Field(description="Optional task identifier (e.g. T001, 02.3) or file reference."),
+    ] = "",
+    followup_needed: Annotated[
+        bool,
+        Field(description="True if an inline edit or delegated run required an immediate follow-up fix."),
+    ] = False,
+    run_id: Annotated[
+        str,
+        Field(description="Optional run_id / task_id from kilo_implement when logging delegate/escalate/discarded."),
+    ] = "",
+) -> str:
+    """Record an orchestration routing or outcome decision to decisions.jsonl
+    under DATA_DIR so kilo_metrics can summarize delegation vs inline choices,
+    escalations, discarded runs, and inline follow-up rates."""
+    norm_branch = (branch or "").strip().lower()
+    if norm_branch not in _VALID_DECISION_BRANCHES:
+        raise ValueError(
+            f"Invalid decision branch '{branch}'. Must be one of: "
+            + ", ".join(sorted(_VALID_DECISION_BRANCHES))
+        )
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "branch": norm_branch,
+        "reason": reason,
+        "task_ref": task_ref,
+        "followup_needed": bool(followup_needed),
+        "run_id": run_id,
+    }
+    _append_jsonl(_decisions_file_path(), record)
+    return (
+        f"Decision logged ({norm_branch}"
+        + (f", task_ref={task_ref}" if task_ref else "")
+        + (f", run_id={run_id}" if run_id else "")
+        + ")."
+    )
+
+
 @mcp.tool()
 async def kilo_metrics(
     days: Annotated[
@@ -1999,12 +2115,13 @@ async def kilo_metrics(
     ] = 30,
 ) -> str:
     """Summarize kilo-mcp usage: runs, outcomes, generated code volume, real
-    delegation cost vs estimated inline-Claude cost, and defect categories from
-    kilo_log_issue. Use this to judge whether delegation is paying off and which
-    defect classes the spec template should address next.
+    delegation cost vs estimated inline-Claude cost, recorded orchestration
+    decisions from kilo_log_decision, and defect categories from kilo_log_issue.
+    Use this to judge whether delegation is paying off and which defect classes
+    the spec template should address next.
 
-    Raw data lives in JSONL files (metrics.jsonl / issues.jsonl) under
-    KILO_MCP_DATA_DIR (default ~/.local/share/kilo-mcp) for ad-hoc analysis.
+    Raw data lives in JSONL files (metrics.jsonl / issues.jsonl / decisions.jsonl)
+    under KILO_MCP_DATA_DIR (default ~/.local/share/kilo-mcp) for ad-hoc analysis.
     """
     cutoff = time.time() - days * 86400
 
@@ -2024,11 +2141,14 @@ async def kilo_metrics(
             pass
         return rows
 
+    decisions_path = _decisions_file_path()
+    has_decisions_file = os.path.exists(decisions_path)
     runs = _load(METRICS_FILE)
     issues = _load(ISSUES_FILE)
+    decisions = _load(decisions_path)
     impl = [r for r in runs if r.get("tool") == "kilo_implement"]
     rag = [r for r in runs if r.get("tool") == "kilo_rag_search"]
-    if not runs:
+    if not runs and not decisions and not has_decisions_file:
         return f"No kilo-mcp activity recorded in the last {days} days. (Data dir: {DATA_DIR})"
 
     lines = [f"# kilo-mcp metrics — last {days} days", ""]
@@ -2059,6 +2179,22 @@ async def kilo_metrics(
     if rag:
         lines += [f"## kilo_rag_search: {len(rag)} runs "
                   f"(avg {sum(r.get('duration_s', 0) for r in rag) / len(rag):.0f}s)", ""]
+    if has_decisions_file or decisions:
+        branch_counts = {b: 0 for b in ("delegate", "inline", "escalate", "discarded")}
+        for d in decisions:
+            b = d.get("branch")
+            if b in branch_counts:
+                branch_counts[b] += 1
+        inline_followup = sum(
+            1 for d in decisions if d.get("branch") == "inline" and d.get("followup_needed")
+        )
+        lines += [
+            f"## decisions logged: {len(decisions)}",
+            f"- branches: delegate={branch_counts['delegate']}, inline={branch_counts['inline']}, "
+            f"escalate={branch_counts['escalate']}, discarded={branch_counts['discarded']}",
+            f"- inline_followup_needed: {inline_followup}",
+            "",
+        ]
     if issues:
         by_cat = {}
         for i in issues:
@@ -2073,7 +2209,7 @@ async def kilo_metrics(
                      "clauses in the spec template / delegation prompts.")
     else:
         lines.append("## defects logged: none")
-    lines.append(f"\n(Raw JSONL: {METRICS_FILE} and {ISSUES_FILE})")
+    lines.append(f"\n(Raw JSONL: {METRICS_FILE}, {ISSUES_FILE}, and {decisions_path})")
     return "\n".join(filter(None, lines))
 
 
@@ -2774,8 +2910,8 @@ async def kilo_task_status(
 # Helper: unexport write/execution tools when running in --rag-only mode
 if _IS_RAG_ONLY:
     _WRITE_TOOLS = {
-        "kilo_implement", "kilo_task_result", "kilo_task_progress", "kilo_task_cancel",
-        "kilo_log_issue", "kilo_metrics", "kilo_create_worktree", "kilo_session_revert",
+        "kilo_implement", "kilo_task_wait", "kilo_task_result", "kilo_task_progress", "kilo_task_cancel",
+        "kilo_log_issue", "kilo_log_decision", "kilo_metrics", "kilo_create_worktree", "kilo_session_revert",
         "kilo_session_fork", "kilo_respond_question", "kilo_get_session_todo",
         "kilo_update_session_todo", "kilo_run_command", "kilo_workspace_status", "kilo_task_status"
     }

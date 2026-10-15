@@ -1,10 +1,20 @@
 ---
 name: kilo-mcp-orchestrator
-description: "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, defect telemetry, and capture of work that emerges mid-session as task files in the repository (whoever will execute it, including the orchestrator itself). Use when coordinating development work through the kilo-mcp tools, or when new tasks appear during a working session."
+description: "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, deterministic completion wait (kilo_task_wait) and complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, defect and decision telemetry (kilo_log_issue/kilo_log_decision), and capture of work that emerges mid-session as task files in the repository (whoever will execute it, including the orchestrator itself). Use when coordinating development work through the kilo-mcp tools, or when new tasks appear during a working session."
 ---
 <!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
 
 # kilo-mcp-orchestrator
+
+## Quick Reference
+
+| Field | Value |
+| --- | --- |
+| **Audience / Role** | Architect / Orchestrator (`orchestration` profile) |
+| **When to Load** | Coordinating multi-step or parallel development, discovery, worktree isolation, monitoring, and verification |
+| **Execution Modes Supported** | **Single-Framework Native** (in-framework parallel worktrees & subagents, zero MCP required) and **Multi-Framework MCP / CLI** (cross-framework delegation) |
+| **Companion Scripts** | `bin/ai-orch`, `scripts/tasks_engine.py`, `scripts/orchestration_config.py` |
+| **Related Skills** | `task-pipeline`, `task-spec-authoring`, `task-worktree-ops`, `conflict-resolver`, `orchestration-metrics` |
 
 This skill is designed for an Orchestrating AI (e.g. Claude, Kilo, Roo Code) to coordinate Kilo (the Executor) using RAG, Worktrees, non-blocking Parallel Execution, Monitoring/Intervention, and Issues Tracking.
 
@@ -48,13 +58,13 @@ in doubt, delegate rather than fix it yourself.
     create the files and **document the activation command instead of running
     it**, and to prove it didn't by showing `git config --get <key>` returning
     empty. Activation is the user's call, not the task's.
-- **Phase 3 - Delegation:** Use `kilo_implement` to delegate implementation work. It runs in the **background by default** and returns a `task_id` immediately — never block the conversation waiting on it. Pass `focus_files` found during search, configure any `skills_to_load`, and dispatch tasks in parallel across worktrees. For work that spans multiple dependent steps or sessions, write it up first as a `plans/` macroplan (see the `macroplan-authoring` skill) and delegate one task file at a time — each task file is already scoped, self-contained, and has its own verification section, which maps directly onto one well-formed `kilo_implement` call.
+- **Phase 3 - Delegation:** Use `kilo_implement` to delegate implementation work. It runs in the **background by default** and returns a `task_id` immediately — never block the conversation waiting on it. Pass `focus_files` found during search, configure any `skills_to_load`, and dispatch tasks in parallel across worktrees. For work that spans multiple dependent steps or sessions, write it up first as a `tasks/` pipeline (see the `task-pipeline` skill) and delegate one task file at a time — each task file is already scoped, self-contained, and has its own verification section, which maps directly onto one well-formed `kilo_implement` call.
 - **Phase 4 - Monitoring & Intervention:** Scale how closely you watch a task to its complexity/risk:
-  - **Small, well-scoped tasks:** a single `kilo_task_result` check at the end is enough.
-  - **Large, multi-file, or high-risk tasks:** poll `kilo_task_progress` periodically or inspect Kilo's live checklist with `kilo_get_session_todo`. You can also directly inject or update the plan using `kilo_update_session_todo` to guide execution.
+  - **Small, well-scoped tasks:** await completion deterministically with `kilo_task_wait(task_id=..., timeout_seconds=...)` (returns the full `kilo_task_result` payload as soon as the task reaches a terminal state, or a clear status message with live progress on timeout without raising) instead of guessing timer intervals.
+  - **Large, multi-file, or high-risk tasks:** use bounded `kilo_task_wait` slices (e.g. `timeout_seconds=120`) or poll `kilo_task_progress` periodically and inspect Kilo's live checklist with `kilo_get_session_todo`. You can also directly inject or update the plan using `kilo_update_session_todo` to guide execution.
   - **A "WORKING" verdict from `kilo_task_status` is not enough on its own — always cross-check it against `kilo_task_progress`'s cost/tokens/plan before trusting it.** That heuristic proves a socket is open to the model, not that the call is converging: a task can sit "connected, long call in progress" for many minutes while burning real cost on every turn. The tell is a low CPU-time/elapsed-time ratio (seconds of CPU across many minutes of wall clock — waiting on the network, not computing) combined with a ballooning cost/token count and no recorded plan, especially after a `continue_session_id` call resuming a prior session: it usually means the task is re-reading its own accumulated context every turn instead of acting on it. Observed live: a corrective `kilo_implement` resuming a failed session ran 50+ minutes and $7+ in cost with under two minutes of CPU time and no plan ever recorded — cancelled via `kilo_task_cancel` and redone directly rather than left to keep burning. Make this cross-check routine, not something reached for only once a task already looks slow.
   - **If a task drifts off-spec or looks stuck:** `kilo_task_cancel` stops it (attempts a graceful REST abort, then hard kill by tracked PID). Alternatively, use `kilo_session_revert` to rewind to a previous checkpoint, or `kilo_session_fork` to test an alternative path in parallel. If Kilo pauses asking a question, answer with `kilo_respond_question`. Review `kilo_workspace_status` for partial changes, then either revert or continue with a corrective `kilo_implement` call using `continue_session_id` — Kilo resumes the SAME session with full memory of what it already built, instead of starting blind.
-  - **Don't go idle after dispatching — check back proactively, don't wait to be asked.** `kilo_implement` returning a `task_id` immediately means control comes back to you well before the work is done; if you just end your turn there, nothing polls the task until the user happens to ask "how's it going?". If your host exposes a self-scheduled wakeup (e.g. Claude Code's `ScheduleWakeup`), use it to check progress/result again after a delay. Otherwise, state explicitly in your response how the user can check progress.
+  - **Don't go idle after dispatching — await completion deterministically, don't guess sleep timers.** Prefer `kilo_task_wait(task_id=...)` to block until the task completes (reconciling orphaned processes from their log files automatically). In hosts where a long blocking MCP call isn't desirable and background shell processes notify on exit, use the zero-token OS PID watcher fallback against the detached `pid` reported by `kilo_implement`: `while kill -0 <pid> 2>/dev/null; do sleep 10; done; echo "task finished"` — then call `kilo_task_result(task_id)` immediately when notified.
   - Ready-to-invoke scripts for the manual/no-task-id case live in `scripts/` (see below) — use them instead of re-deriving the pgrep/ps/lsof/sqlite3 diagnostic pipeline from scratch each session.
 - **Phase 5 - Verification & Review: NEVER trust the Final Report alone.**
   Inspect results with `kilo_workspace_status`, then actually **execute** what was built — reading the report or the diff is not verification, it's a summary. Across real delegation rounds, deviations that never surfaced from the report alone only showed up by running the code: a file committed that should have been gitignored, a cited source path that didn't exist anywhere in the codebase (invented for plausibility), a citation pointing at the right method but the wrong line, DB column types guessed from convention instead of read from the real DDL already available. Calibrate to what was built:
@@ -72,7 +82,7 @@ in doubt, delegate rather than fix it yourself.
   library's barrel file). The integration gate is therefore not the union of the
   tasks' own criteria: after every merge run lint, tests, **and a full build of a
   consuming application**, and treat that as the batch's real acceptance.
-- **Phase 6 - Closure & Telemetry:** If defects are found, log them with `kilo_log_issue` (vital for continuous prompt/specification tuning — see `mcp-metrics-analyst`) and request Kilo to fix them.
+- **Phase 6 - Closure & Telemetry:** Record the orchestration branch taken with `kilo_log_decision` (`delegate`, `inline`, `escalate`, or `discarded`), and if defects are found during review, log them with `kilo_log_issue` (vital for continuous prompt/specification tuning — see `kilo-mcp-metrics-analyst`) and request Kilo to fix them.
   - **Merging: always checkout the target branch explicitly first.**
     Running `git merge --no-ff <feature-branch> -m "..." <target>` without
     checking out `<target>` first is a real, observed mistake - the
@@ -82,8 +92,11 @@ in doubt, delegate rather than fix it yourself.
     `git status --short` (clean) → `git checkout <target>` (explicit,
     never implicit) → `git merge --no-ff <feature-branch> -m "..."` →
     `git log --oneline --graph -6` (confirm the merge landed where
-    intended). Remove the worktree once merged and no longer needed
-    (`git worktree remove <path>`).
+    intended).
+  - **Worktree & Branch Lifecycle Cleanup (Every Terminal Path):** Remove
+    the isolated worktree (`git worktree remove <path>`) not only after a
+    successful merge, but also whenever a run is **cancelled** or
+    **discarded** (`dropped`), so stale worktrees never linger on disk.
 
 ## Analysis/exploration requests need the same specification rigor as implementation requests
 
@@ -149,7 +162,7 @@ and it occupies your context while it waits.
 
 - **Capture first, then continue.** As soon as the work will not be finished
   and verified in the current turn, write it down as a task in the repository's
-  `tasks/` tree, following the emergent-task rules of the `macroplan-authoring`
+  `tasks/` tree, following the emergent-task rules of the `task-pipeline`
   convention: a task file (a folder with its context and progress once it has
   any), a unique id, a priority with a reason, and a one-line entry in the
   registry. Then go back to what you were doing.

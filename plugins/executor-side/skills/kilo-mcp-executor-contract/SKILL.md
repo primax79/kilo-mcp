@@ -1,10 +1,20 @@
 ---
-name: kilo-mcp-headless-executor
+name: kilo-mcp-executor-contract
 description: "Behavioral contract for Kilo when executing background tasks delegated by an orchestrating AI (e.g. Claude) through the kilo-mcp server - zero interactivity, focus_files contract, mandatory Final Report, fail fast."
 ---
 <!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
 
-# kilo-mcp-headless-executor
+# kilo-mcp-executor-contract
+
+## Quick Reference
+
+| Field | Value |
+| --- | --- |
+| **Audience / Role** | Executor Agent (`bulk-execution` or `deep-reasoning` profile) |
+| **When to Load** | Executing a delegated task in an isolated worktree or background subagent session |
+| **Execution Modes Supported** | **Single-Framework Native** (in-framework worktrees/subagents) and **Multi-Framework MCP / CLI** |
+| **Companion Scripts** | None (pure behavioral contract for the executing agent) |
+| **Related Skills** | `task-spec-authoring`, `orchestration-workflow` |
 
 Use this skill when Kilo executes background tasks on behalf of an orchestrating AI such as Claude via the Kilo MCP server.
 
@@ -13,14 +23,40 @@ Use this skill when Kilo executes background tasks on behalf of an orchestrating
 - **Zero interactivity:** You are running in the background through an MCP server controlled by an orchestrating AI (e.g. Claude, Kilo, Roo Code). Do not ask the user questions. Do not offer choices. Make the most reasonable technical decision based on the Architect's instructions.
 - **Honor the contract:** The Architect defined `focus_files`. Read them
   before modifying anything.
+- **One Task = One Commit:** At the end of the task (once verification
+  passes, unless the task instructions explicitly forbid committing), create
+  a **single atomic git commit** scoped strictly to the files changed for
+  this task. Never sweep unrelated untracked files or prior draft changes
+  into your commit.
+- **Worktree Blast-Radius:** Never leave your assigned `working_directory`
+  and never read-write or mutate sibling worktrees, parent directories, or
+  the main repository checkout. Never run `git config` or install repository
+  hooks automatically (`.git/config` is shared across all worktrees).
 - **Produce the report:** At the end of your work cycle you MUST print the
-  `Final Report` exactly as requested (Outcome, Files changed,
-  Verification, Issues). Your final message is parsed by the MCP server, so
+  `## Final Report` using the exact Markdown skeleton below. Your final
+  message is parsed by the MCP server, so
   the report's Markdown formatting must be immaculate.
 - **Fail fast:** If a command (e.g. a build) keeps failing due to missing
   context, stop and mark the outcome as `partial` or `failed` in the Final
   Report, explaining the blocker under "Issues" so the Architect can
   intervene.
+
+## Mandatory `## Final Report` Skeleton
+
+Always conclude your final response with this exact Markdown structure:
+
+```markdown
+## Final Report
+
+- **Outcome:** `success` | `partial` | `failed`
+- **Files changed:**
+  - `path/to/file.ext` — concise summary of changes
+- **Verification:**
+  - Command: `<exact runnable command executed>`
+  - Output: `<actual exit code and concise pass/fail summary from running it>`
+- **Issues:**
+  - `None` (or explicit description of blockers, forced deviations, or out-of-scope findings)
+```
 
 ## Care and Scope Discipline
 

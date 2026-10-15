@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "architect-side",
-      "description": "Kilo-specific Architect-side skills: kilo-mcp-orchestrator, mcp-metrics-analyst, kilo-mcp-conflict-resolver, plus the mcp-orchestrator-agent subagent. Install this if you're the orchestrating AI delegating to Kilo via MCP. The MCP server itself (server.py) is registered separately - see README.md.",
+      "description": "Kilo-specific Architect-side skills: kilo-mcp-orchestrator, kilo-mcp-metrics-analyst, kilo-mcp-conflict-resolver, plus the kilo-mcp-orchestrator-agent subagent. Install this if you're the orchestrating AI delegating to Kilo via MCP. The MCP server itself (server.py) is registered separately - see README.md.",
       "author": {
         "name": "Alfredo Oliviero"
       },
@@ -17,7 +17,7 @@
     },
     {
       "name": "executor-side",
-      "description": "Kilo-specific Executor-side skills: kilo-mcp-headless-executor, kilo-mcp-rag-explorer. Install this on the Kilo side, not the orchestrating AI's side.",
+      "description": "Kilo-specific Executor-side skills: kilo-mcp-executor-contract, kilo-mcp-rag-explorer. Install this on the Kilo side, not the orchestrating AI's side.",
       "author": {
         "name": "Alfredo Oliviero"
       },

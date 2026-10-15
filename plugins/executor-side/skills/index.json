@@ -1,7 +1,7 @@
 {
   "skills": [
     {
-      "name": "kilo-mcp-headless-executor",
+      "name": "kilo-mcp-executor-contract",
       "files": [
         "SKILL.md"
       ]

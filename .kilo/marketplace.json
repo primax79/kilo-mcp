@@ -9,9 +9,9 @@
       "source": "./plugins/architect-side/skills/kilo-mcp-orchestrator"
     },
     {
-      "name": "mcp-metrics-analyst",
+      "name": "kilo-mcp-metrics-analyst",
       "description": "Evaluate kilo-mcp delegation efficiency and ROI metrics",
-      "source": "./plugins/architect-side/skills/mcp-metrics-analyst"
+      "source": "./plugins/architect-side/skills/kilo-mcp-metrics-analyst"
     },
     {
       "name": "kilo-mcp-conflict-resolver",
@@ -19,9 +19,9 @@
       "source": "./plugins/architect-side/skills/kilo-mcp-conflict-resolver"
     },
     {
-      "name": "kilo-mcp-headless-executor",
+      "name": "kilo-mcp-executor-contract",
       "description": "Behavioral contract for Kilo when executing background tasks delegated via MCP",
-      "source": "./plugins/executor-side/skills/kilo-mcp-headless-executor"
+      "source": "./plugins/executor-side/skills/kilo-mcp-executor-contract"
     },
     {
       "name": "kilo-mcp-rag-explorer",

@@ -22,6 +22,7 @@ def fake_data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DATA_DIR", str(data_dir))
     monkeypatch.setattr(server, "METRICS_FILE", str(data_dir / "metrics.jsonl"))
     monkeypatch.setattr(server, "ISSUES_FILE", str(data_dir / "issues.jsonl"))
+    monkeypatch.setattr(server, "DECISIONS_FILE", str(data_dir / "decisions.jsonl"))
     return data_dir
 
 @pytest.fixture
@@ -590,10 +591,10 @@ def test_install_skills(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     dest = home / ".kilo" / "skills"
     # the two bundled skills ship with the repo and must be copied whole
-    assert (dest / "kilo-mcp-headless-executor" / "SKILL.md").exists()
+    assert (dest / "kilo-mcp-executor-contract" / "SKILL.md").exists()
     assert (dest / "kilo-mcp-conflict-resolver" / "SKILL.md").exists()
     assert (dest / "kilo-mcp-rag-explorer" / "SKILL.md").exists()
-    assert "kilo-mcp-headless-executor" in out
+    assert "kilo-mcp-executor-contract" in out
 
 # ==============================================================================
 # 11. kilo_task_status helpers
@@ -1550,3 +1551,132 @@ def test_configure_models_interactive_reprompts_on_unlisted_id(tmp_path, monkeyp
 
     cfg = server._minimal_toml_load(str(cfg_path))
     assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
+
+
+# ==============================================================================
+# 19. kilo_task_wait (T001) and kilo_log_decision + kilo_metrics (T002)
+# ==============================================================================
+
+def test_kilo_task_wait_normal_completion(tmp_path, monkeypatch):
+    """kilo_task_wait polls until the task transitions to a terminal state and
+    returns the kilo_task_result payload."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    server._write_task_record("wait_ok", {
+        "status": "running",
+        "started": "2026-10-15T00:00:00+00:00",
+        "working_directory": str(tmp_path),
+        "pid": os.getpid(),
+    })
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        server._write_task_record("wait_ok", {
+            "status": "completed",
+            "result": "Kilo Execution Finished.\nOutcome: success\nFiles changed:\n- waited.py",
+        })
+
+    monkeypatch.setattr(server.asyncio, "sleep", fake_sleep)
+
+    res = asyncio.run(server.kilo_task_wait(task_id="wait_ok", timeout_seconds=10))
+    assert sleep_calls == [2.0]
+    assert "Kilo Execution Finished" in res
+    assert "waited.py" in res
+
+
+def test_kilo_task_wait_timeout_does_not_raise(tmp_path, monkeypatch):
+    """When timeout_seconds elapses while the task is still running,
+    kilo_task_wait returns a status message with live progress and elapsed
+    seconds instead of raising."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(server, "KILO_SESSION_DB", str(tmp_path / "missing.db"))
+    server._write_task_record("wait_slow", {
+        "status": "running",
+        "started": "2026-10-15T00:00:00+00:00",
+        "working_directory": str(tmp_path),
+        "pid": os.getpid(),
+    })
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock["now"])
+
+    async def fake_sleep(seconds):
+        clock["now"] += seconds
+
+    monkeypatch.setattr(server.asyncio, "sleep", fake_sleep)
+
+    res = asyncio.run(server.kilo_task_wait(task_id="wait_slow", timeout_seconds=4))
+    assert "still running" in res
+    assert "4s" in res
+    assert "wait_slow" in res
+
+
+def test_kilo_task_wait_recovers_orphaned_process_from_log(tmp_path, fake_data_dir, monkeypatch):
+    """If the task process already exited (orphaned record still marked
+    'running'), kilo_task_wait reconciles it from its log file via
+    _reconcile_task_if_orphaned and returns the recovered Final Report."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    os.makedirs(str(tmp_path / "tasks"), exist_ok=True)
+
+    proc = subprocess.Popen(["sleep", "0"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    log_path = str(tmp_path / "tasks" / "wait_orphan.log")
+    with open(log_path, "w") as f:
+        f.write("Outcome: success\nFiles changed:\n- orphan_waited.py\n")
+
+    server._write_task_record("wait_orphan", {
+        "status": "running",
+        "started": "2026-10-15T00:00:00+00:00",
+        "working_directory": str(tmp_path),
+        "agent": "code",
+        "model": "google/gemini-3.5-flash",
+        "pid": dead_pid,
+        "log_path": log_path,
+    })
+
+    res = asyncio.run(server.kilo_task_wait(task_id="wait_orphan", timeout_seconds=5))
+    assert "Kilo Execution Finished" in res
+    assert "orphan_waited.py" in res
+    assert server._read_task_record("wait_orphan")["status"] == "completed"
+
+
+def test_kilo_log_decision_and_metrics_reporting(fake_data_dir):
+    """kilo_log_decision validates branch names, persists JSONL records to
+    DATA_DIR / 'decisions.jsonl', and kilo_metrics reports branch counts and
+    inline_followup_needed."""
+    with pytest.raises(ValueError):
+        server.kilo_log_decision(branch="invalid-branch", reason="nope")
+
+    msg1 = server.kilo_log_decision(
+        branch="delegate", reason="multi-file feature", task_ref="T001", run_id="run_1"
+    )
+    assert "delegate" in msg1
+    server.kilo_log_decision(
+        branch="inline", reason="one-line typo fix", task_ref="T002", followup_needed=False
+    )
+    server.kilo_log_decision(
+        branch="inline", reason="small edit that broke a test", task_ref="T003", followup_needed=True
+    )
+    server.kilo_log_decision(
+        branch="escalate", reason="failed twice", task_ref="T004", run_id="run_2"
+    )
+    server.kilo_log_decision(
+        branch="discarded", reason="wrong approach, redone", task_ref="T005", run_id="run_3"
+    )
+
+    decisions_file = fake_data_dir / "decisions.jsonl"
+    assert decisions_file.exists()
+    rows = [json.loads(line) for line in decisions_file.read_text().splitlines()]
+    assert len(rows) == 5
+    assert [r["branch"] for r in rows] == ["delegate", "inline", "inline", "escalate", "discarded"]
+
+    res = asyncio.run(server.kilo_metrics())
+    assert "decisions logged: 5" in res
+    assert "delegate=1" in res
+    assert "inline=2" in res
+    assert "escalate=1" in res
+    assert "discarded=1" in res
+    assert "inline_followup_needed: 1" in res

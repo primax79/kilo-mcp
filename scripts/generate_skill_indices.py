@@ -27,8 +27,8 @@ PROFILES = {'deep-reasoning', 'orchestration', 'bulk-execution', 'exploration'}
 
 
 def validate_skill_requirements():
-    """Kit-internal half of role validation (see ai-architect-executor's
-    interactive-role-setup/SKILL.md): every skill declares a valid profile,
+    """Kit-internal half of role validation (see ai-orchestration's
+    orchestration-setup/SKILL.md): every skill declares a valid profile,
     none declares a model. Self-contained per repo on purpose — this generator
     is already a per-repo ported copy, and a cross-repo import would break for
     anyone installing this plugin standalone.
@@ -128,10 +128,10 @@ def generate_indices():
     print(f"Generated {plugin_level_count} plugin-level, {skills_dir_count} skills-dir-level, and {single_skill_count} individual skill index.json files!")
 
 def check_binding_drift():
-    """Every bound skill (SKILL.md generated from ai-architect-executor's
+    """Every bound skill (SKILL.md generated from ai-orchestration's
     template + this repo's own bindings/*.json) must match its source —
     see regenerate_bound_skills.py. Skipped with a warning, not a failure,
-    when the ai-architect-executor sibling checkout isn't available (exit
+    when the ai-orchestration sibling checkout isn't available (exit
     code 2 = setup/environment issue, not drift) — this repo must still
     work standalone for anyone who doesn't have that checkout locally."""
     script = os.path.join(ROOT_DIR, 'scripts', 'regenerate_bound_skills.py')
@@ -139,8 +139,8 @@ def check_binding_drift():
         return True
     result = subprocess.run([sys.executable, script, '--check'])
     if result.returncode == 2:
-        print("[warn] skipped binding-drift check: ai-architect-executor checkout not found "
-              "(pass --ai-architect-executor or set $AI_ARCHITECT_EXECUTOR_PATH to enable it)")
+        print("[warn] skipped binding-drift check: ai-orchestration checkout not found "
+              "(pass --ai-orchestration or set $AI_ORCHESTRATION_PATH to enable it)")
         return True
     return result.returncode == 0
 

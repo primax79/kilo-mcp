@@ -8,11 +8,11 @@
       "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-orchestrator.tar.gz"
     },
     {
-      "id": "mcp-metrics-analyst",
-      "description": "Evaluate kilo-mcp delegation efficiency - ROI analysis via kilo_metrics (delegation_cost_usd vs inline_estimate_usd), defect-pattern review from kilo_log_issue, and feedback-loop proposals for better task specifications. Use when asked whether delegation to Kilo is paying off.",
+      "id": "kilo-mcp-metrics-analyst",
+      "description": "Evaluate kilo-mcp delegation efficiency - ROI analysis via kilo_metrics (delegation_cost_usd vs inline_estimate_usd), decision telemetry via kilo_log_decision, defect-pattern review from kilo_log_issue, and feedback-loop proposals for better task specifications. Use when asked whether delegation to Kilo is paying off.",
       "category": "architect-side",
-      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/architect-side/skills/mcp-metrics-analyst",
-      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/mcp-metrics-analyst.tar.gz"
+      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/architect-side/skills/kilo-mcp-metrics-analyst",
+      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-metrics-analyst.tar.gz"
     },
     {
       "id": "kilo-mcp-conflict-resolver",
@@ -22,11 +22,11 @@
       "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-conflict-resolver.tar.gz"
     },
     {
-      "id": "kilo-mcp-headless-executor",
+      "id": "kilo-mcp-executor-contract",
       "description": "Behavioral contract for Kilo when executing background tasks delegated by an orchestrating AI (e.g. Claude) through the kilo-mcp server - zero interactivity, focus_files contract, mandatory Final Report, fail fast.",
       "category": "executor-side",
-      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/executor-side/skills/kilo-mcp-headless-executor",
-      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-headless-executor.tar.gz"
+      "githubUrl": "https://github.com/primax79/kilo-mcp/tree/main/plugins/executor-side/skills/kilo-mcp-executor-contract",
+      "content": "https://github.com/primax79/kilo-mcp/releases/download/skills-latest/kilo-mcp-executor-contract.tar.gz"
     },
     {
       "id": "kilo-mcp-rag-explorer",
