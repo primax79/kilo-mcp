@@ -117,11 +117,43 @@ Software engineering agents operate in multi-turn loops where context accumulate
 7. **Factor in Scheduled Price Step-Ups:**
    Track model pricing deadlines (e.g. `Gemini 4 Argon` doubles on 2026-12-01 to $4 in / $20 out; `Gemini 3.8 Flash` holds its promotional $0.75 in / $3.75 out rate until 2026-12-31, providing a **5.33× price advantage** during December 2026).
 
-### Official Online Model Pricing Documentation
-- **Google Gemini API:** [`https://ai.google.dev/gemini-api/docs/pricing`](https://ai.google.dev/gemini-api/docs/pricing)
-- **Anthropic Claude API:** [`https://www.anthropic.com/pricing`](https://www.anthropic.com/pricing)
-- **OpenAI API:** [`https://openai.com/api/pricing/`](https://openai.com/api/pricing/)
-- **Comprehensive Cost Analysis Report:** [`docs/07-gemini-pricing-and-role-cost-analysis.md`](../../../docs/07-gemini-pricing-and-role-cost-analysis.md)
+### Model Pricing Reference Table (USD per 1M Tokens)
+
+| Provider & Model | Cognitive Profile | Input (Uncached) | Output + Thinking | Context Cache Read | Notes & Promo Deadlines |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Google Gemini 4 Argon** | `deep-reasoning` / `orchestration` | **$2.00** *(thru Nov 30)* → **$4.00** *(Dec 1)* | **$10.00** *(thru Nov 30)* → **$20.00** *(Dec 1)* | **$0.10** → **$0.20** | Flagship reasoning; NOT on Free Tier; doubles 2026-12-01 |
+| **Google Gemini 3.8 Flash** | `bulk-execution` / `exploration` | **$0.75** *(thru Dec 31)* → **$1.50** *(Jan 1)* | **$3.75** *(thru Dec 31)* → **$7.50** *(Jan 1)* | **$0.075** → **$0.15** | Agent workhorse; 2.67× cheaper than Argon (5.33× in Dec 2026) |
+| **Anthropic Claude 3.5 Opus** | `deep-reasoning` | **$15.00** | **$75.00** | **$1.50** | 3.75×-7.5× more expensive than Argon; cache write: $18.75 |
+| **Anthropic Claude 3.5 Sonnet** | `bulk-execution` / `orchestration` | **$3.00** | **$15.00** | **$0.30** | Standard workhorse; 2×-4× more expensive than Flash; cache write: $3.75 |
+| **Anthropic Claude 3.5 Haiku** | `exploration` | **$0.80** *(≤128k)* | **$4.00** *(≤128k)* | **$0.08** | Near price-parity with Flash for high-volume read-only |
+| **OpenAI GPT-5-Codex** | `deep-reasoning` / `orchestration` | **$5.00**–**$10.00** *(est)* | **$20.00**–**$40.00** *(est)* | **$1.25**–**$2.50** | Flagship codex engine |
+| **OpenAI GPT-5-Codex-Mini** | `bulk-execution` / `exploration` | **$1.10** | **$4.40** | **$0.55** | Fast lightweight codex engine |
+
+### Suggested Models & Effort per Activity / Mode
+
+| Activity / Mode | Cognitive Profile | Recommended Model & Effort/Variant | Rationale |
+| :--- | :--- | :--- | :--- |
+| **Architect / Plan / Design** | `orchestration` / `deep-reasoning` | **Gemini 4 Argon** (`medium`/`high`) or **Claude Opus** (`high`/`xhigh`) | Error is silent: flawed architecture poisons all downstream code. |
+| **Independent Verification / Code Review** | `deep-reasoning` | **Gemini 4 Argon** (`high`) or **Claude Opus** (`high`) | Must catch subtle logic/security flaws without authorship bias. |
+| **Root-Cause Debug / Tricky Bug** | `deep-reasoning` | **Gemini 4 Argon** (`high`) or **Claude Opus** (`xhigh`) | Ambiguous by nature; wrong hypothesis costs hours. |
+| **Semantic Conflict Resolution** | `deep-reasoning` | **Gemini 4 Argon** (`high`) or **Claude Opus** (`high`) | Design decision disguised as merge; mechanical tools compile broken logic. |
+| **Bulk Implementation (Worktree)** | `bulk-execution` | **Gemini 3.8 Flash** (`medium`) or **Claude Sonnet** (`high`) | Tests and linters catch noisy errors; Flash cuts token cost by 60%–80%. |
+| **Mechanical Refactor / Tests / UI** | `bulk-execution` | **Gemini 3.8 Flash** (`medium`) or **Claude Sonnet** (`medium`) | High volume, spec-bounded, automated verification. |
+| **Exploration / RAG / Q&A / Commit** | `exploration` | **Gemini 3.8 Flash** (`low`) or **Claude Haiku** (`low`) | Read-only, large context, fast deterministic response. |
+
+### Logic & Commands to Recreate and Keep the Table Updated
+
+1. **Online Pricing Sources to Check for Rate Changes:**
+   - **Google Gemini API:** [`https://ai.google.dev/gemini-api/docs/pricing`](https://ai.google.dev/gemini-api/docs/pricing)
+   - **Anthropic Claude API:** [`https://www.anthropic.com/pricing`](https://www.anthropic.com/pricing)
+   - **OpenAI API:** [`https://openai.com/api/pricing/`](https://openai.com/api/pricing/)
+   - Comprehensive comparative report: [`docs/07-gemini-pricing-and-role-cost-analysis.md`](../../../docs/07-gemini-pricing-and-role-cost-analysis.md)
+2. **Commands to Update Mappings without Manual File Edits:**
+   - Update global model assignments:
+     `./bin/ai-orch config set-profile <tool> <profile> --model <id> [--variant <v>] [--effort <e>]`
+   - Propagate updated model matrix into the project's `AGENTS.md`:
+     `./bin/ai-orch render-agents-md --apply`
+   - In Kilo Code, configure `~/.config/kilo/kilo.jsonc` setting `"subagent_model": "google/gemini-flash-latest"` and `"compaction": { "model": "google/gemini-flash-latest" }` to prevent the expensive default chat model from leaking into background workers.
 
 ## Analysis/exploration requests need the same specification rigor as implementation requests
 
