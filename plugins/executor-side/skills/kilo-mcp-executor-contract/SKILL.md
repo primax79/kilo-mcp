@@ -32,6 +32,18 @@ Use this skill when Kilo executes background tasks on behalf of an orchestrating
   and never read-write or mutate sibling worktrees, parent directories, or
   the main repository checkout. Never run `git config` or install repository
   hooks automatically (`.git/config` is shared across all worktrees).
+- **Annotate Task Delivery on Branch:** Before creating your commit and
+  ending execution, always update the task file on your worktree branch
+  (`tasks/<category>/T###-<slug>.md` or in `plan.md` / `PROGRESS.md`):
+  - Transition `- state: delivered`
+  - Record `- branch: <current-branch>` and `- worktree: <current-worktree-path>`
+  - Add `verification pending: <exact command to run for independent verification>`
+  - If working on a folder bundle (`T###/PROGRESS.md` or initiative `plan.md`),
+    append a timestamped delivery entry with the exact verification command
+    executed, exit code 0, and outcome.
+  - **Stage and include the updated task file in your single atomic commit.**
+    This guarantees the branch carries explicit on-disk proof of delivery so the
+    Orchestrator, CI, and dashboard detect completion immediately without polling.
 - **Produce the report:** At the end of your work cycle you MUST print the
   `## Final Report` using the exact Markdown skeleton below. Your final
   message is parsed by the MCP server, so

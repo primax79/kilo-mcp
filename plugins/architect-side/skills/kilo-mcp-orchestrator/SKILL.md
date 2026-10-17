@@ -55,6 +55,11 @@ in doubt, delegate rather than fix it yourself.
     the activation command instead of running it**, and to prove it didn't by
     showing `git config --get <key>` returning empty. Activation is the user's
     call, not the task's.
+  - **Track Branch and Physical Worktree Path on the Task:** When dispatching a
+    task to an isolated worktree, record `- branch: <branch-name>` and
+    `- worktree: <physical-worktree-path>` on the task file (or in its `PROGRESS.md`).
+    This guarantees that the Architect, the UI dashboard, and the reviewer always know
+    the exact physical checkout path and git ref without searching.
 - **Phase 3 - Delegation:** Use `kilo_implement` to delegate implementation work. It runs in the **background by default** and returns a `task_id` immediately — never block the conversation waiting on it. Pass `focus_files` found during search, configure any `skills_to_load`, and dispatch tasks in parallel across worktrees. For work that spans multiple dependent steps or sessions, write it up first as a `tasks/` pipeline (see the `task-pipeline` skill) and delegate one task file at a time — each task file is already scoped, self-contained, and has its own verification section, which maps directly onto one well-formed `kilo_implement` call.
 - **Phase 4 - Monitoring & Intervention:** Scale how closely you watch a task to its complexity/risk:
   - **Small, well-scoped tasks:** await completion deterministically with `kilo_task_wait(task_id=..., timeout_seconds=...)` (returns the full `kilo_task_result` payload as soon as the task reaches a terminal state, or a clear status message with live progress on timeout without raising) instead of guessing timer intervals.
