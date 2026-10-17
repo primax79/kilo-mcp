@@ -231,6 +231,22 @@ def _cfg(env_name: str, section: str, key: str, default, cast=str):
 # Timeout (seconds) for a single Kilo subprocess before we give up.
 KILO_TIMEOUT = _cfg("KILO_MCP_TIMEOUT", "kilo", "timeout", 1800, int)
 
+# Grace period (seconds) before reaping a lingering kilo run process after it has finished
+KILO_LINGER_GRACE = _cfg(
+    "KILO_MCP_LINGER_GRACE_SECONDS", "kilo", "linger_grace_seconds",
+    _cfg("KILO_MCP_LINGER_GRACE", "kilo", "linger_grace_seconds", 60.0, float),
+    float
+)
+_REAP_SIGKILL_TIMEOUT_S = 5.0
+
+
+def _get_linger_grace() -> float:
+    return _cfg(
+        "KILO_MCP_LINGER_GRACE_SECONDS", "kilo", "linger_grace_seconds",
+        _cfg("KILO_MCP_LINGER_GRACE", "kilo", "linger_grace_seconds", KILO_LINGER_GRACE, float),
+        float
+    )
+
 # Server API Endpoint Configuration (for communicating with running kilo serve instance)
 KILO_SERVER_URL = _cfg("KILO_SERVER_URL", "kilo", "server_url", "")
 KILO_SERVER_PASSWORD = _cfg("KILO_SERVER_PASSWORD", "kilo", "server_password", "")
@@ -1684,22 +1700,224 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                 pass
 
 
+def _has_json_idle_or_finished_event(log_content: str) -> bool:
+    """Check if Kilo's JSON event stream emitted a session-finished or idle event."""
+    if not log_content:
+        return False
+    lines = log_content.strip().splitlines()
+    for line in reversed(lines[-100:]):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        ev_type = ev.get("type") or ev.get("event")
+        if ev_type in ("session.idle", "session_idle", "session.finished", "session_finished"):
+            return True
+        if ev_type == "session.status":
+            status = ev.get("status")
+            if isinstance(status, dict) and status.get("type") == "idle":
+                return True
+            if status == "idle":
+                return True
+            props = ev.get("properties")
+            if isinstance(props, dict):
+                p_status = props.get("status")
+                if isinstance(p_status, dict) and p_status.get("type") == "idle":
+                    return True
+                if p_status == "idle":
+                    return True
+    return False
+
+
+def _is_task_output_finished(log_content: str) -> tuple[bool, Optional[dict]]:
+    """Conservative check whether Kilo output indicates the task has finished:
+    (1) A parsed Final Report with outcome in (success, partial, failed) that is
+        not merely echoing the template skeleton ('success | partial | failed'), OR
+    (2) A session-finished/idle event in Kilo's JSON stream (session.idle, session.status idle, etc.).
+    Returns (is_finished, report_dict).
+    """
+    if not log_content:
+        return False, None
+
+    # Check (1): Final Report parsed from output
+    report = _parse_final_report(log_content)
+    if report.get("outcome") in ("success", "partial", "failed"):
+        m = re.search(r"Outcome[^\n]{0,60}?\b(success|partial|failed)\b([^\n]*)", log_content, re.IGNORECASE)
+        is_template = False
+        if m:
+            line_rest = m.group(2)
+            if re.search(r"\|\s*(partial|failed)", line_rest, re.IGNORECASE):
+                outcomes = list(re.finditer(r"Outcome[^\n]{0,60}?\b(success|partial|failed)\b([^\n]*)", log_content, re.IGNORECASE))
+                real_outcomes = [o for o in outcomes if not re.search(r"\|\s*(partial|failed)", o.group(2), re.IGNORECASE)]
+                if not real_outcomes:
+                    is_template = True
+        if not is_template:
+            return True, report
+
+    # Check (2): JSON stream idle/finished events
+    if _has_json_idle_or_finished_event(log_content):
+        return True, report
+
+    return False, None
+
+
+def _get_time_since_last_output(record: dict) -> Optional[float]:
+    """Seconds since the last write to the task's log file, or None if unavailable."""
+    log_path = record.get("log_path")
+    if not log_path or not os.path.exists(log_path):
+        return None
+    try:
+        mtime = os.path.getmtime(log_path)
+        return max(0.0, time.time() - mtime)
+    except OSError:
+        return None
+
+
+def _is_task_lingering_in_grace(record: dict) -> bool:
+    """True if a task's process is alive, output indicates it is finished,
+    and no new output has been produced, but the grace period has not yet expired."""
+    if record.get("status") != "running":
+        return False
+    pid = record.get("pid")
+    if not pid or not _is_pid_alive(pid):
+        return False
+    log_path = record.get("log_path")
+    if not log_path or not os.path.exists(log_path):
+        return False
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            log_content = f.read()
+    except OSError:
+        return False
+    is_finished, _ = _is_task_output_finished(log_content)
+    if not is_finished:
+        return False
+    time_since_output = _get_time_since_last_output(record)
+    if time_since_output is None:
+        return False
+    return time_since_output < _get_linger_grace()
+
+
+def _reap_lingering_process(pid: int, sigkill_timeout_s: Optional[float] = None) -> None:
+    """Terminate a lingering process and its process group.
+    Sends SIGTERM to the process group, waits up to sigkill_timeout_s (default 5s),
+    and escalates to SIGKILL if still alive."""
+    if not pid:
+        return
+    if sigkill_timeout_s is None:
+        sigkill_timeout_s = _REAP_SIGKILL_TIMEOUT_S
+
+    server_pgrp = os.getpgrp()
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        pgid = pid
+
+    # Send SIGTERM to process group if safe, else to pid directly
+    if pgid and pgid > 1 and pgid != server_pgrp:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                return
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return
+
+    # Wait up to sigkill_timeout_s for process to exit
+    deadline = time.time() + sigkill_timeout_s
+    while time.time() < deadline:
+        if not _is_pid_alive(pid):
+            return
+        time.sleep(0.05)
+
+    # Escalate to SIGKILL if still alive
+    if pgid and pgid > 1 and pgid != server_pgrp:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+    # Non-blocking reap of child process to prevent zombie
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+
+
+def _reconcile_all_tasks() -> None:
+    """Reconcile every task currently marked running in TASKS_DIR."""
+    if not os.path.isdir(TASKS_DIR):
+        return
+    try:
+        filenames = os.listdir(TASKS_DIR)
+    except OSError:
+        return
+    for filename in filenames:
+        if filename.endswith(".json"):
+            task_id = filename[:-len(".json")]
+            rec = _read_task_record(task_id)
+            if rec and rec.get("status") == "running":
+                _reconcile_task_if_orphaned(task_id, rec)
+
+
+def _find_task_record_by_pid(pid: int | str) -> Optional[dict]:
+    """Find the task record matching a given PID if known."""
+    if not os.path.isdir(TASKS_DIR):
+        return None
+    try:
+        pid_int = int(pid)
+    except (ValueError, TypeError):
+        return None
+    try:
+        filenames = os.listdir(TASKS_DIR)
+    except OSError:
+        return None
+    for filename in filenames:
+        if filename.endswith(".json"):
+            rec = _read_task_record(filename[:-len(".json")])
+            if rec and rec.get("pid") == pid_int:
+                return rec
+    return None
+
+
 def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
-    """If `record` says status=='running' but the PID it recorded is
-    actually dead, the task finished (or crashed) with nobody left to update
-    its record — most commonly because the MCP server that launched it
-    restarted or was killed mid-run. Since the task now runs as a detached
-    OS process (see _spawn_kilo_background), PID liveness is real OS state
-    that any server instance can check, and the log file holds everything
-    that happened — so this finalizes the record here instead of leaving it
-    stuck at 'running' forever (the bug this whole mechanism replaces).
+    """If `record` says status=='running':
+    1. If the PID is dead, reconcile as completed/failed from log file.
+    2. If the PID is alive but the task has finished (Final Report parsed or
+       JSON idle event) and has produced no output for the grace period
+       (default 60s), reap the lingering process (SIGTERM pg, SIGKILL after 5s)
+       and record status 'completed' with note 'reaped lingering process after completion'.
+    3. If still genuinely working or in grace window, return record unmodified.
 
     Returns the (possibly updated) record; also persists the update via
     _write_task_record so future calls short-circuit on status != 'running'."""
     if record.get("status") != "running":
         return record
-    if _is_pid_alive(record.get("pid")):
-        return record
+
+    pid = record.get("pid")
+    pid_alive = _is_pid_alive(pid)
 
     log_path = record.get("log_path")
     log_content = ""
@@ -1710,23 +1928,54 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
         except OSError:
             pass
 
+    is_finished, report = _is_task_output_finished(log_content)
+    if report is None:
+        report = _parse_final_report(log_content) if log_content else {"outcome": "unknown", "files_changed": []}
+
+    reaped = False
+    if pid_alive:
+        # Process is alive. Only reap if finished and idle beyond grace period.
+        if not is_finished:
+            return record
+
+        time_since_output = _get_time_since_last_output(record)
+        grace = _get_linger_grace()
+        if time_since_output is None or time_since_output < grace:
+            return record
+
+        # Both (a) finished output and (b) grace period exceeded: reap lingering process
+        logger.info(
+            "Task %s (pid %s) finished output and remained idle for %.1fs (grace %.1fs); reaping process group",
+            task_id, pid, time_since_output, grace
+        )
+        _reap_lingering_process(pid, sigkill_timeout_s=5.0)
+        reaped = True
+
     cwd = record.get("working_directory")
     session_id = record.get("session_id")
     if not session_id and cwd:
         session_id = _find_session_for_task(cwd, record.get("started", ""), task_id)
 
-    report = _parse_final_report(log_content) if log_content else {"outcome": "unknown", "files_changed": []}
-    final_status = "completed" if report["outcome"] in ("success", "partial") else "failed"
-    result_text = (
-        f"Kilo Execution Finished (recovered by kilo-mcp after its process "
-        f"exited — task_id: {task_id}, session_id: {session_id or 'unknown'}). "
-        "The MCP server that launched this task may have restarted before "
-        "it could record the outcome itself; this was reconstructed from "
-        f"the task's log file.\n\nLOG:\n{log_content or '(no log content captured)'}"
-    )
+    if reaped:
+        final_status = "completed"
+        note = "reaped lingering process after completion"
+        result_text = (
+            f"Kilo Execution Finished ({note} — "
+            f"task_id: {task_id}, session_id: {session_id or 'unknown'}).\n\n"
+            f"LOG:\n{log_content or '(no log content captured)'}"
+        )
+    else:
+        final_status = "completed" if report.get("outcome") in ("success", "partial") else "failed"
+        result_text = (
+            f"Kilo Execution Finished (recovered by kilo-mcp after its process "
+            f"exited — task_id: {task_id}, session_id: {session_id or 'unknown'}). "
+            "The MCP server that launched this task may have restarted before "
+            "it could record the outcome itself; this was reconstructed from "
+            f"the task's log file.\n\nLOG:\n{log_content or '(no log content captured)'}"
+        )
 
     if cwd:
-        measure = _measure_files(cwd, report["files_changed"])
+        measure = _measure_files(cwd, report.get("files_changed") or [])
         costs = _estimate_costs(spec_chars=0, result_chars=len(result_text), code_chars=measure["code_chars"])
         _append_jsonl(METRICS_FILE, {
             "run_id": task_id,
@@ -1736,11 +1985,12 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
             "agent": record.get("agent"),
             "model": record.get("model"),
             "session_id": session_id,
-            "outcome": report["outcome"],
-            "files_changed": report["files_changed"],
+            "outcome": report.get("outcome") or ("success" if reaped else "unknown"),
+            "files_changed": report.get("files_changed") or [],
             **measure,
             **costs,
-            "recovered_after_restart": True,
+            "recovered_after_restart": not reaped,
+            "reaped_lingering": reaped,
         })
 
     prompt_file = record.get("prompt_file")
@@ -1751,6 +2001,8 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
             pass
 
     updates = {"status": final_status, "result": result_text, "session_id": session_id}
+    if reaped:
+        updates["note"] = "reaped lingering process after completion"
     _write_task_record(task_id, updates)
     if session_id:
         _agent_manager_note_session(cwd, session_id, record.get("agent_manager_worktree_id"))
@@ -1784,6 +2036,12 @@ async def kilo_task_result(
     record = _reconcile_task_if_orphaned(task_id, record)
     status = record.get("status")
     if status == "running":
+        if _is_task_lingering_in_grace(record):
+            return (
+                f"Task {task_id}: finished; process lingering (grace period active; "
+                f"started {record.get('started')}, pid {record.get('pid')}). "
+                "Use kilo_task_wait to await completion or kilo_task_progress for status."
+            )
         return (
             f"Task {task_id} is still running (started {record.get('started')}, "
             f"workspace {record.get('working_directory')}, pid {record.get('pid')}). "
@@ -1849,7 +2107,8 @@ async def kilo_task_wait(
                 f"{progress}"
             )
 
-        await asyncio.sleep(2.0)
+        poll_interval = min(2.0, max(0.1, _get_linger_grace() / 2.0))
+        await asyncio.sleep(poll_interval)
 
 
 @mcp.tool()
@@ -1889,6 +2148,8 @@ async def kilo_task_progress(
             f"Task {task_id} already ended (status: {status}). "
             "Use kilo_task_result for the final report."
         )
+    if _is_task_lingering_in_grace(record):
+        return f"Task {task_id}: finished; process lingering (grace period). Use kilo_task_result for the final report."
     cwd = record.get("working_directory")
     session_id = record.get("session_id")
     if not session_id and cwd:
@@ -2857,6 +3118,7 @@ async def kilo_task_status(
     """
     env = os.environ.copy()
     here = os.getcwd()
+    _reconcile_all_tasks()
     rc, out, _ = await _run_kilo(["pgrep", "-fl", "kilo run"], cwd=here, env=env)
     procs = []
     for line in (out or "").splitlines():
@@ -2894,7 +3156,11 @@ async def kilo_task_status(
                 if age < elapsed:  # session belongs to this run, not an old one
                     session_age = age
                 break
-        verdict = _assess_kilo_task(elapsed, cpu, has_network, session_age)
+        matching_rec = _find_task_record_by_pid(pid)
+        if matching_rec and _is_task_lingering_in_grace(matching_rec):
+            verdict = "FINISHED; PROCESS LINGERING (GRACE PERIOD)"
+        else:
+            verdict = _assess_kilo_task(elapsed, cpu, has_network, session_age)
         report.append(
             f"## PID {pid} — {proc_cwd}\n"
             f"- elapsed: {int(elapsed)}s | cpu: {int(cpu)}s | network: {'yes' if has_network else 'no'}"

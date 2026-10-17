@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -1680,3 +1682,278 @@ def test_kilo_log_decision_and_metrics_reporting(fake_data_dir):
     assert "escalate=1" in res
     assert "discarded=1" in res
     assert "inline_followup_needed: 1" in res
+
+
+# ==============================================================================
+# 28. Lingering kilo run reaper (T012)
+# ==============================================================================
+
+def test_reap_lingering_process_after_final_report(tmp_path, fake_data_dir, monkeypatch):
+    """A stub kilo process that prints a Final Report then sleeps forever is
+    detected as finished; kilo_task_progress reports 'finished; process lingering
+    (grace period)' during grace, and kilo_task_wait reaps the process once grace
+    expires, recording status 'completed' with note 'reaped lingering process after completion'."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub_kilo = bin_dir / "kilo"
+    stub_kilo.write_text(f"""#!{sys.executable}
+import sys
+import time
+
+print(\"\"\"# Task Execution
+Working on task...
+## Final Report (mandatory)
+- **Outcome**: success
+- **Files changed**:
+- test_output.py
+- **Verification**: tests passed
+- **Issues**: none
+\"\"\", flush=True)
+
+while True:
+    time.sleep(1)
+""")
+    stub_kilo.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(server, "KILO_LINGER_GRACE", 0.5)
+
+    launch = asyncio.run(server.kilo_implement(
+        task_instructions="Implement feature",
+        working_directory=str(tmp_path),
+        background=True,
+    ))
+    task_id = launch.split("task_id: ")[1].split(")")[0]
+
+    # Wait until the stub has written its output to the log
+    log_file = tmp_path / "tasks" / f"{task_id}.log"
+    for _ in range(50):
+        if log_file.exists() and log_file.stat().st_size > 0:
+            break
+        time.sleep(0.02)
+
+    # During the grace period, kilo_task_progress reports finished & lingering
+    prog = asyncio.run(server.kilo_task_progress(task_id=task_id))
+    assert "finished; process lingering (grace period)" in prog
+
+    # Await completion via kilo_task_wait (timeout 5s)
+    res = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=5))
+    assert "Kilo Execution Finished" in res
+    assert "reaped lingering process after completion" in res
+
+    record = server._read_task_record(task_id)
+    assert record["status"] == "completed"
+    assert record.get("note") == "reaped lingering process after completion"
+    pid = record["pid"]
+    assert not server._is_pid_alive(pid), f"Process {pid} should have been terminated and reaped"
+
+
+def test_stub_keeps_printing_output_is_not_reaped(tmp_path, fake_data_dir, monkeypatch):
+    """A stub kilo process that keeps writing new output is NOT reaped even after
+    the grace period duration has elapsed from launch, because time_since_last_output
+    remains smaller than the grace window."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub_kilo = bin_dir / "kilo"
+    stub_kilo.write_text(f"""#!{sys.executable}
+import sys
+import time
+
+print(\"\"\"# Task Execution
+## Final Report
+- **Outcome**: success
+- **Files changed**:
+- ongoing.py
+\"\"\", flush=True)
+
+# Continuously emit new output every 0.05s
+for i in range(20):
+    time.sleep(0.05)
+    print(f"Still working on step {{i}}...", flush=True)
+
+while True:
+    time.sleep(1)
+""")
+    stub_kilo.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(server, "KILO_LINGER_GRACE", 0.3)
+
+    launch = asyncio.run(server.kilo_implement(
+        task_instructions="Implement ongoing task",
+        working_directory=str(tmp_path),
+        background=True,
+    ))
+    task_id = launch.split("task_id: ")[1].split(")")[0]
+
+    # Wait until the stub starts printing output
+    log_file = tmp_path / "tasks" / f"{task_id}.log"
+    for _ in range(50):
+        if log_file.exists() and log_file.stat().st_size > 0:
+            break
+        time.sleep(0.02)
+
+    # Sleep 0.35s (longer than the 0.3s grace period from launch), but the stub has been
+    # actively printing output every 0.05s, so idle time is ~0.05s < 0.3s.
+    time.sleep(0.35)
+
+    rec = server._read_task_record(task_id)
+    rec = server._reconcile_task_if_orphaned(task_id, rec)
+    assert rec["status"] == "running", "Task should NOT be reaped while still printing output"
+    pid = rec["pid"]
+    assert server._is_pid_alive(pid), "Process should still be alive"
+
+    # Clean up the running stub
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def test_reap_lingering_process_after_json_idle_event(tmp_path, fake_data_dir, monkeypatch):
+    """A stub process emitting Kilo's JSON stream ending in a session.idle event
+    is detected as finished and reaped after grace."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub_kilo = bin_dir / "kilo"
+    stub_kilo.write_text(f"""#!{sys.executable}
+import sys
+import time
+import json
+
+print(json.dumps({{"type": "step_start", "part": {{"id": "1"}}}}), flush=True)
+print(json.dumps({{"type": "text", "part": {{"text": "Work done"}}}}), flush=True)
+print(json.dumps({{"type": "session.idle", "sessionID": "ses-json-test"}}), flush=True)
+
+while True:
+    time.sleep(1)
+""")
+    stub_kilo.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(server, "KILO_LINGER_GRACE", 0.2)
+
+    launch = asyncio.run(server.kilo_implement(
+        task_instructions="Run JSON stream task",
+        working_directory=str(tmp_path),
+        background=True,
+    ))
+    task_id = launch.split("task_id: ")[1].split(")")[0]
+
+    log_file = tmp_path / "tasks" / f"{task_id}.log"
+    for _ in range(50):
+        if log_file.exists() and log_file.stat().st_size > 0:
+            break
+        time.sleep(0.02)
+
+    res = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=5))
+    assert "reaped lingering process after completion" in res
+
+    record = server._read_task_record(task_id)
+    assert record["status"] == "completed"
+    assert not server._is_pid_alive(record["pid"])
+
+
+def test_reap_lingering_process_sigkill_escalation(tmp_path, fake_data_dir, monkeypatch):
+    """A lingering stub process that ignores SIGTERM escalates to SIGKILL after
+    the sigkill timeout and is successfully reaped."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub_kilo = bin_dir / "kilo"
+    stub_kilo.write_text(f"""#!{sys.executable}
+import sys
+import time
+import signal
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+print(\"\"\"# Task Execution
+## Final Report
+- **Outcome**: success
+- **Files changed**:
+- stubborn.py
+\"\"\", flush=True)
+
+while True:
+    time.sleep(1)
+""")
+    stub_kilo.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(server, "KILO_LINGER_GRACE", 0.2)
+    monkeypatch.setattr(server, "_REAP_SIGKILL_TIMEOUT_S", 0.2)
+
+    launch = asyncio.run(server.kilo_implement(
+        task_instructions="Run stubborn task",
+        working_directory=str(tmp_path),
+        background=True,
+    ))
+    task_id = launch.split("task_id: ")[1].split(")")[0]
+
+    log_file = tmp_path / "tasks" / f"{task_id}.log"
+    for _ in range(50):
+        if log_file.exists() and log_file.stat().st_size > 0:
+            break
+        time.sleep(0.02)
+
+    res = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=5))
+    assert "reaped lingering process after completion" in res
+
+    record = server._read_task_record(task_id)
+    assert record["status"] == "completed"
+    assert not server._is_pid_alive(record["pid"])
+
+
+def test_kilo_task_status_reaps_lingering_tasks(tmp_path, fake_data_dir, monkeypatch):
+    """kilo_task_status reconciles running tasks, reaping any lingering task whose
+    grace period has elapsed, so it is not reported as running."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub_kilo = bin_dir / "kilo"
+    stub_kilo.write_text(f"""#!{sys.executable}
+import sys
+import time
+
+print(\"\"\"# Task Execution
+## Final Report
+- **Outcome**: success
+- **Files changed**:
+- file.py
+\"\"\", flush=True)
+
+while True:
+    time.sleep(1)
+""")
+    stub_kilo.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(server, "KILO_LINGER_GRACE", 0.2)
+
+    launch = asyncio.run(server.kilo_implement(
+        task_instructions="Run task for status",
+        working_directory=str(tmp_path),
+        background=True,
+    ))
+    task_id = launch.split("task_id: ")[1].split(")")[0]
+
+    log_file = tmp_path / "tasks" / f"{task_id}.log"
+    for _ in range(50):
+        if log_file.exists() and log_file.stat().st_size > 0:
+            break
+        time.sleep(0.02)
+
+    # Wait past grace period
+    time.sleep(0.3)
+
+    status_out = asyncio.run(server.kilo_task_status(working_directory=str(tmp_path)))
+    assert "No `kilo run` process" in status_out
+
+    rec = server._read_task_record(task_id)
+    assert rec["status"] == "completed"
+    assert not server._is_pid_alive(rec["pid"])
+
