@@ -393,7 +393,7 @@ Background `kilo_implement` tasks are launched as **fully detached OS processes*
 3. **Unreaped zombies reported as "alive".** `os.kill(pid, 0)` returns successfully for a zombie (exited but not yet reaped) process - a naive liveness check would report a genuinely-finished task as still running indefinitely. The liveness check reaps via `os.waitpid(pid, os.WNOHANG)` first; only if that finds no exited child does it fall back to `os.kill(pid, 0)`.
 4. **Lingering `kilo run` processes after completion.** If `kilo run` emits its Final Report (or JSON event stream idle event) but the process hangs without exiting (e.g. unclosed background child processes or pipes), kilo-mcp detects that output has ceased for a grace period (default 60s, configurable via `KILO_MCP_LINGER_GRACE_SECONDS` / `linger_grace_seconds`), reaps the process group (SIGTERM, escalating to SIGKILL after 5s), and marks the task status as `completed` with note `reaped lingering process after completion`.
 
-All four were found and fixed by live end-to-end testing through the actual MCP protocol (unit tests mocking at the subprocess-spawn seam did not, and cannot, catch process-lifetime or stdin-inheritance bugs - they're only observable running the real binary through the real transport).
+The first three were found and fixed by live end-to-end testing through the actual MCP protocol (unit tests mocking at the subprocess-spawn seam did not, and cannot, catch process-lifetime or stdin-inheritance bugs - they're only observable running the real binary through the real transport). The fourth was observed in real use (four tasks lingering for hours on 2026-10-17) and is covered by a stub-based test; it takes effect after the MCP server restarts.
 
 ---
 
