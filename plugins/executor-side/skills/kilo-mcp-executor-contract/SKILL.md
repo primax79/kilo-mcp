@@ -40,6 +40,29 @@ Use this skill when Kilo executes background tasks on behalf of an orchestrating
   context, stop and mark the outcome as `partial` or `failed` in the Final
   Report, explaining the blocker under "Issues" so the Architect can
   intervene.
+- **Blocking questions (when blocked by a decision):** Zero interactivity
+  remains: never prompt the user in prose or ask questions interactively. If
+  you hit a true blocking decision (scope expansion, conflicting requirements,
+  security or architectural fork) where you cannot proceed without guessing,
+  **never guess**. Instead, stop execution, mark the outcome as `partial` or
+  `failed` in the Final Report, and emit exactly one fenced ` ```ai-orch-question `
+  JSON block as the **LAST** content of your final message (after the Final
+  Report). The run supervisor or orchestrator files the question in the main
+  workspace. Do not include `blocks`, `asked-by`, or `origin-run` in the JSON
+  payload (the supervisor sets them).
+
+  ```ai-orch-question
+  {
+    "question": "Which database engine should be used for session storage?",
+    "context": "The specification mentions session caching but does not specify whether to use Redis or PostgreSQL.",
+    "options": [
+      {"label": "A", "title": "Redis", "consequence": "In-memory speed, requires running Redis container."},
+      {"label": "B", "title": "PostgreSQL table", "consequence": "Reuses existing DB, slightly higher latency."}
+    ],
+    "recommended": "A",
+    "open_answer": false
+  }
+  ```
 
 ## Mandatory `## Final Report` Skeleton
 
@@ -57,6 +80,8 @@ Always conclude your final response with this exact Markdown structure:
 - **Issues:**
   - `None` (or explicit description of blockers, forced deviations, or out-of-scope findings)
 ```
+
+When stopped due to a blocking decision, append the fenced ` ```ai-orch-question ` block immediately after the Final Report as the very last content of the message.
 
 ## Care and Scope Discipline
 

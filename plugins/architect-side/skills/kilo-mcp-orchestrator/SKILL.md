@@ -241,6 +241,25 @@ and it occupies your context while it waits.
 - **Keep your context lean.** After capturing a task, keep only its one-line
   entry in the registry. Read its files again only when you pick it up.
 
+## Blocking questions: never decide on the owner's behalf
+
+When an architectural, security, scope, or financial fork requires a decision,
+the orchestrator must never guess or decide on the owner's behalf.
+
+- **File questions with `ai-orch questions ask`:** Create a question file in
+  `tasks/questions/Q###-<slug>.md` using `ai-orch questions ask`. Provide a
+  standalone question (≤160 chars, ending with `?`), complete context,
+  clear options with consequences, and link the blocked tasks (`--blocks T###`).
+  The blocked tasks automatically transition to `waiting` (`decider: Q###`).
+- **File questions from executors or runs:** When an Executor or headless run
+  finishes and its Final Report contains a fenced ` ```ai-orch-question ` JSON
+  block, the orchestrator (or the run supervisor) files it immediately via
+  `ai-orch questions ask`, ensuring the question is recorded in `tasks/questions/`
+  and the blocked task is marked `waiting`.
+- **Batching rules:** Batch multiple questions together into one turn or review
+  only when they are strictly independent. If question B depends on the answer
+  to question A, ask question A first to avoid wasted effort and confusion.
+
 Remember: the RAG index behind `kilo_rag_search` is a standing resource for your own exploration and Q&A too — use it even when you are not delegating anything.
 
 **Agent Manager visibility is automatic, not something you manage.** `kilo_create_worktree` and `kilo_implement(isolation='worktree')` register the worktree — and later its session, once resolved — into `.kilo/agent-manager.json` on their own (as of 2026-07-29). You don't need to ask whether to do this, back up the file, or hand-edit it. The one caveat: a task launched before a kilo-mcp-server fix/restart doesn't benefit retroactively once it's already `completed` — if a worktree shows without a linked session, check whether it predates the current server process rather than assuming the mechanism is broken.
