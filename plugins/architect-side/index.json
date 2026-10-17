@@ -16,6 +16,7 @@
       "name": "skills/kilo-mcp-orchestrator",
       "files": [
         "SKILL.md",
+        "references/incidents.md",
         "scripts/diagnose-kilo-tasks.sh",
         "scripts/kill-kilo-task.sh"
       ]

@@ -50,15 +50,12 @@ in doubt, delegate rather than fix it yourself.
     `.git/config` is shared by every worktree of a repo, so a delegated task that
     runs `git config` - or any tool that runs it on your behalf, e.g. `husky
     init` setting `core.hooksPath` - writes into the configuration the user's
-    *own* checkout reads. Observed live: a lint-and-hooks task, correctly
-    isolated in its own worktree, was one command away from installing a
-    pre-commit hook on the user's working checkout of applications in daily
-    production use, where a broken hook would have blocked their real commits.
-    Any task that would touch repo-level configuration must be instructed to
-    create the files and **document the activation command instead of running
-    it**, and to prove it didn't by showing `git config --get <key>` returning
-    empty. Activation is the user's call, not the task's.
-- **Phase 3 - Delegation:** Before each `kilo_implement`, move the task to `in progress` (`ai-orch tasks transition <id> "in progress" --actor <you> --reason "kilo, worktree <branch>"`); when its Final Report arrives with a commit, move it to `delivered`. A dispatched task left `open` is a bookkeeping bug. Use `kilo_implement` to delegate implementation work. It runs in the **background by default** and returns a `task_id` immediately — never block the conversation waiting on it. Pass `focus_files` found during search, configure any `skills_to_load`, and dispatch tasks in parallel across worktrees. For work that spans multiple dependent steps or sessions, write it up first as a `tasks/` pipeline (see the `task-pipeline` skill) and delegate one task file at a time — each task file is already scoped, self-contained, and has its own verification section, which maps directly onto one well-formed `kilo_implement` call.
+    *own* checkout reads (see `references/incidents.md` #3). Any task that would touch
+    repo-level configuration must be instructed to create the files and **document
+    the activation command instead of running it**, and to prove it didn't by
+    showing `git config --get <key>` returning empty. Activation is the user's
+    call, not the task's.
+- **Phase 3 - Delegation:** Use `kilo_implement` to delegate implementation work. It runs in the **background by default** and returns a `task_id` immediately — never block the conversation waiting on it. Pass `focus_files` found during search, configure any `skills_to_load`, and dispatch tasks in parallel across worktrees. For work that spans multiple dependent steps or sessions, write it up first as a `tasks/` pipeline (see the `task-pipeline` skill) and delegate one task file at a time — each task file is already scoped, self-contained, and has its own verification section, which maps directly onto one well-formed `kilo_implement` call.
 - **Phase 4 - Monitoring & Intervention:** Scale how closely you watch a task to its complexity/risk:
   - **Small, well-scoped tasks:** await completion deterministically with `kilo_task_wait(task_id=..., timeout_seconds=...)` (returns the full `kilo_task_result` payload as soon as the task reaches a terminal state, or a clear status message with live progress on timeout without raising) instead of guessing timer intervals.
   - **Large, multi-file, or high-risk tasks:** use bounded `kilo_task_wait` slices (e.g. `timeout_seconds=120`) or poll `kilo_task_progress` periodically and inspect Kilo's live checklist with `kilo_get_session_todo`. You can also directly inject or update the plan using `kilo_update_session_todo` to guide execution.
@@ -75,20 +72,15 @@ in doubt, delegate rather than fix it yourself.
   - See the `task-spec-authoring` skill for calibrating verification depth to task risk in more detail.
 - **Phase 5b - Verify the integration, not only the tasks.** Every task in a
   batch can be green in its own worktree and the merged result still be broken:
-  tasks branched from the same commit cannot see each other. Observed live: two
-  tasks in one batch each declared their own `BBox` type in the same library;
-  lint and unit tests stayed green in both worktrees **and after the merge**,
-  and only the application build caught it (a duplicate-export error on the
-  library's barrel file). The integration gate is therefore not the union of the
-  tasks' own criteria: after every merge run lint, tests, **and a full build of a
-  consuming application**, and treat that as the batch's real acceptance.
+  tasks branched from the same commit cannot see each other (see `references/incidents.md` #6
+  for the duplicate symbol collision incident). The integration gate is therefore
+  not the union of the tasks' own criteria: after every merge run lint, tests,
+  **and a full build of a consuming application**, and treat that as the batch's real acceptance.
 - **Phase 6 - Closure & Telemetry:** Record the orchestration branch taken with `kilo_log_decision` (`delegate`, `inline`, `escalate`, or `discarded`), and if defects are found during review, log them with `kilo_log_issue` (vital for continuous prompt/specification tuning — see `kilo-mcp-metrics-analyst`) and request Kilo to fix them.
   - **Merging: always checkout the target branch explicitly first.**
     Running `git merge --no-ff <feature-branch> -m "..." <target>` without
-    checking out `<target>` first is a real, observed mistake - the
-    trailing `<target>` argument gets interpreted as another branch to
-    merge IN, not as the destination, so the merge silently lands on
-    whatever branch you happened to be on. Correct sequence, every time:
+    checking out `<target>` first is a real, observed mistake (see `references/incidents.md` #7).
+    Correct sequence, every time:
     `git status --short` (clean) → `git checkout <target>` (explicit,
     never implicit) → `git merge --no-ff <feature-branch> -m "..."` →
     `git log --oneline --graph -6` (confirm the merge landed where
