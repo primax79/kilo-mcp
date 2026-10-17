@@ -33,7 +33,7 @@ rather than repeated here.
 - **💸 Configurable Cost Model & Delegation Policy**: Whether Kilo execution is free depends on the operator - some have provider API keys supplied at no charge, others pay per token. Set `[kilo] input_cost_per_mtok` / `output_cost_per_mtok` (default `0.0` = free) to your real Kilo rates: the built-in delegation policy automatically switches between a free-Kilo model (only orchestrator tokens matter) and a paid-Kilo model (Kilo's own agentic loop joins the comparison), and cost estimates include Kilo's execution cost. The `delegation_policy` setting still overrides the injected policy text entirely, so the orchestrator self-selects *when* delegating (short spec + review) beats doing the work inline; tune it without touching code.
 - **📊 Metrics & Feedback Loop**: Every run is recorded to `metrics.jsonl` (duration, outcome parsed from Kilo's Final Report, generated-code volume, real delegation cost vs estimated inline cost). Defects found during review are logged via `kilo_log_issue` to `issues.jsonl`, and `kilo_metrics` aggregates everything - surfacing the exact cost breakdown (orchestrator spec+review vs. Kilo execution) so you can see whether delegation pays off and which defect categories the prompts must start guarding against.
 - **🤖 Agent & Skill Discovery**: Exposes tools for the orchestrator to dynamically discover available Kilo agents (e.g., `code`, `explore`) and custom skills configured in your local or global `.kilo/` directories.
-- **🛡️ Advanced Orchestration**: Support for git worktrees (`kilo_create_worktree`) to allow parallel feature implementations, advanced workspace checks (`kilo_workspace_status`), provider status checks (`kilo_auth_status`), and custom command execution (`kilo_run_command`). Included are skills (`kilo-mcp-executor-contract`, `kilo-mcp-conflict-resolver`, and `kilo-mcp-rag-explorer`) to improve parallel agent work, headless task completion, and fast semantic search.
+- **🛡️ Advanced Orchestration**: Support for git worktrees (`kilo_create_worktree`) to allow parallel feature implementations, advanced workspace checks (`kilo_workspace_status`), structured verification gates (`kilo_verify_worktree`), provider status checks (`kilo_auth_status`), and custom command execution (`kilo_run_command`). Included are skills (`kilo-mcp-executor-contract`, `kilo-mcp-conflict-resolver`, and `kilo-mcp-rag-explorer`) to improve parallel agent work, headless task completion, and fast semantic search.
 - **🎯 Precise Context Injection**: The orchestrator can pass specific files as `focus_files`, ensuring Kilo reads the exact context needed before making changes.
 - **⚙️ Dynamic Configuration**: Claude can inject environment variables into the Kilo subprocess at runtime (e.g. debugging flags) to shape Kilo's execution environment; the server itself is configured via a layered env-var/TOML/default scheme.
 - **🛡️ Non-Interactive by Default**: Safely runs Kilo in background subprocesses without hanging on interactive CLI prompts.
@@ -345,6 +345,16 @@ Execute a deterministic, pre-programmed Kilo custom command (e.g., `db-migrate`)
 Report the git status (`git status -s`) of a working directory or worktree - useful to review what a delegated run actually touched. A clean tree and git failures are reported explicitly.
 
 **Parameters:** `working_directory` *(optional)*.
+
+### `kilo_verify_worktree`
+
+Run a structured verification gate on a working directory or worktree. Executes a sequence of verification commands (lint, test, build) sequentially via the shell and returns a compact JSON verdict with overall status (`ok`), git commit hash (`head`), dirty flag (`dirty`), and output tails only for failed checks to avoid context window waste.
+
+**Security Caveat:** Executes arbitrary shell commands provided by the caller or read from the project configuration.
+
+**Commands:** Checks are taken from the explicit `commands` list, or, when omitted, from the `[verify]` table in a project-local `kilo-mcp.toml` or `.kilo-mcp.toml` at the working directory root (e.g. `commands = ["pytest", "ruff check ."]`). If neither exists, returns an error explaining both options (does not guess commands). Each command runs with `cwd=working_directory` sequentially under `timeout_seconds`; on timeout, the command's entire process group is killed. Execution continues across checks so all failures are reported.
+
+**Parameters:** `working_directory` *(required)*, `commands` *(list of strings, optional)*, `timeout_seconds` *(int, default 600, range 1..3600)*, `tail_lines` *(int, default 40, range 1..500)*.
 
 ### `kilo_task_status`
 

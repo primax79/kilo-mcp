@@ -39,7 +39,7 @@ IMPORTANT — the indexing resource is yours to use directly: kilo_rag_search re
 - Phase 2 — Isolation: kilo_implement has NO isolation and NO locking by default — it runs directly in working_directory (defaulting to the server's own cwd) with nothing preventing a concurrent writer (another kilo_implement call, or your own git commands) from racing it in the same tree. Pass isolation='worktree' on kilo_implement (or call kilo_create_worktree yourself first) for anything beyond a single trivial edit, and always when dispatching parallel tasks against the same repo. If you skip isolation, kilo_implement still warns you when another task is already running against the exact same working_directory — do not proceed past that warning without a plan (wait, isolate, or pick a different directory).
 - Phase 3 — Delegation: call kilo_implement in parallel across the worktrees. It runs in the BACKGROUND BY DEFAULT and returns a task_id immediately — the conversation is never blocked waiting for Kilo.
 - Phase 4 — Monitoring & intervention: scale how closely you watch a task to its complexity/risk. Small, well-scoped delegations can be awaited deterministically with kilo_task_wait (which polls and reconciles orphaned processes from their log files, returning kilo_task_result when done or live progress on timeout). Large, multi-file, or high-risk ones are worth polling periodically with kilo_task_progress (Kilo's own live plan/todo list, recent commentary, running cost — read from its session database, not a heuristic); kilo_task_status gives a quicker but coarser OS-level signal. If a task drifts off-spec or looks stuck, kilo_task_cancel stops it, and a corrective kilo_implement call with continue_session_id resumes the same session with corrective instructions instead of starting blind.
-- Phase 5 — Verification & review: inspect results with kilo_workspace_status and review every Final Report.
+- Phase 5 — Verification & review: inspect results with kilo_workspace_status, run verification gates with kilo_verify_worktree, and review every Final Report.
 - Phase 6 — Closure & telemetry: log orchestration decisions with kilo_log_decision and defects found during review with kilo_log_issue.
 
 ## Metrics analysis (for the connected assistant)
@@ -2893,6 +2893,261 @@ async def kilo_workspace_status(
     return f"Workspace status:\n{stdout or '(clean — no uncommitted changes)'}"
 
 
+async def _git_head_async(cwd: str) -> Optional[str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "HEAD",
+            cwd=cwd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        if proc.returncode == 0:
+            val = stdout.decode().strip()
+            return val or None
+    except Exception:
+        pass
+    return None
+
+
+async def _git_dirty_async(cwd: str) -> bool:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "status", "--porcelain",
+            cwd=cwd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        if proc.returncode == 0:
+            return bool(stdout.decode().strip())
+    except Exception:
+        pass
+    return False
+
+
+def _read_project_verify_commands(working_directory: str) -> Optional[list[str]]:
+    for fname in ("kilo-mcp.toml", ".kilo-mcp.toml"):
+        cfg_path = os.path.join(working_directory, fname)
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            import tomllib
+            with open(cfg_path, "rb") as f:
+                data = tomllib.load(f)
+            verify_table = data.get("verify")
+            if isinstance(verify_table, dict) and "commands" in verify_table:
+                cmds = verify_table["commands"]
+                if isinstance(cmds, list) and len(cmds) > 0:
+                    return [str(c) for c in cmds]
+        except ImportError:
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                verify_match = re.search(r'\[verify\](.*?)(?=\n\[|\Z)', content, re.DOTALL)
+                if verify_match:
+                    sec_text = verify_match.group(1)
+                    cmd_match = re.search(r'commands\s*=\s*\[(.*?)\]', sec_text, re.DOTALL)
+                    if cmd_match:
+                        raw_cmds = cmd_match.group(1)
+                        items = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"|\'([^\'\\]*(?:\\.[^\'\\]*)*)\'', raw_cmds)
+                        cmds = [i[0] or i[1] for i in items if i[0] or i[1]]
+                        if cmds:
+                            return cmds
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("Failed to parse verify config from %s: %s", cfg_path, e)
+    return None
+
+
+async def _read_stream_lines(stream: asyncio.StreamReader) -> list[str]:
+    lines = []
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        lines.append(line.decode("utf-8", errors="replace"))
+    return lines
+
+
+async def _run_verify_check(
+    cmd_str: str,
+    cwd: str,
+    timeout_seconds: int,
+    tail_lines: int,
+) -> dict:
+    start_time = time.monotonic()
+    timed_out = False
+    exit_code = None
+    lines: list[str] = []
+
+    proc = await asyncio.create_subprocess_shell(
+        cmd_str,
+        cwd=cwd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    read_task = asyncio.create_task(_read_stream_lines(proc.stdout))
+    try:
+        await asyncio.wait_for(asyncio.shield(read_task), timeout=timeout_seconds)
+        exit_code = await proc.wait()
+        lines = await read_task
+    except asyncio.TimeoutError:
+        timed_out = True
+        _reap_lingering_process(proc.pid, sigkill_timeout_s=1.0)
+        try:
+            await proc.wait()
+        except (ChildProcessError, OSError):
+            pass
+        read_task.cancel()
+        try:
+            lines = await read_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    duration_s = round(time.monotonic() - start_time, 2)
+    passed = (not timed_out) and (exit_code == 0)
+
+    if passed:
+        output_tail = ""
+    else:
+        clean_lines = [l.rstrip("\r\n") for l in lines]
+        while clean_lines and not clean_lines[-1]:
+            clean_lines.pop()
+        if clean_lines:
+            output_tail = "\n".join(clean_lines[-tail_lines:])
+        elif timed_out:
+            output_tail = f"Command timed out after {timeout_seconds}s"
+        else:
+            output_tail = ""
+
+    return {
+        "command": cmd_str,
+        "exit_code": exit_code,
+        "passed": passed,
+        "duration_s": duration_s,
+        "timed_out": timed_out,
+        "output_tail": output_tail,
+    }
+
+
+@mcp.tool()
+async def kilo_verify_worktree(
+    working_directory: Annotated[
+        str,
+        Field(description="Path to the repository or worktree to verify."),
+    ],
+    commands: Annotated[
+        Optional[list[str]],
+        Field(
+            description="Optional list of shell commands to execute sequentially. "
+            "If omitted, commands are read from the [verify] table in kilo-mcp.toml "
+            "or .kilo-mcp.toml at the root of working_directory."
+        ),
+    ] = None,
+    timeout_seconds: Annotated[
+        int,
+        Field(description="Maximum execution time in seconds per command (1..3600, default 600)."),
+    ] = 600,
+    tail_lines: Annotated[
+        int,
+        Field(description="Number of output tail lines to capture for failed checks (1..500, default 40)."),
+    ] = 40,
+) -> str:
+    """Run a structured verification gate on a working directory or worktree.
+
+    Executes a sequence of verification commands (lint, test, build) and returns
+    a compact structured verdict with git head/dirty state and output tails for
+    failed checks only, minimizing context window waste.
+
+    SECURITY NOTE: This tool executes arbitrary shell commands provided by the
+    caller or read from project configuration.
+
+    Commands are taken from the explicit `commands` list, or, when omitted,
+    from the `[verify]` table in a project-local `kilo-mcp.toml` or `.kilo-mcp.toml`
+    at the root of `working_directory` (e.g. `commands = ["pytest", "ruff check ."]`).
+    If neither is found, returns an error explaining both options.
+
+    Each command runs sequentially with cwd=working_directory via the shell.
+    If a command exceeds `timeout_seconds`, its entire process group is killed.
+    All commands are run regardless of individual failures.
+
+    Returns a JSON string:
+    {
+        "ok": bool,
+        "working_directory": str,
+        "head": str | null,
+        "dirty": bool,
+        "checks": [
+            {
+                "command": str,
+                "exit_code": int | null,
+                "passed": bool,
+                "duration_s": float,
+                "timed_out": bool,
+                "output_tail": str
+            }
+        ]
+    }
+    """
+    if not os.path.exists(working_directory) or not os.path.isdir(working_directory):
+        raise ValueError(f"working_directory '{working_directory}' does not exist or is not a directory.")
+
+    if not isinstance(timeout_seconds, int) or timeout_seconds < 1 or timeout_seconds > 3600:
+        raise ValueError(f"timeout_seconds must be between 1 and 3600 (got {timeout_seconds}).")
+
+    if not isinstance(tail_lines, int) or tail_lines < 1 or tail_lines > 500:
+        raise ValueError(f"tail_lines must be between 1 and 500 (got {tail_lines}).")
+
+    resolved_commands = commands
+    if resolved_commands is None:
+        resolved_commands = _read_project_verify_commands(working_directory)
+
+    if not resolved_commands:
+        return json.dumps({
+            "ok": False,
+            "error": (
+                f"No verification commands provided and no [verify] table found in "
+                f"kilo-mcp.toml or .kilo-mcp.toml at '{working_directory}'. "
+                "Provide commands explicitly via the 'commands' argument "
+                "or define commands = [...] under [verify] in kilo-mcp.toml or .kilo-mcp.toml."
+            ),
+            "working_directory": working_directory,
+            "head": await _git_head_async(working_directory),
+            "dirty": await _git_dirty_async(working_directory),
+            "checks": [],
+        }, indent=2)
+
+    checks = []
+    for cmd_str in resolved_commands:
+        check = await _run_verify_check(
+            cmd_str,
+            cwd=working_directory,
+            timeout_seconds=timeout_seconds,
+            tail_lines=tail_lines,
+        )
+        checks.append(check)
+
+    all_passed = all(c["passed"] for c in checks)
+    head = await _git_head_async(working_directory)
+    dirty = await _git_dirty_async(working_directory)
+
+    result = {
+        "ok": all_passed,
+        "working_directory": working_directory,
+        "head": head,
+        "dirty": dirty,
+        "checks": checks,
+    }
+    return json.dumps(result, indent=2)
+
+
 # --- kilo_task_status helpers (pure logic kept separate for testability) ----
 
 KILO_SESSION_DB = os.path.expanduser("~/.local/share/kilo/kilo.db")
@@ -3179,7 +3434,8 @@ if _IS_RAG_ONLY:
         "kilo_implement", "kilo_task_wait", "kilo_task_result", "kilo_task_progress", "kilo_task_cancel",
         "kilo_log_issue", "kilo_log_decision", "kilo_metrics", "kilo_create_worktree", "kilo_session_revert",
         "kilo_session_fork", "kilo_respond_question", "kilo_get_session_todo",
-        "kilo_update_session_todo", "kilo_run_command", "kilo_workspace_status", "kilo_task_status"
+        "kilo_update_session_todo", "kilo_run_command", "kilo_workspace_status", "kilo_task_status",
+        "kilo_verify_worktree"
     }
     mcp._tool_manager._tools = {
         k: v for k, v in mcp._tool_manager._tools.items()

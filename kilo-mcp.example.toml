@@ -80,3 +80,13 @@ chars_per_token = 4.0
 # env: KILO_MCP_INLINE_OUTPUT_FACTOR / KILO_MCP_INLINE_INPUT_PER_OUTPUT
 inline_output_factor = 1.2
 inline_input_per_output = 40.0
+
+# [verify]
+# Project-level verification commands run by kilo_verify_worktree when called
+# without explicit commands. Commands execute sequentially in working_directory
+# via the shell; any failure or timeout is reported in the structured verdict.
+# commands = [
+#     "pytest",
+#     "ruff check .",
+# ]
+

@@ -1957,3 +1957,149 @@ while True:
     assert rec["status"] == "completed"
     assert not server._is_pid_alive(rec["pid"])
 
+
+# ==============================================================================
+# kilo_verify_worktree tests
+# ==============================================================================
+
+def test_kilo_verify_worktree_all_pass(tmp_path):
+    repo = _init_git_repo(tmp_path / "repo")
+    res_str = asyncio.run(server.kilo_verify_worktree(
+        working_directory=repo,
+        commands=["echo check1", "echo check2"],
+    ))
+    res = json.loads(res_str)
+    assert res["ok"] is True
+    assert res["working_directory"] == repo
+    assert res["head"] is not None and len(res["head"]) == 40
+    assert res["dirty"] is False
+    assert len(res["checks"]) == 2
+    for check in res["checks"]:
+        assert check["passed"] is True
+        assert check["exit_code"] == 0
+        assert check["timed_out"] is False
+        assert check["output_tail"] == ""
+        assert check["duration_s"] >= 0.0
+
+
+def test_kilo_verify_worktree_one_failing(tmp_path):
+    repo = _init_git_repo(tmp_path / "repo")
+    # Make worktree dirty by writing an untracked file
+    with open(os.path.join(repo, "dirty.txt"), "w") as f:
+        f.write("uncommitted")
+
+    res_str = asyncio.run(server.kilo_verify_worktree(
+        working_directory=repo,
+        commands=[
+            "echo check1_ok",
+            "echo fail_error_line && exit 1",
+            "echo check3_ok",
+        ],
+        tail_lines=10,
+    ))
+    res = json.loads(res_str)
+    assert res["ok"] is False
+    assert res["dirty"] is True
+    assert len(res["checks"]) == 3
+
+    assert res["checks"][0]["passed"] is True
+    assert res["checks"][0]["output_tail"] == ""
+
+    assert res["checks"][1]["passed"] is False
+    assert res["checks"][1]["exit_code"] == 1
+    assert res["checks"][1]["timed_out"] is False
+    assert "fail_error_line" in res["checks"][1]["output_tail"]
+
+    assert res["checks"][2]["passed"] is True
+    assert res["checks"][2]["output_tail"] == ""
+
+
+def test_kilo_verify_worktree_timeout(tmp_path):
+    repo = _init_git_repo(tmp_path / "repo")
+    res_str = asyncio.run(server.kilo_verify_worktree(
+        working_directory=repo,
+        commands=["sleep 5"],
+        timeout_seconds=1,
+    ))
+    res = json.loads(res_str)
+    assert res["ok"] is False
+    assert len(res["checks"]) == 1
+    c = res["checks"][0]
+    assert c["timed_out"] is True
+    assert c["passed"] is False
+    assert c["exit_code"] is None
+
+
+def test_kilo_verify_worktree_config_file(tmp_path):
+    repo = _init_git_repo(tmp_path / "repo")
+    # Test kilo-mcp.toml
+    cfg_file = os.path.join(repo, "kilo-mcp.toml")
+    with open(cfg_file, "w") as f:
+        f.write("[verify]\ncommands = [\"echo from_kilo_mcp_toml\"]\n")
+
+    res_str = asyncio.run(server.kilo_verify_worktree(working_directory=repo))
+    res = json.loads(res_str)
+    assert res["ok"] is True
+    assert len(res["checks"]) == 1
+    assert res["checks"][0]["command"] == "echo from_kilo_mcp_toml"
+    assert res["checks"][0]["passed"] is True
+
+    # Test .kilo-mcp.toml fallback
+    os.remove(cfg_file)
+    dot_cfg_file = os.path.join(repo, ".kilo-mcp.toml")
+    with open(dot_cfg_file, "w") as f:
+        f.write("[verify]\ncommands = [\"echo from_dot_kilo_mcp_toml\"]\n")
+
+    res_str2 = asyncio.run(server.kilo_verify_worktree(working_directory=repo))
+    res2 = json.loads(res_str2)
+    assert res2["ok"] is True
+    assert len(res2["checks"]) == 1
+    assert res2["checks"][0]["command"] == "echo from_dot_kilo_mcp_toml"
+    assert res2["checks"][0]["passed"] is True
+
+
+def test_kilo_verify_worktree_no_commands_no_config(tmp_path):
+    repo = _init_git_repo(tmp_path / "repo")
+    res_str = asyncio.run(server.kilo_verify_worktree(working_directory=repo))
+    res = json.loads(res_str)
+    assert res["ok"] is False
+    assert "error" in res
+    assert "commands" in res["error"]
+    assert "verify" in res["error"]
+    assert "kilo-mcp.toml" in res["error"]
+
+
+def test_kilo_verify_worktree_invalid_args(tmp_path):
+    repo = _init_git_repo(tmp_path / "repo")
+
+    # Nonexistent working directory
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(server.kilo_verify_worktree(working_directory=str(tmp_path / "nonexistent")))
+    assert "does not exist" in str(exc.value)
+
+    # File instead of directory
+    file_path = tmp_path / "somefile.txt"
+    file_path.write_text("hello")
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(server.kilo_verify_worktree(working_directory=str(file_path)))
+    assert "not a directory" in str(exc.value)
+
+    # timeout_seconds outside 1..3600
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(server.kilo_verify_worktree(working_directory=repo, timeout_seconds=0))
+    assert "timeout_seconds" in str(exc.value)
+
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(server.kilo_verify_worktree(working_directory=repo, timeout_seconds=3601))
+    assert "timeout_seconds" in str(exc.value)
+
+    # tail_lines outside 1..500
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(server.kilo_verify_worktree(working_directory=repo, tail_lines=0))
+    assert "tail_lines" in str(exc.value)
+
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(server.kilo_verify_worktree(working_directory=repo, tail_lines=501))
+    assert "tail_lines" in str(exc.value)
+
+
