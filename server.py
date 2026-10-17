@@ -1,9 +1,11 @@
 from mcp.server.mcpserver import MCPServer as FastMCP
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
+import pathlib
 import re
 import shutil
 import signal
@@ -3429,13 +3431,324 @@ async def kilo_task_status(
 
 
 # Helper: unexport write/execution tools when running in --rag-only mode
+@mcp.tool()
+async def kilo_cleanup(
+    working_directory: Annotated[
+        Optional[str],
+        Field(description="Root directory of the git repository to clean up. Defaults to current working directory.")
+    ] = None,
+    keep: Annotated[
+        Optional[list[str]],
+        Field(description="List of branch names, worktree directory names/paths, or task IDs to preserve unconditionally.")
+    ] = None,
+    scope: Annotated[
+        Optional[list[str]],
+        Field(description="Resources to clean up: any of ['worktrees', 'branches', 'processes']. Defaults to all three.")
+    ] = None,
+    base_branch: Annotated[
+        Optional[str],
+        Field(description="Base target branch to test merge status against (default: repo default branch or main/master).")
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        Field(description="If True, only reports candidates, kept items, and leftovers with a plan_hash. If False, executes the plan.")
+    ] = True,
+    plan_hash: Annotated[
+        Optional[str],
+        Field(description="Required when dry_run=False: must match the plan_hash returned by the preceding dry-run.")
+    ] = None,
+) -> str:
+    """Safely cleans up stale git worktrees, merged feature branches, and orphan background
+    dev server processes created by delegated Kilo runs.
+
+    Follows strict safety principles from executor-housekeeping-and-completion.md:
+    - Dry-run first (returns candidates, kept items, leftover work, and a plan_hash).
+    - Requires plan_hash to apply (preventing race conditions or accidental deletions).
+    - NEVER deletes worktrees with uncommitted changes or unmerged commits (reported as 'leftover_work').
+    - NEVER uses git branch -D or git clean -f: only safe git branch -d.
+    - Writes an audit log to .kilo/cleanup-<timestamp>.json upon execution.
+    """
+    cwd = os.path.realpath(working_directory if working_directory else os.getcwd())
+    env = os.environ.copy()
+
+    # Safety check: must be the root of a git repository
+    rc, top_out, _ = await _run_kilo(["git", "rev-parse", "--show-toplevel"], cwd=cwd, env=env)
+    if rc != 0 or not top_out.strip():
+        return json.dumps({"error": f"working_directory '{cwd}' is not inside a git repository."})
+    repo_root = os.path.realpath(top_out.strip())
+    if repo_root != cwd:
+        return json.dumps({
+            "error": f"working_directory '{cwd}' is a subdirectory of git root '{repo_root}'. "
+                     "kilo_cleanup must be invoked from the repository root."
+        })
+
+    # Resolve target base branch (main/master or explicit)
+    target_base = base_branch
+    if not target_base:
+        for candidate in ("main", "master", "development", "develop"):
+            chk_rc, _, _ = await _run_kilo(["git", "rev-parse", "--verify", f"refs/heads/{candidate}"], cwd=repo_root, env=env)
+            if chk_rc == 0:
+                target_base = candidate
+                break
+    if not target_base:
+        target_base = _current_branch(repo_root) or "main"
+
+    active_scope = set(scope) if scope else {"worktrees", "branches", "processes"}
+    keep_set = set(keep or [])
+
+    # Find live running processes that might hold worktrees
+    rc_lsof, lsof_out, _ = await _run_kilo(["lsof", "-d", "cwd", "-Fn"], cwd=repo_root, env=env)
+    running_cwds: set[str] = set()
+    proc_entries: list[tuple[int, str]] = []
+    if rc_lsof == 0:
+        cur_pid = None
+        for line in lsof_out.splitlines():
+            if line.startswith("p") and line[1:].isdigit():
+                cur_pid = int(line[1:])
+            elif line.startswith("n") and cur_pid:
+                proc_path = os.path.realpath(line[1:])
+                running_cwds.add(proc_path)
+                proc_entries.append((cur_pid, proc_path))
+
+    candidates: list[dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
+    leftovers: list[dict[str, Any]] = []
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 1. Inspect Worktrees
+    # ─────────────────────────────────────────────────────────────────────────
+    candidate_wt_paths: set[str] = set()
+    remaining_wt_branches: set[str] = set()
+
+    if "worktrees" in active_scope:
+        rc_wt, wt_out, _ = await _run_kilo(["git", "worktree", "list", "--porcelain"], cwd=repo_root, env=env)
+        if rc_wt == 0:
+            blocks = wt_out.strip().split("\n\n")
+            parsed_wts: list[dict[str, str]] = []
+            for b in blocks:
+                lines = b.splitlines()
+                info = {}
+                for l in lines:
+                    if l.startswith("worktree "):
+                        info["path"] = l[9:].strip()
+                    elif l.startswith("branch "):
+                        info["branch"] = l[7:].strip().replace("refs/heads/", "")
+                if info.get("path") and os.path.realpath(info["path"]) != repo_root:
+                    parsed_wts.append(info)
+
+            # Sort nested worktrees deepest first (child first)
+            parsed_wts.sort(key=lambda x: len(x["path"]), reverse=True)
+
+            for wt_info in parsed_wts:
+                wt_path = os.path.realpath(wt_info["path"])
+                bname = wt_info.get("branch", "")
+                wt_name = os.path.basename(wt_path)
+
+                # Keep checks
+                if bname in keep_set or wt_path in keep_set or wt_name in keep_set:
+                    kept.append({"kind": "worktree", "id": wt_path, "branch": bname, "kept_because": "in_keep_list"})
+                    remaining_wt_branches.add(bname)
+                    continue
+
+                # Dirty check (uncommitted changes)
+                rc_st, st_out, _ = await _run_kilo(["git", "status", "--porcelain"], cwd=wt_path, env=env)
+                if rc_st == 0 and st_out.strip():
+                    leftovers.append({
+                        "kind": "worktree",
+                        "id": wt_path,
+                        "branch": bname,
+                        "reason": "dirty_files",
+                        "diffstat": st_out.strip()[:1000]
+                    })
+                    kept.append({"kind": "worktree", "id": wt_path, "kept_because": "dirty"})
+                    remaining_wt_branches.add(bname)
+                    continue
+
+                # Merged check (ancestor of target_base)
+                if bname:
+                    rc_anc, _, _ = await _run_kilo(["git", "merge-base", "--is-ancestor", bname, target_base], cwd=repo_root, env=env)
+                    if rc_anc != 0:
+                        _, ahead_out, _ = await _run_kilo(["git", "rev-list", "--count", f"{target_base}..{bname}"], cwd=repo_root, env=env)
+                        leftovers.append({
+                            "kind": "worktree",
+                            "id": wt_path,
+                            "branch": bname,
+                            "reason": "unmerged_commits",
+                            "commits_ahead": ahead_out.strip()
+                        })
+                        kept.append({"kind": "worktree", "id": wt_path, "kept_because": "unmerged"})
+                        remaining_wt_branches.add(bname)
+                        continue
+
+                # Live process check
+                has_live_proc = any(p_cwd == wt_path or p_cwd.startswith(wt_path + os.sep) for p_cwd in running_cwds)
+                if has_live_proc:
+                    kept.append({"kind": "worktree", "id": wt_path, "branch": bname, "kept_because": "live_process"})
+                    remaining_wt_branches.add(bname)
+                    continue
+
+                # Candidate for removal!
+                candidates.append({
+                    "kind": "worktree",
+                    "id": wt_path,
+                    "branch": bname,
+                    "action": "git worktree remove",
+                    "reason": f"Clean and merged into {target_base}"
+                })
+                candidate_wt_paths.add(wt_path)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 2. Inspect Branches
+    # ─────────────────────────────────────────────────────────────────────────
+    if "branches" in active_scope:
+        rc_br, br_out, _ = await _run_kilo(["git", "branch", "--format=%(refname:short)|%(HEAD)"], cwd=repo_root, env=env)
+        if rc_br == 0:
+            for line in br_out.strip().splitlines():
+                if not line.strip():
+                    continue
+                parts = line.strip().split("|")
+                bname = parts[0].strip()
+                is_head = len(parts) > 1 and parts[1].strip() == "*"
+                if is_head or bname in (target_base, "main", "master", "development", "develop"):
+                    continue
+
+                if bname in keep_set:
+                    kept.append({"kind": "branch", "id": bname, "kept_because": "in_keep_list"})
+                    continue
+
+                if bname in remaining_wt_branches:
+                    kept.append({"kind": "branch", "id": bname, "kept_because": "checked_out_in_worktree"})
+                    continue
+
+                # Merged check
+                rc_m, _, _ = await _run_kilo(["git", "merge-base", "--is-ancestor", bname, target_base], cwd=repo_root, env=env)
+                if rc_m == 0:
+                    candidates.append({
+                        "kind": "branch",
+                        "id": bname,
+                        "action": "git branch -d",
+                        "reason": f"Merged into {target_base}"
+                    })
+                else:
+                    kept.append({"kind": "branch", "id": bname, "kept_because": "unmerged"})
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 3. Inspect Processes (Orphans in removed worktrees)
+    # ─────────────────────────────────────────────────────────────────────────
+    if "processes" in active_scope and candidate_wt_paths:
+        for pid, p_cwd in proc_entries:
+            for wt_path in candidate_wt_paths:
+                if p_cwd == wt_path or p_cwd.startswith(wt_path + os.sep):
+                    candidates.append({
+                        "kind": "process",
+                        "id": str(pid),
+                        "cwd": p_cwd,
+                        "action": "terminate",
+                        "reason": f"Orphan process running in removed worktree {wt_path}"
+                    })
+
+    # Calculate deterministic plan hash
+    plan_data = json.dumps(candidates, sort_keys=True)
+    calculated_plan_hash = hashlib.sha256(plan_data.encode("utf-8")).hexdigest()[:16]
+
+    # Dry-run return
+    if dry_run:
+        return json.dumps({
+            "dry_run": True,
+            "plan_hash": calculated_plan_hash,
+            "working_directory": repo_root,
+            "base_branch": target_base,
+            "candidates_count": len(candidates),
+            "candidates": candidates,
+            "kept_count": len(kept),
+            "kept": kept,
+            "leftovers_count": len(leftovers),
+            "leftover_work": leftovers,
+            "instructions": f"To execute this plan, re-run kilo_cleanup with dry_run=False and plan_hash='{calculated_plan_hash}'."
+        }, indent=2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Execution (dry_run == False)
+    # ─────────────────────────────────────────────────────────────────────────
+    if not plan_hash:
+        return json.dumps({
+            "error": "plan_hash is required when dry_run=False. First run with dry_run=True to obtain the plan_hash."
+        })
+
+    if plan_hash != calculated_plan_hash:
+        return json.dumps({
+            "error": f"plan_hash mismatch: provided '{plan_hash}', but current state yields '{calculated_plan_hash}'. "
+                     "Workspace state has changed since preview. Run dry_run=True again to re-plan."
+        })
+
+    executed_actions: list[dict[str, Any]] = []
+
+    # 1. Kill orphan processes first
+    for item in candidates:
+        if item["kind"] == "process":
+            pid = int(item["id"])
+            try:
+                os.kill(pid, signal.SIGTERM)
+                executed_actions.append({"id": str(pid), "action": "sigterm", "status": "sent"})
+            except OSError as e:
+                executed_actions.append({"id": str(pid), "action": "sigterm", "status": f"skipped: {e}"})
+
+    # 2. Remove worktrees
+    for item in candidates:
+        if item["kind"] == "worktree":
+            wt_path = item["id"]
+            rc_rm, out_rm, err_rm = await _run_kilo(["git", "worktree", "remove", wt_path], cwd=repo_root, env=env)
+            executed_actions.append({
+                "id": wt_path,
+                "action": "git worktree remove",
+                "success": (rc_rm == 0),
+                "output": out_rm or err_rm
+            })
+
+    # 3. Delete merged branches (safe -d only)
+    for item in candidates:
+        if item["kind"] == "branch":
+            bname = item["id"]
+            rc_bd, out_bd, err_bd = await _run_kilo(["git", "branch", "-d", bname], cwd=repo_root, env=env)
+            executed_actions.append({
+                "id": bname,
+                "action": "git branch -d",
+                "success": (rc_bd == 0),
+                "output": out_bd or err_bd
+            })
+
+    # Write audit log to .kilo/
+    audit_file = pathlib.Path(repo_root) / ".kilo" / f"cleanup-{int(time.time())}.json"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    audit_data = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "working_directory": repo_root,
+        "base_branch": target_base,
+        "plan_hash": plan_hash,
+        "candidates": candidates,
+        "executed_actions": executed_actions,
+        "leftovers_kept": leftovers,
+    }
+    audit_file.write_text(json.dumps(audit_data, indent=2), encoding="utf-8")
+
+    return json.dumps({
+        "dry_run": False,
+        "plan_hash": plan_hash,
+        "working_directory": repo_root,
+        "executed_count": len(executed_actions),
+        "executed_actions": executed_actions,
+        "audit_file": str(audit_file),
+        "leftover_work_protected": len(leftovers),
+    }, indent=2)
+
+
 if _IS_RAG_ONLY:
     _WRITE_TOOLS = {
         "kilo_implement", "kilo_task_wait", "kilo_task_result", "kilo_task_progress", "kilo_task_cancel",
         "kilo_log_issue", "kilo_log_decision", "kilo_metrics", "kilo_create_worktree", "kilo_session_revert",
         "kilo_session_fork", "kilo_respond_question", "kilo_get_session_todo",
         "kilo_update_session_todo", "kilo_run_command", "kilo_workspace_status", "kilo_task_status",
-        "kilo_verify_worktree"
+        "kilo_verify_worktree", "kilo_cleanup"
     }
     mcp._tool_manager._tools = {
         k: v for k, v in mcp._tool_manager._tools.items()

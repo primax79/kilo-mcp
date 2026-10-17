@@ -2103,3 +2103,76 @@ def test_kilo_verify_worktree_invalid_args(tmp_path):
     assert "tail_lines" in str(exc.value)
 
 
+def test_kilo_cleanup_dry_run_and_apply(tmp_path):
+    repo = _init_git_repo(tmp_path / "cleanup_repo")
+    base_branch = "master" if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "master"], capture_output=True).returncode == 0 else "main"
+
+    # Create clean merged worktree
+    wt_merged = os.path.join(repo, ".kilo", "worktrees", "feat-clean-merged")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat-clean-merged", wt_merged], check=True, capture_output=True)
+    with open(os.path.join(wt_merged, "file.txt"), "w") as f:
+        f.write("clean\n")
+    subprocess.run(["git", "-C", wt_merged, "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", wt_merged, "commit", "-q", "-m", "feat clean"], check=True)
+    subprocess.run(["git", "-C", repo, "merge", "--no-ff", "feat-clean-merged", "-m", "merge clean"], check=True, capture_output=True)
+
+    # Create dirty worktree
+    wt_dirty = os.path.join(repo, ".kilo", "worktrees", "feat-dirty")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat-dirty", wt_dirty], check=True, capture_output=True)
+    with open(os.path.join(wt_dirty, "uncommitted.txt"), "w") as f:
+        f.write("dirty\n")
+
+    # Create unmerged worktree
+    wt_unmerged = os.path.join(repo, ".kilo", "worktrees", "feat-unmerged")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat-unmerged", wt_unmerged], check=True, capture_output=True)
+    with open(os.path.join(wt_unmerged, "unmerged.txt"), "w") as f:
+        f.write("unmerged\n")
+    subprocess.run(["git", "-C", wt_unmerged, "add", "unmerged.txt"], check=True)
+    subprocess.run(["git", "-C", wt_unmerged, "commit", "-q", "-m", "unmerged feat"], check=True)
+
+    # 1. Dry run
+    res_dry_raw = asyncio.run(server.kilo_cleanup(working_directory=repo, dry_run=True, base_branch=base_branch))
+    res_dry = json.loads(res_dry_raw)
+
+    assert res_dry["dry_run"] is True
+    assert "plan_hash" in res_dry
+    assert len(res_dry["plan_hash"]) == 16
+    assert res_dry["candidates_count"] >= 1  # feat-clean-merged worktree and branch
+    
+    # Verify leftover protection
+    assert res_dry["leftovers_count"] == 2
+    leftover_reasons = [item["reason"] for item in res_dry["leftover_work"]]
+    assert "dirty_files" in leftover_reasons
+    assert "unmerged_commits" in leftover_reasons
+
+    # 2. Apply without plan_hash should fail
+    res_no_hash = json.loads(asyncio.run(server.kilo_cleanup(working_directory=repo, dry_run=False, base_branch=base_branch)))
+    assert "error" in res_no_hash
+    assert "plan_hash is required" in res_no_hash["error"]
+
+    # 3. Apply with wrong plan_hash should fail
+    res_wrong_hash = json.loads(asyncio.run(server.kilo_cleanup(working_directory=repo, dry_run=False, plan_hash="wrong_hash_1234", base_branch=base_branch)))
+    assert "error" in res_wrong_hash
+    assert "plan_hash mismatch" in res_wrong_hash["error"]
+
+    # 4. Apply with correct plan_hash
+    res_apply = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        dry_run=False,
+        plan_hash=res_dry["plan_hash"],
+        base_branch=base_branch
+    )))
+    assert res_apply["dry_run"] is False
+    assert res_apply["executed_count"] >= 1
+    assert os.path.exists(res_apply["audit_file"])
+    assert not os.path.exists(wt_merged)
+    # Dirty and unmerged worktrees MUST survive
+    assert os.path.exists(wt_dirty)
+    assert os.path.exists(wt_unmerged)
+
+    # 5. Idempotence: re-running dry-run has zero candidates for the cleaned worktree
+    res_idempotent = json.loads(asyncio.run(server.kilo_cleanup(working_directory=repo, dry_run=True, base_branch=base_branch)))
+    assert not any(c["id"] == wt_merged for c in res_idempotent["candidates"])
+
+
+
