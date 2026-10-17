@@ -1,8 +1,36 @@
 ---
 name: kilo-mcp-orchestrator
-description: "Orchestrate Kilo (the Executor) through the kilo-mcp server - RAG-first discovery, worktree isolation (kilo_implement's own isolation='worktree', or kilo_create_worktree), non-blocking parallel delegation via kilo_implement, deterministic completion wait (kilo_task_wait) and complexity-scaled monitoring/intervention (kilo_task_progress/kilo_task_cancel/continue_session_id), verification of Final Reports, defect and decision telemetry (kilo_log_issue/kilo_log_decision), and capture of work that emerges mid-session as task files in the repository (whoever will execute it, including the orchestrator itself). Use when coordinating development work through the kilo-mcp tools, or when new tasks appear during a working session."
+description: "Tool-level binding for orchestrating Kilo via the kilo-mcp server - kilo_rag_search, kilo_implement with worktree isolation, deterministic wait (kilo_task_wait), progress monitoring, and defect telemetry (kilo_log_issue). Use specifically when executing tasks through kilo-mcp tools. For generic multi-agent coordination or native worktrees, use orchestration-workflow."
 ---
 <!-- GENERATED FROM SKILL.template.md — DO NOT EDIT BY HAND. Run generate_binding.py to regenerate. -->
+
+<!--
+TEMPLATE SLOTS (for binding maps in bindings/*.json):
+  Top-level:
+    NAME                - Skill name (e.g. orchestration-workflow, kilo-mcp-orchestrator)
+    DESCRIPTION         - Frontmatter description
+  Tools:
+    implement_call      - Primary delegation call (e.g. `kilo_implement`)
+    edit_tools          - Orchestrator's edit tools
+    executor_name       - Executor name (e.g. Kilo)
+    executor_poss       - Executor possessive (e.g. Kilo's)
+    spec_skill_link     - Link/name for task-spec-authoring skill
+  Blocks:
+    intro               - Skill intro block under Quick Reference
+    precedence_note     - Precedence relationship between generic and bound skills (under Role discipline)
+    corrective_call     - Phrase for follow-up delegation into existing session
+    phase1_suffix       - Suffix to Phase 1 heading (e.g. " & RAG")
+    phase1_body         - Phase 1 Discovery body
+    phase2_body         - Phase 2 Isolation body
+    phase3_body         - Phase 3 Delegation body
+    phase4_body         - Phase 4 Monitoring body
+    phase5_tool_notes   - Phase 5 Tool-specific inspection / execution notes (Verification Modes & Decision Table remain invariant)
+    phase6_body         - Phase 6 Closure & Telemetry body
+    closing_note        - Final closing reminder (Scaffolding & Task State Table remain invariant)
+  Additions:
+    phase4_extra        - Extra items under Phase 4
+    end                 - Extra sections at the end of the skill
+-->
 
 # kilo-mcp-orchestrator
 
@@ -37,9 +65,13 @@ handful of lines, or that touches actual logic, goes back to Kilo via
 `kilo_implement(continue_session_id=..., task_instructions="<corrective instructions>")`, not a direct edit. When
 in doubt, delegate rather than fix it yourself.
 
+### Precedence with Generic Skills
+
+This skill provides the concrete `kilo-mcp` tool bindings for orchestrating Kilo. When `orchestration-workflow` is also loaded, this skill specializes the tool calls (`kilo_implement`, `kilo_task_wait`, etc.), while `orchestration-workflow` governs the overarching architecture: task state transitions, verification modes, the Post-Verification Decision Table, and harness safety.
+
 ## Logic and Behavior
 
-- **Phase 1 - Discovery & RAG:** Explore the repository using `kilo_rag_search` before designing solutions. Do not guess filenames. Use `kilo_list_models` and `kilo_auth_status` to ensure Kilo's engine and models are ready.
+- **Phase 1 - Discovery & RAG:** Explore the repository using `kilo_rag_search` before designing solutions. Do not guess filenames. Use `kilo_list_models` and `kilo_auth_status` to ensure Kilo's engine and models are ready once per session or after a dispatch failure (do not re-run health/config checks before every single task).
 - **Phase 2 - Isolation:** `kilo_implement` has **no isolation and no locking by default** — it runs directly in `working_directory` (defaulting to the server's own cwd), and nothing stops a second concurrent writer — another `kilo_implement` call, or your own `git` commands — from racing it in the exact same tree. This is not hypothetical: it has caused a real incident (a live git race that reset a branch and nearly dropped in-progress work while the orchestrator was doing its own git surgery in the same checkout Kilo was still committing to). Default to isolating:
   - Pass `isolation='worktree'` directly on the `kilo_implement` call (auto-creates `.kilo-worktrees/<branch>` and runs there) — prefer this over the two-step `kilo_create_worktree` + `working_directory` combo, it's one step and harder to forget.
   - Use `kilo_create_worktree` standalone only when you need the worktree to exist before deciding what to delegate into it.
@@ -60,13 +92,14 @@ in doubt, delegate rather than fix it yourself.
     `- worktree: <physical-worktree-path>` on the task file (or in its `PROGRESS.md`).
     This guarantees that the Architect, the UI dashboard, and the reviewer always know
     the exact physical checkout path and git ref without searching.
-- **Phase 3 - Delegation:** Use `kilo_implement` to delegate implementation work. It runs in the **background by default** and returns a `task_id` immediately — never block the conversation waiting on it. Pass `focus_files` found during search, configure any `skills_to_load`, and dispatch tasks in parallel across worktrees. For work that spans multiple dependent steps or sessions, write it up first as a `tasks/` pipeline (see the `task-pipeline` skill) and delegate one task file at a time — each task file is already scoped, self-contained, and has its own verification section, which maps directly onto one well-formed `kilo_implement` call.
+- **Phase 3 - Delegation:** Use `kilo_implement` to delegate implementation work. It runs in the **background by default** and returns a `task_id` immediately — never block the conversation waiting on it. Pass `focus_files` found during search, configure any `skills_to_load`, and dispatch tasks in parallel across worktrees. Before each `kilo_implement`, move the task to `in progress` (`ai-orch tasks transition <id> "in progress" --actor <you> --reason "kilo, worktree <branch>"`); when its Final Report arrives with a commit, move it to `delivered`. A dispatched task left `open` is a bookkeeping bug. Keep at most ~4 concurrent `kilo run`s on the machine (count other sessions' with `kilo_task_status`): more make Kilo's shared session database fail with 'Database is busy'. For work that spans multiple dependent steps or sessions, write it up first as a `tasks/` pipeline (see the `task-pipeline` skill) and delegate one task file at a time — each task file is already scoped, self-contained, and has its own verification section, which maps directly onto one well-formed `kilo_implement` call.
 - **Phase 4 - Monitoring & Intervention:** Scale how closely you watch a task to its complexity/risk:
-  - **Small, well-scoped tasks:** await completion deterministically with `kilo_task_wait(task_id=..., timeout_seconds=...)` (returns the full `kilo_task_result` payload as soon as the task reaches a terminal state, or a clear status message with live progress on timeout without raising) instead of guessing timer intervals.
+  - **Small, well-scoped tasks:** when the host supports blocking MCP calls, await completion deterministically with `kilo_task_wait(task_id=..., timeout_seconds=...)` (returns the full `kilo_task_result` payload as soon as the task reaches a terminal state, or a clear status message with live progress on timeout without raising) instead of guessing timer intervals. Otherwise, use detached monitoring (PID watcher / `kilo_task_progress`).
   - **Large, multi-file, or high-risk tasks:** use bounded `kilo_task_wait` slices (e.g. `timeout_seconds=120`) or poll `kilo_task_progress` periodically and inspect Kilo's live checklist with `kilo_get_session_todo`. You can also directly inject or update the plan using `kilo_update_session_todo` to guide execution.
   - **A "WORKING" verdict from `kilo_task_status` is not enough on its own — always cross-check it against `kilo_task_progress`'s cost/tokens/plan before trusting it.** That heuristic proves a socket is open to the model, not that the call is converging: a task can sit "connected, long call in progress" for many minutes while burning real cost on every turn. The tell is a low CPU-time/elapsed-time ratio (seconds of CPU across many minutes of wall clock — waiting on the network, not computing) combined with a ballooning cost/token count and no recorded plan, especially after a `continue_session_id` call resuming a prior session: it usually means the task is re-reading its own accumulated context every turn instead of acting on it. Observed live: a corrective `kilo_implement` resuming a failed session ran 50+ minutes and $7+ in cost with under two minutes of CPU time and no plan ever recorded — cancelled via `kilo_task_cancel` and redone directly rather than left to keep burning. Make this cross-check routine, not something reached for only once a task already looks slow.
-  - **If a task drifts off-spec or looks stuck:** `kilo_task_cancel` stops it (attempts a graceful REST abort, then hard kill by tracked PID). Alternatively, use `kilo_session_revert` to rewind to a previous checkpoint, or `kilo_session_fork` to test an alternative path in parallel. If Kilo pauses asking a question, answer with `kilo_respond_question`. Review `kilo_workspace_status` for partial changes, then either revert or continue with a corrective `kilo_implement` call using `continue_session_id` — Kilo resumes the SAME session with full memory of what it already built, instead of starting blind.
-  - **Don't go idle after dispatching — await completion deterministically, don't guess sleep timers.** Prefer `kilo_task_wait(task_id=...)` to block until the task completes (reconciling orphaned processes from their log files automatically). In hosts where a long blocking MCP call isn't desirable and background shell processes notify on exit, use the zero-token OS PID watcher fallback against the detached `pid` reported by `kilo_implement`: `while kill -0 <pid> 2>/dev/null; do sleep 10; done; echo "task finished"` — then call `kilo_task_result(task_id)` immediately when notified.
+  - **If a task drifts off-spec or looks stuck:** `kilo_task_cancel` stops it (attempts a graceful REST abort, then hard kill by tracked PID). Alternatively, use `kilo_session_revert` to rewind to a previous checkpoint, or `kilo_session_fork` to test an alternative path in parallel. If Kilo pauses asking a question, answer with `kilo_respond_question`. Review `kilo_workspace_status` for partial changes, then either revert or continue with a corrective `kilo_implement` call using `continue_session_id` — Kilo resumes the SAME session with full memory of what it already built, instead of starting blind. If a cancelled or failed run is abandoned (`discarded`) rather than resumed, **clean up its isolated worktree and branch immediately** (`git worktree remove <path>`) so orphan worktrees do not accumulate.
+  - **Don't go idle after dispatching — await completion deterministically, don't guess sleep timers.** When the host supports blocking MCP calls, prefer `kilo_task_wait(task_id=...)` to block until the task completes (reconciling orphaned processes from their log files automatically). In hosts where a long blocking MCP call isn't desirable and background shell processes notify on exit, use detached monitoring with the zero-token OS PID watcher fallback against the detached `pid` reported by `kilo_implement`: `while kill -0 <pid> 2>/dev/null; do sleep 10; done; echo "task finished"` (or poll `kilo_task_progress`) — then call `kilo_task_result(task_id)` immediately when notified.
+  - **Detect Delivery via On-Branch Task Annotation:** The Executor contract mandates updating the task file to `- state: delivered` with `verification pending: <command>` directly on its worktree branch before committing. When the branch updates or the task report arrives, immediately transition the task to `delivered` in the main registry and proceed to Phase 5 Independent Verification.
   - Ready-to-invoke scripts for the manual/no-task-id case live in `scripts/` (see below) — use them instead of re-deriving the pgrep/ps/lsof/sqlite3 diagnostic pipeline from scratch each session.
 - **Phase 5 - Verification & Review: NEVER trust the Final Report alone.**
   Inspect results with `kilo_workspace_status`, then actually **execute** what was built — reading the report or the diff is not verification, it's a summary. Across real delegation rounds, deviations that never surfaced from the report alone only showed up by running the code: a file committed that should have been gitignored, a cited source path that didn't exist anywhere in the codebase (invented for plausibility), a citation pointing at the right method but the wrong line, DB column types guessed from convention instead of read from the real DDL already available. Calibrate to what was built:
@@ -75,6 +108,36 @@ in doubt, delegate rather than fix it yourself.
   - **Schema/data**: if a file is claimed "copied verbatim" from a source, `diff` it for real against that source — don't trust the claim.
   - **Infra**: if there's a `docker-compose.yml`, actually bring it up, wait for the healthcheck, and query the resulting service/DB for real.
   - See the `task-spec-authoring` skill for calibrating verification depth to task risk in more detail.
+  - **Verification Modes (`delivered` → `verified`):** An Executor can only
+    mark a task `delivered`. Moving to `verified` follows the configured
+    verification mode (`orchestration.toml` `[verification].default_mode` or
+    per-task `verification-mode`):
+    - `independent-session`: spawn a fresh, context-blind subagent/session
+      inside the **same** framework (on the `deep-reasoning` profile) to
+      re-run the `Verification` checks and inspect the diff without
+      authorship bias (Single-Framework Native default).
+    - `cross-agent`: delegate verification to a **different** framework/engine
+      (`verifier != executor`) on the `deep-reasoning` profile (Multi-Framework
+      default).
+    - `panel`: run multiple independent reviewers (keeping at least one
+      blind on subsequent cycles) for high-risk specs or architectural
+      changes.
+    - `owner`: require explicit human approval recorded in `PROGRESS.md`.
+    - `self`: when no independent verifier or owner approval is used, close
+      directly as `done with a caveat: self-verified only` rather than
+      claiming `verified`.
+
+  ### Post-Verification Decision Table
+
+  After inspecting the diff and running the verification checks, take
+  exactly one of these four actions:
+
+  | Finding | Action |
+  | --- | --- |
+  | **All acceptance criteria pass** and diff is within scope | **Merge**: transition to `verified`, proceed to Phase 5b/6 integration merge, and close as `done`. |
+  | **Trivial mechanical defect (`<= 5` lines)** — typo, missing import, misnamed local variable, zero logic/signature impact | **Fix inline**: apply the fix directly in the Executor's worktree, re-run the check, and proceed to merge. |
+  | **Logic, test, or scope defect (`> 5` lines or behavioral)** where the spec itself is still sound | **Bounce to same Executor session**: transition task to `bounced`, record `B1..Bn` findings in `PROGRESS.md`, and send the exact failing criterion back to the **same** Executor session. |
+  | **Ambiguous requirement, incompatible design conflict, or repeated (2+) bounce failure** | **Stop and ask user** (or escalate to `deep-reasoning` re-architecture): record the blocker in the task file and surface the concrete decision fork. |
 - **Phase 5b - Verify the integration, not only the tasks.** Every task in a
   batch can be green in its own worktree and the merged result still be broken:
   tasks branched from the same commit cannot see each other (see `references/incidents.md` #6
@@ -256,6 +319,61 @@ the orchestrator must never guess or decide on the owner's behalf.
 - **Batching rules:** Batch multiple questions together into one turn or review
   only when they are strictly independent. If question B depends on the answer
   to question A, ask question A first to avoid wasted effort and confusion.
+
+## Scaffolding steps can write configuration for *your* harness
+
+When a delegated task runs a project generator, review what it actually
+committed file by file, not just the files you asked for. Observed live: a
+mainstream framework's `create-workspace` command emitted 51 files of agent
+configuration for six different AI harnesses, including a settings file for the
+orchestrator's own harness that registered an external plugin marketplace,
+enabled a plugin from it, and added a third-party analytics domain to the
+sandbox's allowed-domains list.
+
+Treat tool-authored harness, permission, or sandbox configuration as something
+to remove, not to silently adopt: the user didn't ask for it, and you cannot
+consent to a change in your own permissions on their behalf. Removing is the
+conservative direction; keeping it requires asking. Then say what you removed
+and why, rather than quietly cleaning up.
+
+## Track task state as a path, not a label
+
+"Done" is the state that lies. Keep the unified state machine below (aligned
+with `task-pipeline` and `tasks_engine.py`), and let only the
+orchestrator/verifier advance a task past `delivered` — an Executor may only
+*deliver*:
+
+| state | means |
+| --- | --- |
+| `open` | captured and specified in `tasks/`, not yet started |
+| `in progress` | the Executor is actively working |
+| `waiting` | waiting on a blocking question (`decider: Q###`) or external party |
+| `blocked` | an unresolved upstream question or dependency makes it unspecifiable or unrunnable |
+| **`delivered`** | the Executor committed, ran its self-checks, and emitted its `Final Report` (`verification pending: <what, by whom>`) |
+| `bounced` | an acceptance criterion failed during verification; findings (`B1..Bn`) are logged in `PROGRESS.md` and sent back into the *same* Executor session |
+| **`verified`** | an independent verifier (`verifier != executor`, such as a fresh blind subagent in `independent-session` mode or a second engine in `cross-agent` / `panel` mode) re-ran the `Verification` checks and they passed, OR the owner explicitly approved the result in `PROGRESS.md` |
+| **`done`** | merged into the target branch with the post-merge integration gate (lint + tests + build) green, and moved via `git mv` to `tasks/done/<category>/` |
+| **`done with a caveat`** | works and is closed, but carries a known limitation or `self-verified only` status recorded in `PROGRESS.md` |
+| `dropped` | cancelled or superseded with the reason recorded and worktree cleaned up |
+
+The rule carrying the weight: **there is no direct path from `open` or `in
+progress` to `done`.** `delivered` always sits in between, and leaving it
+requires independent verification (or explicit owner sign-off). Publish this
+state in `tasks/00-INDEX.md` (via `tasks_engine.py`) whenever work spans
+multiple tasks or sessions.
+
+**The state follows the work, at the moment it happens** (owner rule, 2026-10-17: "chi è assegnato deve finire in progress"). Every step below is an `ai-orch tasks transition <id> <state> --actor <you> --reason "..."`, which works for emergent `T###` and plan `NN.T` tasks alike:
+
+| When | Transition |
+| --- | --- |
+| You assign/dispatch a task (`kilo_implement`, a subagent, `ai-orch run start`, or you start it yourself) | `open`/`bounced` → `in progress`, **before** the executor starts; reason names the executor and the branch/worktree |
+| The executor committed and returned its Final Report | `in progress` → `delivered` (reason: commit + "review pending") |
+| Your review passes and it is merged | `delivered` → `verified` (independent check or owner approval) → `done` |
+| Review fails | `delivered` → `bounced`, then `in progress` again when re-dispatched |
+| The run died or you cancelled it, work kept on a branch | stays `in progress`; reason records where the work is |
+| You abandon it | `waiting`/`blocked` with the reason, or `dropped` |
+
+A task being worked on while still `open`, or finished while still `in progress`, is a bookkeeping bug: fix it before anything else. `ai-orch run start` performs the dispatch transition itself; for every other way of dispatching, you do.
 
 Remember: the RAG index behind `kilo_rag_search` is a standing resource for your own exploration and Q&A too — use it even when you are not delegating anything.
 
