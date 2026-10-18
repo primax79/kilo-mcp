@@ -76,6 +76,13 @@ Use this skill when Kilo executes background tasks on behalf of an orchestrating
   }
   ```
 
+## Citing tasks and questions
+
+In the Final Report and in any question you raise, never write a bare task or
+question id: follow it with a 3-4 word short title in parentheses, e.g.
+"12.16 (UI proposal confirm)", taken from the task's `Short:` field or derived
+from its title.
+
 ## Mandatory `## Final Report` Skeleton
 
 Always conclude your final response with this exact Markdown structure:
