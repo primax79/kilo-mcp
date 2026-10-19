@@ -274,12 +274,44 @@ def _resolve_kilo_server_port(pid: str) -> Optional[str]:
     return None
 
 
-def _list_active_kilo_servers() -> list[tuple[str, Optional[str]]]:
+def _resolve_kilo_server_cwd(pid: str) -> Optional[str]:
+    """Resolve the working directory of a running `kilo serve` process."""
+    try:
+        res = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                              capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        if line.startswith("n") and len(line) > 1:
+            return os.path.realpath(line[1:])
+    return None
+
+
+def _resolve_kilo_server_password(pid: str) -> Optional[str]:
+    """Read KILO_SERVER_PASSWORD from a running `kilo serve` process's environment
+    (VS Code spawns each embedded `kilo serve --port 0` with a per-window password)."""
+    if KILO_SERVER_PASSWORD:
+        return KILO_SERVER_PASSWORD
+    try:
+        res = subprocess.run(["ps", "eww", "-p", pid],
+                              capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    m = re.search(r"\bKILO_SERVER_PASSWORD=([^\s]+)", res.stdout)
+    return m.group(1) if m else None
+
+
+def _list_active_kilo_servers(target_cwd: Optional[str] = None) -> list[tuple[str, Optional[str]]]:
     """Enumerate every running `kilo serve` instance on this machine. There can
     be more than one at a time — observed in practice as one per open VS Code
     window — and each is its own daemon with its own in-memory session state
-    even though they all persist to the same shared `kilo.db`. Returns a list
-    of (url, password), in `ps aux` order."""
+    and per-process KILO_SERVER_PASSWORD even though they all persist to the
+    same shared `kilo.db`. When `target_cwd` is provided, matching workspace
+    servers are ordered first. Returns a list of (url, password)."""
     if KILO_SERVER_URL:
         return [(KILO_SERVER_URL.rstrip("/"), KILO_SERVER_PASSWORD)]
 
@@ -292,7 +324,15 @@ def _list_active_kilo_servers() -> list[tuple[str, Optional[str]]]:
     if res.returncode != 0:
         return []
 
-    servers = []
+    target_roots: set[str] = set()
+    if target_cwd:
+        target_roots.add(os.path.realpath(target_cwd))
+        root = _agent_manager_root(target_cwd)
+        if root:
+            target_roots.add(os.path.realpath(root))
+
+    matched: list[tuple[str, Optional[str]]] = []
+    others: list[tuple[str, Optional[str]]] = []
     for line in res.stdout.splitlines():
         if "kilo serve" not in line:
             continue
@@ -302,28 +342,61 @@ def _list_active_kilo_servers() -> list[tuple[str, Optional[str]]]:
         pid = parts[1]
         m_port = re.search(r"--port\s+(\d+)", line)
         port = m_port.group(1) if m_port else None
+        resolved_port = None
         if port and port != "0":
-            servers.append((f"http://127.0.0.1:{port}", KILO_SERVER_PASSWORD))
+            resolved_port = port
         elif port == "0":
-            real_port = _resolve_kilo_server_port(pid)
-            if real_port:
-                servers.append((f"http://127.0.0.1:{real_port}", KILO_SERVER_PASSWORD))
-            else:
+            resolved_port = _resolve_kilo_server_port(pid)
+            if not resolved_port:
                 logger.warning(
                     "kilo serve pid=%s runs with --port 0 but lsof could not resolve its bound port", pid
                 )
-    return servers
+        if not resolved_port:
+            continue
+        url = f"http://127.0.0.1:{resolved_port}"
+        password = _resolve_kilo_server_password(pid)
+        if target_roots:
+            srv_cwd = _resolve_kilo_server_cwd(pid)
+            if srv_cwd and srv_cwd in target_roots:
+                matched.append((url, password))
+                continue
+        others.append((url, password))
+    return matched + others
 
 
-def _discover_active_kilo_server() -> tuple[Optional[str], Optional[str]]:
-    """Discover a single running `kilo serve` instance — only safe to use when
-    no specific existing session/request is involved (e.g. creating a brand
-    new session, where any live instance is equally valid). For an operation
-    scoped to an EXISTING session_id or request_id, use
-    `_try_all_kilo_servers` instead: with several instances running, 'the
-    first one found' is not necessarily the one that owns that session, and
-    calling the wrong one 404s silently even though the right instance is
-    simultaneously live."""
+def _discover_active_kilo_server(target_cwd: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """Discover a single running `kilo serve` instance. When `target_cwd` is
+    given, only returns a server whose working directory matches `target_cwd`
+    (or its main git repo root) unless `KILO_SERVER_URL` is explicitly set."""
+    if KILO_SERVER_URL:
+        return (KILO_SERVER_URL.rstrip("/"), KILO_SERVER_PASSWORD)
+    if target_cwd:
+        target_roots = {os.path.realpath(target_cwd)}
+        root = _agent_manager_root(target_cwd)
+        if root:
+            target_roots.add(os.path.realpath(root))
+        try:
+            res = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
+        except Exception:
+            return (None, None)
+        if res.returncode != 0:
+            return (None, None)
+        for line in res.stdout.splitlines():
+            if "kilo serve" not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            pid = parts[1]
+            srv_cwd = _resolve_kilo_server_cwd(pid)
+            if not srv_cwd or srv_cwd not in target_roots:
+                continue
+            m_port = re.search(r"--port\s+(\d+)", line)
+            port = m_port.group(1) if m_port else None
+            resolved_port = port if (port and port != "0") else (_resolve_kilo_server_port(pid) if port == "0" else None)
+            if resolved_port:
+                return (f"http://127.0.0.1:{resolved_port}", _resolve_kilo_server_password(pid))
+        return (None, None)
     servers = _list_active_kilo_servers()
     return servers[0] if servers else (None, None)
 
@@ -369,13 +442,18 @@ def _kilo_server_request(server_url: str, password: Optional[str], path: str,
 
 
 async def _kilo_server_create_session(server_url: str, password: Optional[str],
-                                    title: Optional[str] = None) -> Optional[str]:
+                                    title: Optional[str] = None,
+                                    directory: Optional[str] = None) -> Optional[str]:
     """Create a new session directly on a running `kilo serve` instance
     via `POST /session`. Returns the created session_id."""
     payload = {"title": title} if title else {}
+    extra = {"x-opencode-directory": directory} if directory else None
     try:
         def _do_req():
-            status, body = _kilo_server_request(server_url, password, "/session", method="POST", payload=payload)
+            status, body = _kilo_server_request(
+                server_url, password, "/session", method="POST",
+                payload=payload, extra_headers=extra,
+            )
             if status in (200, 201):
                 res_data = json.loads(body.decode("utf-8"))
                 return res_data.get("id") or res_data.get("sessionID")
@@ -450,13 +528,26 @@ async def _kilo_server_fork_session(server_url: str, password: Optional[str],
 
 
 async def _kilo_server_respond_question(server_url: str, password: Optional[str],
-                                         request_id: str, answers: list[str]) -> bool:
-    """Respond to an interactive question/prompt request via `POST /question/:requestID`."""
-    payload = {"answers": answers}
+                                         request_id: str, answers: list) -> bool:
+    """Respond to an interactive question/prompt request via `POST /question/:requestID/reply`
+    (with fallback to `POST /question/:requestID`)."""
+    # Kilo serve's Question.reply expects `answers` as one array of option labels per question
+    normalized = [[a] if isinstance(a, str) else list(a) for a in answers]
     try:
         def _do_req():
-            status, _ = _kilo_server_request(server_url, password, f"/question/{request_id}",
-                                               method="POST", payload=payload)
+            try:
+                status, _ = _kilo_server_request(
+                    server_url, password, f"/question/{request_id}/reply",
+                    method="POST", payload={"answers": normalized},
+                )
+                if status in (200, 201, 202, 204):
+                    return True
+            except Exception:
+                pass
+            status, _ = _kilo_server_request(
+                server_url, password, f"/question/{request_id}",
+                method="POST", payload={"answers": answers},
+            )
             return status in (200, 201, 202, 204)
         return await asyncio.to_thread(_do_req)
     except Exception:
@@ -981,6 +1072,66 @@ async def kilo_list_models(
         return f"Error listing Kilo models: {str(e)}"
 
 
+_QDRANT_DEFAULT_URL = os.environ.get("KILO_QDRANT_URL", "http://localhost:16333")
+_QDRANT_METADATA_POINT_ID = "f946a536-9af4-4f1f-9f95-7d6efb4647d5"
+
+
+def _normalize_rag_workspace(path: Optional[str]) -> str:
+    raw = path if path else os.getcwd()
+    expanded = os.path.expanduser(raw)
+    if len(expanded) > 1:
+        expanded = expanded.rstrip("/\\")
+    return os.path.normpath(expanded)
+
+
+def _resolve_rag_subpath(cwd: str, subpath: Optional[str]) -> Optional[str]:
+    """Resolve virtual symlink folders (e.g. gcube_repos functional/JDK views) to their real relative path inside cwd."""
+    if not subpath:
+        return None
+    cleaned = subpath.strip().strip("/\\")
+    if not cleaned:
+        return None
+    candidate = os.path.join(cwd, cleaned)
+    if not os.path.exists(candidate):
+        return cleaned
+    real_cwd = os.path.realpath(cwd)
+    real_target = os.path.realpath(candidate)
+    if real_target == real_cwd:
+        return None
+    if real_target.startswith(real_cwd + os.sep):
+        return os.path.relpath(real_target, real_cwd).replace("\\", "/")
+    return cleaned
+
+
+def _qdrant_get_metadata_point(base_url: str, collection: str) -> Optional[dict]:
+    import urllib.request
+
+    url = f"{base_url.rstrip('/')}/collections/{collection}/points"
+    body = json.dumps({"ids": [_QDRANT_METADATA_POINT_ID], "with_payload": True, "with_vector": True}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            pts = json.loads(resp.read().decode("utf-8")).get("result", [])
+            return pts[0] if pts else None
+    except Exception:
+        return None
+
+
+def _qdrant_restore_metadata_point(base_url: str, collection: str, point: dict) -> None:
+    import urllib.request
+
+    url = f"{base_url.rstrip('/')}/collections/{collection}/points?wait=true"
+    body = json.dumps(
+        {"points": [{"id": point["id"], "vector": point["vector"], "payload": point.get("payload") or {}}]}
+    ).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=3.0):
+            pass
+    except Exception:
+        pass
+
+
 @mcp.tool()
 async def kilo_rag_search(
     query: Annotated[
@@ -1031,13 +1182,14 @@ async def kilo_rag_search(
     Returns a text report: `Exit Code`, `STDOUT` (the findings), `STDERR` (the
     run trace). Review STDOUT as the reviewer.
     """
-    cwd = working_directory if working_directory else os.getcwd()
+    cwd = _normalize_rag_workspace(working_directory)
     if not os.path.exists(cwd):
         return f"Error: Working directory {cwd} does not exist."
     try:
+        resolved_path = _resolve_rag_subpath(cwd, path)
         prompt = f"Please perform a semantic search in the codebase for the following query: '{query}'."
-        if path:
-            prompt += f" Limit the search to the '{path}' directory."
+        if resolved_path:
+            prompt += f" Limit the search to the '{resolved_path}' directory."
         prompt += (
             "\n\nIf the 'kilo-mcp-rag-explorer' skill is available, load it and follow "
             "it. Use your semantic_search tool (falling back to explore/grep only if "
@@ -1051,8 +1203,18 @@ async def kilo_rag_search(
         cmd = ["kilo", "run", "--agent", "explore", prompt]
         env = os.environ.copy()
 
+        coll = f"ws-{hashlib.sha256(cwd.encode('utf-8')).hexdigest()[:16]}"
+        saved_meta = _qdrant_get_metadata_point(_QDRANT_DEFAULT_URL, coll)
+        was_complete = bool(saved_meta and (saved_meta.get("payload") or {}).get("indexing_complete") is True)
+
         started = time.monotonic()
-        returncode, stdout, stderr = await _run_kilo(cmd, cwd=cwd, env=env)
+        try:
+            returncode, stdout, stderr = await _run_kilo(cmd, cwd=cwd, env=env)
+        finally:
+            if was_complete and saved_meta:
+                current_meta = _qdrant_get_metadata_point(_QDRANT_DEFAULT_URL, coll)
+                if current_meta and (current_meta.get("payload") or {}).get("indexing_complete") is False:
+                    _qdrant_restore_metadata_point(_QDRANT_DEFAULT_URL, coll, saved_meta)
         _append_jsonl(METRICS_FILE, {
             "run_id": uuid.uuid4().hex[:12],
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -1355,13 +1517,18 @@ async def kilo_implement(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
         f.write(full_content)
         prompt_file = f.name
-    # If connected to an active kilo serve instance, attempt immediate session creation via REST API
+    # If connected to an active kilo serve instance for this workspace, attempt immediate session creation via REST API
+    # (Skip pre-creation for isolated worktrees unless KILO_SERVER_URL is explicitly set, so detached `kilo run`
+    # creates the session with `session.directory` set to the worktree path rather than the main repo root).
     server_session_id = continue_session_id
-    srv_url, srv_pass = _discover_active_kilo_server()
-    if srv_url and not server_session_id:
-        created_sid = await _kilo_server_create_session(srv_url, srv_pass, title=f"MCP Task {run_id}")
-        if created_sid:
-            server_session_id = created_sid
+    if not server_session_id and (not isolated_branch or KILO_SERVER_URL):
+        srv_url, srv_pass = _discover_active_kilo_server(cwd)
+        if srv_url:
+            created_sid = await _kilo_server_create_session(
+                srv_url, srv_pass, title=f"MCP Task {run_id}", directory=cwd
+            )
+            if created_sid:
+                server_session_id = created_sid
 
     cmd = ["kilo", "run"]
     if server_session_id:
@@ -1383,9 +1550,10 @@ async def kilo_implement(
     except Exception as e:
         return collision_warning + f"Error launching Kilo in background: {e}"
 
+    started_iso = datetime.now(timezone.utc).isoformat()
     _write_task_record(run_id, {
         "status": "running",
-        "started": datetime.now(timezone.utc).isoformat(),
+        "started": started_iso,
         "working_directory": cwd,
         "agent": agent,
         "model": model,
@@ -1405,10 +1573,16 @@ async def kilo_implement(
         try:
             loop = asyncio.get_running_loop()
             async def _lazy_link():
-                await asyncio.sleep(1.5)
-                sid = _find_session_for_task(cwd, datetime.now(timezone.utc).isoformat(), run_id)
-                if sid:
-                    _agent_manager_note_session(cwd, sid, agent_manager_worktree_id)
+                for _ in range(5):
+                    await asyncio.sleep(1.5)
+                    sid = _find_session_for_task(cwd, started_iso, run_id)
+                    if sid:
+                        _agent_manager_note_session(cwd, sid, agent_manager_worktree_id)
+                        rec = _read_task_record(run_id)
+                        if rec and not rec.get("session_id"):
+                            rec["session_id"] = sid
+                            _write_task_record(run_id, rec)
+                        break
             loop.create_task(_lazy_link())
         except Exception:
             pass
@@ -2244,8 +2418,16 @@ async def kilo_task_cancel(
         )
 
     note = f"Cancelled by architect. Reason: {reason}" if reason else "Cancelled by architect (no reason given)."
+    server_pgrp = os.getpgrp()
     try:
-        os.kill(pid, signal.SIGTERM)
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+    try:
+        if pgid and pgid > 1 and pgid != server_pgrp:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         _write_task_record(task_id, {"status": "cancelled", "result": f"{note} (process had already exited.)"})
         return f"Task {task_id}: process {pid} was already gone; marked cancelled."
@@ -2253,10 +2435,26 @@ async def kilo_task_cancel(
     forced = False
     try:
         os.kill(pid, 0)  # still alive?
-        os.kill(pid, signal.SIGKILL)
+        if pgid and pgid > 1 and pgid != server_pgrp:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                os.kill(pid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
         forced = True
     except ProcessLookupError:
         pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+    prompt_file = record.get("prompt_file")
+    if prompt_file and os.path.exists(prompt_file):
+        try:
+            os.remove(prompt_file)
+        except OSError:
+            pass
     _write_task_record(task_id, {"status": "cancelled", "result": note})
     return (
         f"Task {task_id} (pid {pid}) terminated{' (had to force-kill)' if forced else ''}. "
@@ -2613,6 +2811,136 @@ def _resolve_parent_remote(cwd: str, parent_branch: str) -> Optional[str]:
     return "origin" if result.returncode == 0 else None
 
 
+GIT_METADATA_FILE = "kilo-agent-manager-metadata.json"
+
+
+def _worktree_dir_name(branch_name: str) -> str:
+    """Convert a branch name (which may contain slashes like `kilo/t071-foo`)
+    into a flat single-segment directory name under `.kilo/worktrees/`.
+
+    The Kilo VS Code extension's `WorktreeManager.scanWorktrees()` only scans
+    direct children of `.kilo/worktrees/` and requires `<child>/.git` to be a
+    file: a nested directory like `.kilo/worktrees/kilo/t071-foo` causes the
+    parent `.kilo/worktrees/kilo` directory to be flagged as a 'leftover
+    worktree folder' and makes the child invisible to `discoverWorktrees()`."""
+    if "/" not in branch_name and re.match(r"^[a-zA-Z0-9_-][a-zA-Z0-9._-]{0,99}$", branch_name):
+        return branch_name
+    flat = re.sub(r"[^a-zA-Z0-9._-]+", "-", branch_name).strip("-")
+    return flat[:100] if flat else "worktree"
+
+
+def _worktree_git_dir(worktree_path: str) -> Optional[str]:
+    """Resolve the `.git/worktrees/<name>` metadata directory for a linked
+    worktree by reading its `.git` file (`gitdir: ...`), matching the
+    extension's `WorktreeManager.worktreeGitDir()`."""
+    git_path = os.path.join(worktree_path, ".git")
+    try:
+        if os.path.isdir(git_path):
+            return git_path
+        if not os.path.isfile(git_path):
+            return None
+        with open(git_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        m = re.search(r"^gitdir:\s*(.+)$", content, re.MULTILINE)
+        if not m:
+            return None
+        target = m.group(1).strip()
+        return target if os.path.isabs(target) else os.path.normpath(os.path.join(worktree_path, target))
+    except OSError:
+        return None
+
+
+def _write_worktree_git_metadata(worktree_path: str, *,
+                                  session_id: Optional[str] = None,
+                                  parent_branch: Optional[str] = None,
+                                  remote: Optional[str] = None) -> None:
+    """Write or update `<worktree_gitdir>/kilo-agent-manager-metadata.json`
+    (`GIT_METADATA_FILE` in `WorktreeManager.ts`), which the Kilo VS Code
+    extension's `discoverWorktrees()` / `restoreWorktrees()` reads to recover
+    worktrees and their linked session IDs from disk."""
+    git_dir = _worktree_git_dir(worktree_path)
+    if not git_dir or not os.path.isdir(git_dir):
+        return
+    meta_file = os.path.join(git_dir, GIT_METADATA_FILE)
+    try:
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if not isinstance(meta, dict):
+                meta = {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            meta = {}
+        if session_id:
+            meta["sessionId"] = session_id
+        if parent_branch:
+            meta["parentBranch"] = parent_branch
+        if remote:
+            meta["remote"] = remote
+        tmp_file = f"{meta_file}.{os.getpid()}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp_file, meta_file)
+    except OSError:
+        logger.debug("Could not write worktree git metadata in %s", git_dir, exc_info=True)
+
+
+def _prune_stale_from_state_dict(data: dict, removed_paths: Optional[set[str]] = None) -> list[str]:
+    """Remove worktree entries from `data` whose paths are in `removed_paths`,
+    along with their orphaned session entries, tabOrder, pinnedTabs,
+    worktreeOrder, and activeTarget."""
+    if not removed_paths:
+        return []
+    norm_removed = {os.path.realpath(p) for p in removed_paths}
+    worktrees = data.get("worktrees", {})
+    dropped_ids: list[str] = []
+    for wt_id, wt in list(worktrees.items()):
+        wt_path = wt.get("path", "")
+        if wt_path and os.path.realpath(wt_path) in norm_removed:
+            dropped_ids.append(wt_id)
+            del worktrees[wt_id]
+    if not dropped_ids:
+        return []
+    dropped_set = set(dropped_ids)
+    sessions = data.get("sessions", {})
+    for sid, sinfo in list(sessions.items()):
+        if isinstance(sinfo, dict) and sinfo.get("worktreeId") in dropped_set:
+            del sessions[sid]
+    tab_order = data.get("tabOrder")
+    if isinstance(tab_order, dict):
+        for wt_id in dropped_ids:
+            tab_order.pop(wt_id, None)
+    pinned = data.get("pinnedTabs")
+    if isinstance(pinned, dict):
+        for wt_id in dropped_ids:
+            pinned.pop(wt_id, None)
+    if isinstance(data.get("worktreeOrder"), list):
+        data["worktreeOrder"] = [w for w in data["worktreeOrder"] if w not in dropped_set]
+    active = data.get("activeTarget")
+    if isinstance(active, dict) and active.get("worktreeId") in dropped_set:
+        data.pop("activeTarget", None)
+    return dropped_ids
+
+
+def _agent_manager_prune_stale(root: str, removed_paths: Optional[set[str]] = None) -> list[str]:
+    """Prune removed or non-existent worktrees from `<root>/.kilo/agent-manager.json`."""
+    dropped: list[str] = []
+
+    def mutate(data: dict) -> None:
+        paths_to_drop = set(removed_paths or set())
+        for wt in data.get("worktrees", {}).values():
+            p = wt.get("path", "")
+            if p and not os.path.exists(p):
+                paths_to_drop.add(p)
+        dropped.extend(_prune_stale_from_state_dict(data, paths_to_drop))
+
+    try:
+        if os.path.exists(_agent_manager_file(root)):
+            _agent_manager_locked_update(root, mutate)
+    except OSError:
+        logger.warning("Agent Manager stale worktree prune failed (root=%s)", root, exc_info=True)
+    return dropped
+
+
 def _agent_manager_register_worktree(root: str, *, branch: str, path: str,
                                       parent_branch: str, label: Optional[str] = None,
                                       remote: Optional[str] = None) -> str:
@@ -2638,6 +2966,7 @@ def _agent_manager_register_worktree(root: str, *, branch: str, path: str,
             order.append(wt_id)
 
     _agent_manager_locked_update(root, mutate)
+    _write_worktree_git_metadata(path, parent_branch=parent_branch, remote=remote)
     return wt_id
 
 
@@ -2657,9 +2986,14 @@ def _agent_manager_register_session(root: str, session_id: str, worktree_id: Opt
     of truth. An existing session with `worktreeId: null` is upgradeable by
     a later, better-informed call (e.g. once `cwd` is known); a session
     already linked to a real worktree is never touched."""
+    resolved_wt_path: list[str] = []
+
     def mutate(data: dict) -> None:
         existing = data["sessions"].get(session_id)
         if existing and existing.get("worktreeId"):
+            wt_entry = data["worktrees"].get(existing["worktreeId"], {})
+            if wt_entry.get("path"):
+                resolved_wt_path.append(wt_entry["path"])
             return  # already correctly linked — never overwrite
         linked = worktree_id if worktree_id and worktree_id in data["worktrees"] else None
         if not linked and cwd:
@@ -2672,8 +3006,19 @@ def _agent_manager_register_session(root: str, session_id: str, worktree_id: Opt
             "worktreeId": linked,
             "createdAt": existing["createdAt"] if existing else _iso_now_z(),
         }
+        if linked:
+            tab_order = data.setdefault("tabOrder", {})
+            tabs = tab_order.setdefault(linked, [])
+            if session_id not in tabs:
+                tabs.append(session_id)
+            wt_entry = data["worktrees"].get(linked, {})
+            if wt_entry.get("path"):
+                resolved_wt_path.append(wt_entry["path"])
 
     _agent_manager_locked_update(root, mutate)
+    wt_dir = resolved_wt_path[0] if resolved_wt_path else cwd
+    if wt_dir:
+        _write_worktree_git_metadata(wt_dir, session_id=session_id)
 
 
 def _agent_manager_note_session(cwd: Optional[str], session_id: Optional[str],
@@ -2708,15 +3053,15 @@ def _worktree_lock_for(cwd: str) -> asyncio.Lock:
 async def _create_worktree(cwd: str, branch_name: str, base_branch: Optional[str],
                             env: dict) -> tuple[Optional[str], int, str, str, Optional[str]]:
     """Shared core of kilo_create_worktree and kilo_implement's isolation='worktree'
-    path: `git worktree add -b <branch_name> .kilo/worktrees/<branch_name>` under
+    path: `git worktree add -b <branch_name> .kilo/worktrees/<dir_name>` under
     `cwd`. Matches the Kilo VS Code extension's own WorktreeManager convention
-    (`KILO_DIR/worktrees`, not a top-level `.kilo-worktrees` — that older path
-    isn't covered by the extension's `ensureGitExclude()` patterns, so a
-    worktree created there shows up as untracked content to git and isn't
-    found by the extension's own `discoverWorktrees()` recovery scan).
+    (`KILO_DIR/worktrees` with a flat single-segment `<dir_name>` so `<dir>/.git`
+    is always a direct child of `.kilo/worktrees/` and never flagged as a
+    leftover nested folder).
     Returns (worktree_abspath_or_None_on_failure, returncode, stdout, stderr,
     agent_manager_worktree_id_or_None)."""
-    worktree_rel = os.path.join(".kilo", "worktrees", branch_name)
+    dir_name = _worktree_dir_name(branch_name)
+    worktree_rel = os.path.join(".kilo", "worktrees", dir_name)
     cmd = ["git", "worktree", "add", "-b", branch_name, worktree_rel]
     if base_branch:
         cmd.append(base_branch)
@@ -3200,15 +3545,23 @@ def _assess_kilo_task(elapsed_s: float, cpu_s: float, has_network: bool,
 
 
 def _recent_kilo_sessions(limit: int = 15) -> list[tuple]:
-    """(worktree, title, time_updated_ms) of the most recent Kilo sessions,
-    read-only so we never lock the db Kilo is writing to."""
+    """(directory_or_worktree, title, time_updated_ms) of the most recent Kilo sessions,
+    read-only so we never lock the db Kilo is writing to. Prefers `session.directory`
+    (which stores the specific worktree path) over `project.worktree`."""
     try:
         con = sqlite3.connect(f"file:{KILO_SESSION_DB}?mode=ro", uri=True, timeout=1)
-        rows = con.execute(
-            "SELECT p.worktree, s.title, s.time_updated FROM session s "
-            "JOIN project p ON s.project_id = p.id "
-            "ORDER BY s.time_updated DESC LIMIT ?", (limit,)
-        ).fetchall()
+        try:
+            rows = con.execute(
+                "SELECT COALESCE(NULLIF(s.directory, ''), p.worktree), s.title, s.time_updated "
+                "FROM session s LEFT JOIN project p ON s.project_id = p.id "
+                "ORDER BY s.time_updated DESC LIMIT ?", (limit,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = con.execute(
+                "SELECT p.worktree, s.title, s.time_updated FROM session s "
+                "JOIN project p ON s.project_id = p.id "
+                "ORDER BY s.time_updated DESC LIMIT ?", (limit,)
+            ).fetchall()
         con.close()
         return rows
     except Exception:
@@ -3261,26 +3614,46 @@ def _find_session_for_task(cwd: str, started_iso: str, run_id: str) -> Optional[
         started_ms = datetime.fromisoformat(started_iso).timestamp() * 1000
     except (ValueError, TypeError):
         return None
-    targets = {os.path.realpath(cwd)}
+    exact_cwd = os.path.realpath(cwd)
+    targets = {exact_cwd}
     root = _agent_manager_root(cwd)
     if root:
         targets.add(os.path.realpath(root))
     try:
         con = sqlite3.connect(f"file:{KILO_SESSION_DB}?mode=ro", uri=True, timeout=1)
-        rows = con.execute(
-            "SELECT s.id, p.worktree FROM session s "
-            "JOIN project p ON s.project_id = p.id "
-            "WHERE s.time_created >= ? ORDER BY s.time_created ASC LIMIT 50",
-            (started_ms - 15000,),
-        ).fetchall()
+        try:
+            rows = con.execute(
+                "SELECT s.id, s.directory, p.worktree FROM session s "
+                "LEFT JOIN project p ON s.project_id = p.id "
+                "WHERE s.time_created >= ? ORDER BY s.time_created ASC LIMIT 50",
+                (started_ms - 15000,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = [
+                (sid, None, wt)
+                for sid, wt in con.execute(
+                    "SELECT s.id, p.worktree FROM session s "
+                    "JOIN project p ON s.project_id = p.id "
+                    "WHERE s.time_created >= ? ORDER BY s.time_created ASC LIMIT 50",
+                    (started_ms - 15000,),
+                ).fetchall()
+            ]
         con.close()
     except Exception:
         return None
     claimed = set(_SESSION_CLAIMS.values())
-    for sid, worktree in rows:
+    # Pass 1: prefer an exact match on `session.directory` (disambiguates concurrent worktrees)
+    for sid, s_dir, _ in rows:
         if sid in claimed:
             continue
-        if worktree and os.path.realpath(worktree) in targets:
+        if s_dir and os.path.realpath(s_dir) == exact_cwd:
+            _SESSION_CLAIMS[run_id] = sid
+            return sid
+    # Pass 2: fallback to `project.worktree` (or `session.directory` in `targets`)
+    for sid, s_dir, worktree in rows:
+        if sid in claimed:
+            continue
+        if (worktree and os.path.realpath(worktree) in targets) or (s_dir and os.path.realpath(s_dir) in targets):
             _SESSION_CLAIMS[run_id] = sid
             return sid
     return None
@@ -3402,8 +3775,13 @@ async def kilo_task_status(
         cpu = _parse_ps_time(fields[1]) if len(fields) > 1 else 0.0
         _, cwd_out, _ = await _run_kilo(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"], cwd=here, env=env)
         proc_cwd = next((l[1:] for l in cwd_out.splitlines() if l.startswith("n")), "?")
-        if working_directory and os.path.realpath(proc_cwd) != os.path.realpath(working_directory):
-            continue
+        if working_directory:
+            real_proc = os.path.realpath(proc_cwd)
+            real_wd = os.path.realpath(working_directory)
+            if real_proc != real_wd and not real_proc.startswith(real_wd + os.sep):
+                proc_root = _agent_manager_root(real_proc)
+                if not proc_root or os.path.realpath(proc_root) != real_wd:
+                    continue
         net_rc, net_out, _ = await _run_kilo(["lsof", "-a", "-p", pid, "-i"], cwd=here, env=env)
         has_network = bool(net_out.strip())
         session_age = None
@@ -3497,18 +3875,35 @@ async def kilo_cleanup(
     keep_set = set(keep or [])
 
     # Find live running processes that might hold worktrees
-    rc_lsof, lsof_out, _ = await _run_kilo(["lsof", "-d", "cwd", "-Fn"], cwd=repo_root, env=env)
+    rc_lsof, lsof_out, _ = await _run_kilo(["lsof", "-d", "cwd", "-Fc", "-Fn"], cwd=repo_root, env=env)
     running_cwds: set[str] = set()
-    proc_entries: list[tuple[int, str]] = []
+    proc_entries: list[tuple[int, str, str]] = []
     if rc_lsof == 0:
         cur_pid = None
+        cur_cmd = ""
         for line in lsof_out.splitlines():
             if line.startswith("p") and line[1:].isdigit():
                 cur_pid = int(line[1:])
+                cur_cmd = ""
+            elif line.startswith("c"):
+                cur_cmd = line[1:].strip().lower()
             elif line.startswith("n") and cur_pid:
-                proc_path = os.path.realpath(line[1:])
+                raw_path = line[1:]
+                proc_path = os.path.realpath(raw_path) if os.path.exists(raw_path) else os.path.normpath(raw_path)
                 running_cwds.add(proc_path)
-                proc_entries.append((cur_pid, proc_path))
+                proc_entries.append((cur_pid, cur_cmd, proc_path))
+
+    active_task_pids: set[int] = set()
+    if os.path.isdir(TASKS_DIR):
+        try:
+            for fname in os.listdir(TASKS_DIR):
+                if fname.endswith(".json"):
+                    rec = _read_task_record(fname[:-5])
+                    if rec and rec.get("status") == "running" and rec.get("pid"):
+                        active_task_pids.add(int(rec["pid"]))
+        except Exception:
+            pass
+    agent_cmd_names = {"kilo", "claude", "codex", "opencode"}
 
     candidates: list[dict[str, Any]] = []
     kept: list[dict[str, Any]] = []
@@ -3519,6 +3914,7 @@ async def kilo_cleanup(
     # ─────────────────────────────────────────────────────────────────────────
     candidate_wt_paths: set[str] = set()
     remaining_wt_branches: set[str] = set()
+    all_git_wt_paths: set[str] = set()
 
     if "worktrees" in active_scope:
         rc_wt, wt_out, _ = await _run_kilo(["git", "worktree", "list", "--porcelain"], cwd=repo_root, env=env)
@@ -3535,6 +3931,7 @@ async def kilo_cleanup(
                         info["branch"] = l[7:].strip().replace("refs/heads/", "")
                 if info.get("path") and os.path.realpath(info["path"]) != repo_root:
                     parsed_wts.append(info)
+                    all_git_wt_paths.add(os.path.realpath(info["path"]))
 
             # Sort nested worktrees deepest first (child first)
             parsed_wts.sort(key=lambda x: len(x["path"]), reverse=True)
@@ -3580,9 +3977,18 @@ async def kilo_cleanup(
                         remaining_wt_branches.add(bname)
                         continue
 
-                # Live process check
-                has_live_proc = any(p_cwd == wt_path or p_cwd.startswith(wt_path + os.sep) for p_cwd in running_cwds)
-                if has_live_proc:
+                # Live process check: keep if an active agent is in this worktree,
+                # or if any process is in it and 'processes' cleanup was not requested.
+                wt_procs = [
+                    (pid, p_cmd, p_cwd)
+                    for pid, p_cmd, p_cwd in proc_entries
+                    if p_cwd == wt_path or p_cwd.startswith(wt_path + os.sep)
+                ]
+                has_active_agent = any(
+                    pid in active_task_pids or p_cmd in agent_cmd_names
+                    for pid, p_cmd, _ in wt_procs
+                )
+                if has_active_agent or (wt_procs and "processes" not in active_scope):
                     kept.append({"kind": "worktree", "id": wt_path, "branch": bname, "kept_because": "live_process"})
                     remaining_wt_branches.add(bname)
                     continue
@@ -3633,19 +4039,36 @@ async def kilo_cleanup(
                     kept.append({"kind": "branch", "id": bname, "kept_because": "unmerged"})
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 3. Inspect Processes (Orphans in removed worktrees)
+    # 3. Inspect Processes (Orphans in candidate or already-removed worktrees)
     # ─────────────────────────────────────────────────────────────────────────
-    if "processes" in active_scope and candidate_wt_paths:
-        for pid, p_cwd in proc_entries:
+    if "processes" in active_scope:
+        wt_base_dir = os.path.join(repo_root, ".kilo", "worktrees")
+        seen_pids: set[int] = set()
+        for pid, p_cmd, p_cwd in proc_entries:
+            if pid in seen_pids or pid in active_task_pids or p_cmd in agent_cmd_names:
+                continue
+            matched_wt = None
             for wt_path in candidate_wt_paths:
                 if p_cwd == wt_path or p_cwd.startswith(wt_path + os.sep):
-                    candidates.append({
-                        "kind": "process",
-                        "id": str(pid),
-                        "cwd": p_cwd,
-                        "action": "terminate",
-                        "reason": f"Orphan process running in removed worktree {wt_path}"
-                    })
+                    matched_wt = wt_path
+                    break
+            if not matched_wt and p_cwd.startswith(wt_base_dir + os.sep):
+                # Also catch orphan servers whose .kilo/worktrees/<name> folder was already removed
+                in_kept_wt = any(
+                    p_cwd == kw or p_cwd.startswith(kw + os.sep)
+                    for kw in (all_git_wt_paths - candidate_wt_paths)
+                )
+                if not in_kept_wt and not os.path.exists(p_cwd):
+                    matched_wt = p_cwd
+            if matched_wt:
+                seen_pids.add(pid)
+                candidates.append({
+                    "kind": "process",
+                    "id": str(pid),
+                    "cwd": p_cwd,
+                    "action": "terminate",
+                    "reason": f"Orphan process running in removed worktree {matched_wt}"
+                })
 
     # Calculate deterministic plan hash
     plan_data = json.dumps(candidates, sort_keys=True)
@@ -3693,10 +4116,16 @@ async def kilo_cleanup(
             except OSError as e:
                 executed_actions.append({"id": str(pid), "action": "sigterm", "status": f"skipped: {e}"})
 
-    # 2. Remove worktrees
+    # 2. Remove worktrees (and immediately delete their candidate branch so the
+    #    VS Code extension's reconcileWorktrees sees both path and branch gone ->
+    #    'absent-gone' -> auto-drop, rather than getting stuck in 'absent-restorable')
+    removed_wt_paths: set[str] = set()
+    deleted_branches: set[str] = set()
+    candidate_branch_ids = {item["id"] for item in candidates if item["kind"] == "branch"}
     for item in candidates:
         if item["kind"] == "worktree":
             wt_path = item["id"]
+            bname = item.get("branch", "")
             rc_rm, out_rm, err_rm = await _run_kilo(["git", "worktree", "remove", wt_path], cwd=repo_root, env=env)
             executed_actions.append({
                 "id": wt_path,
@@ -3704,10 +4133,30 @@ async def kilo_cleanup(
                 "success": (rc_rm == 0),
                 "output": out_rm or err_rm
             })
+            if rc_rm == 0:
+                removed_wt_paths.add(wt_path)
+                # Clean up any empty parent directories inside .kilo/worktrees/ (e.g. .kilo/worktrees/kilo)
+                wt_root = os.path.realpath(os.path.join(repo_root, ".kilo", "worktrees"))
+                parent_dir = os.path.dirname(os.path.realpath(wt_path))
+                while parent_dir.startswith(wt_root + os.sep) and parent_dir != wt_root:
+                    try:
+                        os.rmdir(parent_dir)
+                    except OSError:
+                        break
+                    parent_dir = os.path.dirname(parent_dir)
+                if bname and bname in candidate_branch_ids and bname not in deleted_branches:
+                    rc_bd, out_bd, err_bd = await _run_kilo(["git", "branch", "-d", bname], cwd=repo_root, env=env)
+                    executed_actions.append({
+                        "id": bname,
+                        "action": "git branch -d",
+                        "success": (rc_bd == 0),
+                        "output": out_bd or err_bd
+                    })
+                    deleted_branches.add(bname)
 
-    # 3. Delete merged branches (safe -d only)
+    # 3. Delete remaining merged branches (safe -d only)
     for item in candidates:
-        if item["kind"] == "branch":
+        if item["kind"] == "branch" and item["id"] not in deleted_branches:
             bname = item["id"]
             rc_bd, out_bd, err_bd = await _run_kilo(["git", "branch", "-d", bname], cwd=repo_root, env=env)
             executed_actions.append({
@@ -3716,6 +4165,41 @@ async def kilo_cleanup(
                 "success": (rc_bd == 0),
                 "output": out_bd or err_bd
             })
+
+    # 4. Prune removed/non-existent worktrees from .kilo/agent-manager.json
+    pruned_am_ids = _agent_manager_prune_stale(repo_root, removed_wt_paths)
+    if pruned_am_ids:
+        executed_actions.append({
+            "id": ".kilo/agent-manager.json",
+            "action": "prune_stale_worktrees",
+            "success": True,
+            "pruned_worktree_ids": pruned_am_ids,
+        })
+
+    # 5. Archive sessions in kilo.db whose worktree directory under this repo no longer exists
+    try:
+        if os.path.exists(KILO_SESSION_DB):
+            wt_prefix = os.path.join(repo_root, ".kilo", "worktrees") + os.sep
+            now_ms = int(time.time() * 1000)
+            con = sqlite3.connect(KILO_SESSION_DB, timeout=5)
+            with con:
+                rows = con.execute(
+                    "SELECT id, directory FROM session WHERE directory LIKE ? AND time_archived IS NULL",
+                    (wt_prefix + "%",),
+                ).fetchall()
+                to_archive = [sid for sid, sdir in rows if sdir and not os.path.exists(sdir)]
+                for sid in to_archive:
+                    con.execute("UPDATE session SET time_archived = ? WHERE id = ?", (now_ms, sid))
+            con.close()
+            if to_archive:
+                executed_actions.append({
+                    "id": "kilo.db",
+                    "action": "archive_dead_worktree_sessions",
+                    "success": True,
+                    "archived_count": len(to_archive),
+                })
+    except Exception:
+        logger.debug("Archiving dead worktree sessions in kilo.db failed", exc_info=True)
 
     # Write audit log to .kilo/
     audit_file = pathlib.Path(repo_root) / ".kilo" / f"cleanup-{int(time.time())}.json"
