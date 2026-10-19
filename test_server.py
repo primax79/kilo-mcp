@@ -1104,7 +1104,9 @@ def test_kilo_implement_isolation_worktree_default_branch_name(tmp_path, fake_da
     worktree_call = mock_run_kilo_custom.calls[0]
     branch = worktree_call["cmd"][4]
     assert branch.startswith("kilo/")
-    assert worktree_call["cmd"][-1] == os.path.join(".kilo", "worktrees", branch)
+    # Directory under .kilo/worktrees/ must be flat (no slash), otherwise the
+    # VS Code extension flags `.kilo/worktrees/kilo` as a leftover folder.
+    assert worktree_call["cmd"][-1] == os.path.join(".kilo", "worktrees", branch.replace("/", "-"))
 
 
 def test_kilo_implement_isolation_worktree_base_branch(tmp_path, fake_data_dir, mock_run_kilo_custom):
@@ -2599,6 +2601,48 @@ def test_cleanup_prune_deletes_only_identified_removed_worktree_collections(tmp_
     assert not any(coll_unknown in u for u in deleted_urls)
     assert not any(coll_existing in u for u in deleted_urls)
     assert not any(coll_non_wt in u for u in deleted_urls)
+
+
+def test_worktree_git_metadata_and_cleanup_prune(tmp_path, fake_data_dir):
+    """Verify that worktree creation + session registration write
+    `.git/worktrees/<name>/kilo-agent-manager-metadata.json` and `tabOrder`,
+    and that `_agent_manager_prune_stale` removes deleted worktrees and their
+    sessions from `.kilo/agent-manager.json`."""
+    repo = _init_git_repo(tmp_path)
+    wt_dir = tmp_path / ".kilo" / "worktrees" / "kilo-feat-meta"
+    wt_gitdir = tmp_path / ".git" / "worktrees" / "kilo-feat-meta"
+    wt_dir.mkdir(parents=True)
+    wt_gitdir.mkdir(parents=True)
+    (wt_dir / ".git").write_text(f"gitdir: {wt_gitdir}\n")
+
+    wt_id = server._agent_manager_register_worktree(
+        repo, branch="kilo/feat-meta", path=str(wt_dir),
+        parent_branch="main", remote="origin",
+    )
+    server._agent_manager_register_session(repo, "ses_meta123", wt_id, cwd=str(wt_dir))
+
+    meta_file = wt_gitdir / server.GIT_METADATA_FILE
+    assert meta_file.exists()
+    meta = json.loads(meta_file.read_text())
+    assert meta == {
+        "parentBranch": "main",
+        "remote": "origin",
+        "sessionId": "ses_meta123",
+    }
+
+    am_data = json.loads((tmp_path / ".kilo" / "agent-manager.json").read_text())
+    assert am_data["tabOrder"][wt_id] == ["ses_meta123"]
+
+    # Now simulate worktree removal and prune stale entries
+    import shutil
+    shutil.rmtree(wt_dir)
+    dropped = server._agent_manager_prune_stale(repo)
+    assert dropped == [wt_id]
+    am_after = json.loads((tmp_path / ".kilo" / "agent-manager.json").read_text())
+    assert wt_id not in am_after["worktrees"]
+    assert "ses_meta123" not in am_after["sessions"]
+    assert wt_id not in am_after.get("tabOrder", {})
+    assert wt_id not in am_after.get("worktreeOrder", [])
 
 
 
