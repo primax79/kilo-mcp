@@ -16,8 +16,10 @@ import tempfile
 import time
 import uuid
 import glob
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 from pydantic import Field
 
 # stderr only: stdout is the MCP JSON-RPC framing channel for a stdio server,
@@ -3431,6 +3433,180 @@ async def kilo_task_status(
 
 
 # Helper: unexport write/execution tools when running in --rag-only mode
+def _normalize_workspace_path(path: str) -> str:
+    """Canonicalize a workspace path matching Kilo's FSUtil.resolve:
+    - Resolves symlinks (e.g. macOS /var -> /private/var)
+    - Resolves relative paths to absolute
+    - Strips trailing slash unless root
+    """
+    if not path:
+        return ""
+    expanded = os.path.expanduser(path)
+    canonical = os.path.realpath(os.path.abspath(expanded))
+    if len(canonical) > 1 and canonical.endswith(os.sep):
+        canonical = canonical.rstrip(os.sep)
+    return canonical
+
+
+def _kilo_workspace_collection_name(workspace_path: str) -> str:
+    """Compute Qdrant collection name matching Kilo's indexing convention.
+    ws-<sha256(canonical_path)[:16]>
+    """
+    norm = _normalize_workspace_path(workspace_path)
+    h = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+    return f"ws-{h}"
+
+
+def _resolve_qdrant_url(config: Optional[dict] = None) -> tuple[str, Optional[str]]:
+    """Resolve Qdrant REST URL and optional API key.
+    Checks:
+    1. Environment variables: QDRANT_URL / KILO_QDRANT_URL, QDRANT_API_KEY / KILO_QDRANT_API_KEY
+    2. kilo-mcp config file: [qdrant] url/api_key, [kilo] qdrant_url/qdrant_api_key
+    3. Kilo user config (~/.config/kilo/kilo.jsonc or kilo.json): indexing.qdrant.url
+    4. Default: http://localhost:6333
+    """
+    url = os.environ.get("QDRANT_URL") or os.environ.get("KILO_QDRANT_URL")
+    api_key = os.environ.get("QDRANT_API_KEY") or os.environ.get("KILO_QDRANT_API_KEY")
+    if url:
+        return url.rstrip("/"), api_key
+
+    try:
+        cfg = config if config is not None else _load_config_file()
+        q_cfg = cfg.get("qdrant", {})
+        k_cfg = cfg.get("kilo", {})
+        url = q_cfg.get("url") or k_cfg.get("qdrant_url")
+        if not api_key:
+            api_key = q_cfg.get("api_key") or k_cfg.get("qdrant_api_key")
+        if url:
+            return url.rstrip("/"), api_key
+    except Exception:
+        pass
+
+    for candidate_name in ("kilo.jsonc", "kilo.json"):
+        kilo_cfg_path = os.path.expanduser(f"~/.config/kilo/{candidate_name}")
+        if os.path.exists(kilo_cfg_path):
+            try:
+                with open(kilo_cfg_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                m_url = re.search(r'"qdrant"\s*:\s*\{[^}]*"url"\s*:\s*"([^"]+)"', content)
+                if m_url:
+                    url = m_url.group(1).strip()
+                if not api_key:
+                    m_key = re.search(r'"qdrant"\s*:\s*\{[^}]*"apiKey"\s*:\s*"([^"]+)"', content)
+                    if m_key:
+                        api_key = m_key.group(1).strip()
+                if url:
+                    return url.rstrip("/"), api_key
+            except Exception:
+                pass
+
+    return "http://localhost:6333", api_key
+
+
+def _delete_qdrant_collection(
+    collection_name: str,
+    qdrant_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Delete a Qdrant collection via REST API. 404 is treated as already gone."""
+    url, default_key = _resolve_qdrant_url()
+    base_url = (qdrant_url or url).rstrip("/")
+    key = api_key if api_key is not None else default_key
+    endpoint = f"{base_url}/collections/{collection_name}"
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["api-key"] = key
+    req = urllib.request.Request(endpoint, headers=headers, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status if hasattr(resp, "status") else resp.getcode()
+            return {
+                "collection": collection_name,
+                "action": "delete_collection",
+                "success": True,
+                "status": "deleted",
+                "http_status": status,
+            }
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {
+                "collection": collection_name,
+                "action": "delete_collection",
+                "success": True,
+                "status": "already_deleted",
+                "http_status": 404,
+                "note": "Collection was already deleted or did not exist.",
+            }
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return {
+            "collection": collection_name,
+            "action": "delete_collection",
+            "success": False,
+            "status": "error",
+            "http_status": e.code,
+            "error": f"HTTP {e.code}: {error_body or e.reason}",
+        }
+    except urllib.error.URLError as e:
+        return {
+            "collection": collection_name,
+            "action": "delete_collection",
+            "success": False,
+            "status": "error",
+            "error": f"Connection error reaching Qdrant at {base_url}: {e.reason}",
+        }
+    except Exception as e:
+        return {
+            "collection": collection_name,
+            "action": "delete_collection",
+            "success": False,
+            "status": "error",
+            "error": str(e),
+        }
+
+
+def _list_qdrant_collections(
+    qdrant_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout: float = 10.0,
+) -> tuple[list[str], Optional[str]]:
+    """List collection names from Qdrant REST API. Returns (collections, error)."""
+    url, default_key = _resolve_qdrant_url()
+    base_url = (qdrant_url or url).rstrip("/")
+    key = api_key if api_key is not None else default_key
+    endpoint = f"{base_url}/collections"
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["api-key"] = key
+    req = urllib.request.Request(endpoint, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            colls = data.get("result", {}).get("collections", [])
+            names = [c["name"] for c in colls if isinstance(c, dict) and "name" in c]
+            return names, None
+    except Exception as e:
+        return [], str(e)
+
+
+async def _list_kilo_sessions(cwd: str, env: dict) -> list[dict[str, Any]]:
+    """List sessions using `kilo session list --format json --all`."""
+    rc, out, _ = await _run_kilo(["kilo", "session", "list", "--format", "json", "--all"], cwd=cwd, env=env)
+    if rc != 0 or not out.strip():
+        return []
+    try:
+        data = json.loads(out)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
 @mcp.tool()
 async def kilo_cleanup(
     working_directory: Annotated[
@@ -3449,9 +3625,21 @@ async def kilo_cleanup(
         Optional[str],
         Field(description="Base target branch to test merge status against (default: repo default branch or main/master).")
     ] = None,
+    delete_collection: Annotated[
+        bool,
+        Field(description="If True (default), deletes the removed worktrees' Qdrant vector collections through the REST API.")
+    ] = True,
+    delete_sessions: Annotated[
+        bool,
+        Field(description="If True (default False), deletes Kilo sessions associated with removed worktrees via `kilo session delete`.")
+    ] = False,
+    prune_orphans: Annotated[
+        bool,
+        Field(description="If True, runs prune mode: audits and cleans orphan Qdrant collections whose worktrees were removed.")
+    ] = False,
     dry_run: Annotated[
         bool,
-        Field(description="If True, only reports candidates, kept items, and leftovers with a plan_hash. If False, executes the plan.")
+        Field(description="If True (default), only reports candidates, kept items, and leftovers with a plan_hash. If False, executes the plan.")
     ] = True,
     plan_hash: Annotated[
         Optional[str],
@@ -3461,7 +3649,14 @@ async def kilo_cleanup(
     """Safely cleans up stale git worktrees, merged feature branches, and orphan background
     dev server processes created by delegated Kilo runs.
 
-    Follows strict safety principles from executor-housekeeping-and-completion.md:
+    Features:
+    - By default (delete_collection=True), removes each deleted worktree's Qdrant vector
+      collection (ws-<sha256[:16]>) via the REST API (404 is tolerated; errors never block worktree removal).
+    - Optionally (delete_sessions=True), deletes Kilo sessions run in the removed worktree via
+      the Kilo CLI (`kilo session delete <id>`).
+    - Prune mode (prune_orphans=True): audits Qdrant collections named `ws-*` whose source path
+      no longer exists and deletes only those positively identified as belonging to a removed
+      worktree (.kilo/worktrees/ paths); unknown hashes are reported, never deleted.
     - Dry-run first (returns candidates, kept items, leftover work, and a plan_hash).
     - Requires plan_hash to apply (preventing race conditions or accidental deletions).
     - NEVER deletes worktrees with uncommitted changes or unmerged commits (reported as 'leftover_work').
@@ -3474,14 +3669,232 @@ async def kilo_cleanup(
     # Safety check: must be the root of a git repository
     rc, top_out, _ = await _run_kilo(["git", "rev-parse", "--show-toplevel"], cwd=cwd, env=env)
     if rc != 0 or not top_out.strip():
-        return json.dumps({"error": f"working_directory '{cwd}' is not inside a git repository."})
-    repo_root = os.path.realpath(top_out.strip())
-    if repo_root != cwd:
-        return json.dumps({
-            "error": f"working_directory '{cwd}' is a subdirectory of git root '{repo_root}'. "
-                     "kilo_cleanup must be invoked from the repository root."
-        })
+        if prune_orphans:
+            repo_root = cwd
+        else:
+            return json.dumps({"error": f"working_directory '{cwd}' is not inside a git repository."})
+    else:
+        repo_root = os.path.realpath(top_out.strip())
+        if repo_root != cwd and not prune_orphans:
+            return json.dumps({
+                "error": f"working_directory '{cwd}' is a subdirectory of git root '{repo_root}'. "
+                         "kilo_cleanup must be invoked from the repository root."
+            })
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Prune Mode: orphan Qdrant collections audit & cleanup
+    # ─────────────────────────────────────────────────────────────────────────
+    if prune_orphans:
+        qdrant_url, api_key = _resolve_qdrant_url()
+        all_colls, err = _list_qdrant_collections(qdrant_url, api_key)
+        if err:
+            return json.dumps({"error": f"Failed to list collections from Qdrant at {qdrant_url}: {err}"})
+        ws_colls = [c for c in all_colls if c.startswith("ws-")]
+
+        known_paths: dict[str, str] = {}
+        path_to_sessions: dict[str, list[str]] = {}
+
+        # 1. Kilo session list
+        sessions = await _list_kilo_sessions(repo_root, env)
+        for s in sessions:
+            sess_id = s.get("id")
+            d = s.get("directory")
+            if d:
+                norm_d = _normalize_workspace_path(d)
+                c_name = _kilo_workspace_collection_name(norm_d)
+                known_paths[c_name] = norm_d
+                if sess_id:
+                    path_to_sessions.setdefault(norm_d, []).append(sess_id)
+            wt = s.get("project", {}).get("worktree")
+            if wt:
+                norm_wt = _normalize_workspace_path(wt)
+                c_name = _kilo_workspace_collection_name(norm_wt)
+                known_paths[c_name] = norm_wt
+
+        # 2. Existing worktrees from git
+        rc_wt, wt_out, _ = await _run_kilo(["git", "worktree", "list", "--porcelain"], cwd=repo_root, env=env)
+        if rc_wt == 0:
+            for line in wt_out.splitlines():
+                if line.startswith("worktree "):
+                    p = line[9:].strip()
+                    norm_p = _normalize_workspace_path(p)
+                    known_paths[_kilo_workspace_collection_name(norm_p)] = norm_p
+
+        # 3. Worktrees under .kilo/worktrees/ in repo_root
+        kilo_wt_dir = os.path.join(repo_root, ".kilo", "worktrees")
+        if os.path.isdir(kilo_wt_dir):
+            for root, dirs, _ in os.walk(kilo_wt_dir):
+                norm_p = _normalize_workspace_path(root)
+                known_paths[_kilo_workspace_collection_name(norm_p)] = norm_p
+
+        # 4. Git metadata worktrees (.git/worktrees/*/gitdir)
+        git_wt_dir = os.path.join(repo_root, ".git", "worktrees")
+        if os.path.isdir(git_wt_dir):
+            for entry in os.listdir(git_wt_dir):
+                gitdir_file = os.path.join(git_wt_dir, entry, "gitdir")
+                if os.path.isfile(gitdir_file):
+                    try:
+                        with open(gitdir_file, "r") as gf:
+                            target = gf.read().strip()
+                        if target.endswith("/.git") or target.endswith("\\.git"):
+                            target = target[:-5]
+                        norm_p = _normalize_workspace_path(target)
+                        known_paths[_kilo_workspace_collection_name(norm_p)] = norm_p
+                    except Exception:
+                        pass
+
+        candidates: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
+        unknown_hashes: list[dict[str, Any]] = []
+
+        for c in sorted(ws_colls):
+            if c in known_paths:
+                src_path = known_paths[c]
+                if os.path.exists(src_path):
+                    kept.append({
+                        "kind": "collection",
+                        "id": c,
+                        "path": src_path,
+                        "kept_because": "path_exists"
+                    })
+                else:
+                    norm_slash = src_path.replace("\\", "/")
+                    is_worktree = (
+                        "/.kilo/worktrees/" in norm_slash or
+                        "/.kilo-worktrees/" in norm_slash or
+                        norm_slash.endswith("/.kilo/worktrees") or
+                        src_path.startswith(os.path.join(repo_root, ".kilo", "worktrees"))
+                    )
+                    if is_worktree:
+                        candidates.append({
+                            "kind": "collection",
+                            "id": c,
+                            "path": src_path,
+                            "action": "delete_collection",
+                            "reason": f"Removed worktree path does not exist: {src_path}"
+                        })
+                    else:
+                        kept.append({
+                            "kind": "collection",
+                            "id": c,
+                            "path": src_path,
+                            "kept_because": "not_a_worktree_path"
+                        })
+            else:
+                unknown_hashes.append({
+                    "kind": "collection",
+                    "id": c,
+                    "reason": "unknown_hash"
+                })
+
+        plan_data = json.dumps(candidates, sort_keys=True)
+        calculated_plan_hash = hashlib.sha256(plan_data.encode("utf-8")).hexdigest()[:16]
+
+        skipped: list[dict[str, Any]] = [
+            {"id": k["id"], "kind": k.get("kind", "collection"), "reason": k.get("kept_because", "kept")} for k in kept
+        ] + [
+            {"id": u["id"], "kind": "collection", "reason": "unknown_hash"} for u in unknown_hashes
+        ]
+
+        if dry_run:
+            return json.dumps({
+                "prune_orphans": True,
+                "dry_run": True,
+                "plan_hash": calculated_plan_hash,
+                "working_directory": repo_root,
+                "candidates_count": len(candidates),
+                "candidates": candidates,
+                "kept_count": len(kept),
+                "kept": kept,
+                "unknown_count": len(unknown_hashes),
+                "unknown_hashes": unknown_hashes,
+                "deleted_collections": [],
+                "deleted_sessions": [],
+                "skipped": skipped,
+                "instructions": f"To execute this plan, re-run kilo_cleanup with prune_orphans=True, dry_run=False and plan_hash='{calculated_plan_hash}'."
+            }, indent=2)
+
+        # Execution (dry_run == False)
+        if not plan_hash:
+            return json.dumps({
+                "error": "plan_hash is required when dry_run=False. First run with dry_run=True to obtain the plan_hash."
+            })
+        if plan_hash != calculated_plan_hash:
+            return json.dumps({
+                "error": f"plan_hash mismatch: provided '{plan_hash}', but current state yields '{calculated_plan_hash}'. "
+                         "Qdrant/worktree state has changed since preview. Run dry_run=True again to re-plan."
+            })
+
+        executed_actions: list[dict[str, Any]] = []
+        deleted_collections: list[str] = []
+        deleted_sessions: list[str] = []
+
+        for item in candidates:
+            coll_id = item["id"]
+            res = _delete_qdrant_collection(coll_id, qdrant_url=qdrant_url, api_key=api_key)
+            executed_actions.append(res)
+            if res.get("success"):
+                deleted_collections.append(coll_id)
+            else:
+                skipped.append({
+                    "id": coll_id,
+                    "kind": "collection",
+                    "reason": f"delete_failed: {res.get('error')}"
+                })
+
+        if delete_sessions:
+            for item in candidates:
+                wt_p = item.get("path")
+                if wt_p and wt_p in path_to_sessions:
+                    for s_id in path_to_sessions[wt_p]:
+                        rc_s, out_s, err_s = await _run_kilo(["kilo", "session", "delete", s_id], cwd=repo_root, env=env)
+                        executed_actions.append({
+                            "id": s_id,
+                            "worktree": wt_p,
+                            "action": "kilo session delete",
+                            "success": (rc_s == 0),
+                            "output": out_s or err_s
+                        })
+                        if rc_s == 0:
+                            deleted_sessions.append(s_id)
+                        else:
+                            skipped.append({
+                                "id": s_id,
+                                "kind": "session",
+                                "reason": f"session_delete_failed: {out_s or err_s}"
+                            })
+
+        audit_file = pathlib.Path(repo_root) / ".kilo" / f"cleanup-prune-{int(time.time())}.json"
+        audit_file.parent.mkdir(parents=True, exist_ok=True)
+        audit_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": "prune_orphans",
+            "working_directory": repo_root,
+            "plan_hash": plan_hash,
+            "candidates": candidates,
+            "executed_actions": executed_actions,
+            "deleted_collections": deleted_collections,
+            "deleted_sessions": deleted_sessions,
+            "skipped": skipped,
+        }
+        audit_file.write_text(json.dumps(audit_data, indent=2), encoding="utf-8")
+
+        return json.dumps({
+            "prune_orphans": True,
+            "dry_run": False,
+            "plan_hash": plan_hash,
+            "working_directory": repo_root,
+            "executed_count": len(executed_actions),
+            "executed_actions": executed_actions,
+            "deleted_collections": deleted_collections,
+            "deleted_sessions": deleted_sessions,
+            "skipped": skipped,
+            "audit_file": str(audit_file)
+        }, indent=2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Standard Mode: git worktree, branch, process, and session cleanup
+    # ─────────────────────────────────────────────────────────────────────────
     # Resolve target base branch (main/master or explicit)
     target_base = base_branch
     if not target_base:
@@ -3588,13 +4001,16 @@ async def kilo_cleanup(
                     continue
 
                 # Candidate for removal!
-                candidates.append({
+                candidate_wt: dict[str, Any] = {
                     "kind": "worktree",
                     "id": wt_path,
                     "branch": bname,
                     "action": "git worktree remove",
-                    "reason": f"Clean and merged into {target_base}"
-                })
+                    "reason": f"Clean and merged into {target_base}",
+                }
+                if delete_collection:
+                    candidate_wt["collection"] = _kilo_workspace_collection_name(wt_path)
+                candidates.append(candidate_wt)
                 candidate_wt_paths.add(wt_path)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -3647,9 +4063,54 @@ async def kilo_cleanup(
                         "reason": f"Orphan process running in removed worktree {wt_path}"
                     })
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # 4. Inspect Sessions (associated with removed worktrees)
+    # ─────────────────────────────────────────────────────────────────────────
+    if delete_sessions and candidate_wt_paths:
+        all_sessions = await _list_kilo_sessions(repo_root, env)
+        for s in all_sessions:
+            s_id = s.get("id")
+            if not s_id:
+                continue
+            s_dir = _normalize_workspace_path(s.get("directory", ""))
+            for wt_path in candidate_wt_paths:
+                if s_dir == wt_path or s_dir.startswith(wt_path + os.sep):
+                    candidates.append({
+                        "kind": "session",
+                        "id": s_id,
+                        "worktree": wt_path,
+                        "action": "kilo session delete",
+                        "reason": f"Session associated with removed worktree {wt_path}"
+                    })
+
     # Calculate deterministic plan hash
     plan_data = json.dumps(candidates, sort_keys=True)
     calculated_plan_hash = hashlib.sha256(plan_data.encode("utf-8")).hexdigest()[:16]
+
+    # Build skipped items list
+    skipped: list[dict[str, Any]] = [
+        {"kind": item["kind"], "id": item["id"], "reason": item.get("kept_because", "kept")}
+        for item in kept
+    ] + [
+        {"kind": item["kind"], "id": item["id"], "reason": item.get("reason", "leftover_work")}
+        for item in leftovers
+    ]
+    if not delete_collection:
+        for wt_path in candidate_wt_paths:
+            skipped.append({
+                "kind": "collection",
+                "id": _kilo_workspace_collection_name(wt_path),
+                "worktree": wt_path,
+                "reason": "delete_collection=False"
+            })
+    if not delete_sessions:
+        for wt_path in candidate_wt_paths:
+            skipped.append({
+                "kind": "session",
+                "id": f"sessions:{wt_path}",
+                "worktree": wt_path,
+                "reason": "delete_sessions=False"
+            })
 
     # Dry-run return
     if dry_run:
@@ -3664,6 +4125,9 @@ async def kilo_cleanup(
             "kept": kept,
             "leftovers_count": len(leftovers),
             "leftover_work": leftovers,
+            "deleted_collections": [],
+            "deleted_sessions": [],
+            "skipped": skipped,
             "instructions": f"To execute this plan, re-run kilo_cleanup with dry_run=False and plan_hash='{calculated_plan_hash}'."
         }, indent=2)
 
@@ -3682,6 +4146,8 @@ async def kilo_cleanup(
         })
 
     executed_actions: list[dict[str, Any]] = []
+    deleted_collections: list[str] = []
+    deleted_sessions: list[str] = []
 
     # 1. Kill orphan processes first
     for item in candidates:
@@ -3705,7 +4171,44 @@ async def kilo_cleanup(
                 "output": out_rm or err_rm
             })
 
-    # 3. Delete merged branches (safe -d only)
+            # Delete Qdrant collection if delete_collection is True (default)
+            if delete_collection and rc_rm == 0:
+                coll_name = _kilo_workspace_collection_name(wt_path)
+                coll_res = _delete_qdrant_collection(coll_name)
+                executed_actions.append(coll_res)
+                if coll_res.get("success"):
+                    deleted_collections.append(coll_name)
+                else:
+                    skipped.append({
+                        "kind": "collection",
+                        "id": coll_name,
+                        "worktree": wt_path,
+                        "reason": f"delete_collection_error: {coll_res.get('error')}"
+                    })
+
+    # 3. Delete sessions (if delete_sessions=True)
+    if delete_sessions:
+        for item in candidates:
+            if item["kind"] == "session":
+                sess_id = item["id"]
+                rc_s, out_s, err_s = await _run_kilo(["kilo", "session", "delete", sess_id], cwd=repo_root, env=env)
+                executed_actions.append({
+                    "id": sess_id,
+                    "worktree": item.get("worktree"),
+                    "action": "kilo session delete",
+                    "success": (rc_s == 0),
+                    "output": out_s or err_s
+                })
+                if rc_s == 0:
+                    deleted_sessions.append(sess_id)
+                else:
+                    skipped.append({
+                        "kind": "session",
+                        "id": sess_id,
+                        "reason": f"session_delete_failed: {out_s or err_s}"
+                    })
+
+    # 4. Delete merged branches (safe -d only)
     for item in candidates:
         if item["kind"] == "branch":
             bname = item["id"]
@@ -3727,7 +4230,10 @@ async def kilo_cleanup(
         "plan_hash": plan_hash,
         "candidates": candidates,
         "executed_actions": executed_actions,
+        "deleted_collections": deleted_collections,
+        "deleted_sessions": deleted_sessions,
         "leftovers_kept": leftovers,
+        "skipped": skipped,
     }
     audit_file.write_text(json.dumps(audit_data, indent=2), encoding="utf-8")
 
@@ -3737,6 +4243,9 @@ async def kilo_cleanup(
         "working_directory": repo_root,
         "executed_count": len(executed_actions),
         "executed_actions": executed_actions,
+        "deleted_collections": deleted_collections,
+        "deleted_sessions": deleted_sessions,
+        "skipped": skipped,
         "audit_file": str(audit_file),
         "leftover_work_protected": len(leftovers),
     }, indent=2)

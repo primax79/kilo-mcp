@@ -2175,4 +2175,431 @@ def test_kilo_cleanup_dry_run_and_apply(tmp_path):
     assert not any(c["id"] == wt_merged for c in res_idempotent["candidates"])
 
 
+def test_path_normalisation_matches_kilo():
+    """Verify workspace path normalization and Qdrant collection hash calculation
+    matches Kilo's qdrant-client.ts and FSUtil.resolve exactly."""
+    # Test 1: gcube_repos known hash
+    c1 = server._kilo_workspace_collection_name("/Users/Alfredo/works/gcube_repos")
+    assert c1 == "ws-21327b19f043c6a7"
+
+    # Test 2: gcube_atlas known hash
+    c2 = server._kilo_workspace_collection_name("/Users/Alfredo/works/gcube_atlas")
+    assert c2 == "ws-e2499c9ce8d6a71c"
+
+    # Test 3: trailing slash stripped
+    c3 = server._kilo_workspace_collection_name("/Users/Alfredo/works/gcube_repos/")
+    assert c3 == "ws-21327b19f043c6a7"
+
+    # Test 4: known worktree path
+    c4 = server._kilo_workspace_collection_name(
+        "/Users/Alfredo/works/ai-coding-tools/ai-swissknife/.kilo/worktrees/kilo/29.5-object-shaped-config-and-command"
+    )
+    assert c4 == "ws-00356f2dacdbf06d"
+
+
+def test_cleanup_default_deletes_collection(tmp_path, monkeypatch):
+    """Default kilo_cleanup (delete_collection=True) sends DELETE /collections/ws-<hash>."""
+    repo = _init_git_repo(tmp_path / "repo")
+    base_branch = "master" if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "master"], capture_output=True).returncode == 0 else "main"
+
+    wt_clean = os.path.join(repo, ".kilo", "worktrees", "feat-clean")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat-clean", wt_clean], check=True, capture_output=True)
+    with open(os.path.join(wt_clean, "f.txt"), "w") as f:
+        f.write("clean\n")
+    subprocess.run(["git", "-C", wt_clean, "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", wt_clean, "commit", "-q", "-m", "feat clean"], check=True)
+    subprocess.run(["git", "-C", repo, "merge", "--no-ff", "feat-clean", "-m", "merge clean"], check=True, capture_output=True)
+
+    expected_coll = server._kilo_workspace_collection_name(wt_clean)
+    http_calls = []
+
+    class FakeResp:
+        def __init__(self):
+            self.status = 200
+        def read(self):
+            return b'{"result": true}'
+        def getcode(self):
+            return 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    def fake_urlopen(req, timeout=10):
+        http_calls.append({"url": req.full_url, "method": req.get_method()})
+        return FakeResp()
+
+    monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+
+    # Dry-run
+    res_dry = json.loads(asyncio.run(server.kilo_cleanup(working_directory=repo, dry_run=True, base_branch=base_branch)))
+    assert len(http_calls) == 0
+    assert any(c["id"] == wt_clean and c.get("collection") == expected_coll for c in res_dry["candidates"])
+
+    # Apply
+    res_apply = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        dry_run=False,
+        plan_hash=res_dry["plan_hash"],
+        base_branch=base_branch,
+    )))
+
+    assert res_apply["dry_run"] is False
+    assert not os.path.exists(wt_clean)
+    assert any(call["method"] == "DELETE" and expected_coll in call["url"] for call in http_calls)
+    assert expected_coll in res_apply["deleted_collections"]
+
+
+def test_cleanup_collection_404_tolerated(tmp_path, monkeypatch):
+    """404 when deleting Qdrant collection is treated as already gone and not fatal."""
+    repo = _init_git_repo(tmp_path / "repo")
+    base_branch = "master" if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "master"], capture_output=True).returncode == 0 else "main"
+
+    wt_clean = os.path.join(repo, ".kilo", "worktrees", "feat-404")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat-404", wt_clean], check=True, capture_output=True)
+    with open(os.path.join(wt_clean, "f.txt"), "w") as f:
+        f.write("test\n")
+    subprocess.run(["git", "-C", wt_clean, "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", wt_clean, "commit", "-q", "-m", "feat 404"], check=True)
+    subprocess.run(["git", "-C", repo, "merge", "--no-ff", "feat-404", "-m", "merge"], check=True, capture_output=True)
+
+    expected_coll = server._kilo_workspace_collection_name(wt_clean)
+
+    import io
+    def fake_urlopen_404(req, timeout=10):
+        if req.get_method() == "DELETE":
+            fp = io.BytesIO(b'{"status": "error", "message": "Not found"}')
+            raise server.urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, fp)
+        raise server.urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen_404)
+
+    res_dry = json.loads(asyncio.run(server.kilo_cleanup(working_directory=repo, dry_run=True, base_branch=base_branch)))
+    res_apply = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        dry_run=False,
+        plan_hash=res_dry["plan_hash"],
+        base_branch=base_branch,
+    )))
+
+    assert not os.path.exists(wt_clean)
+    assert expected_coll in res_apply["deleted_collections"]
+    coll_action = next(a for a in res_apply["executed_actions"] if a.get("action") == "delete_collection")
+    assert coll_action["status"] == "already_deleted"
+    assert coll_action["success"] is True
+
+
+def test_cleanup_collection_error_reported_but_worktree_still_removed(tmp_path, monkeypatch):
+    """Qdrant error (500 or connection error) is reported, never fatal to worktree removal."""
+    repo = _init_git_repo(tmp_path / "repo")
+    base_branch = "master" if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "master"], capture_output=True).returncode == 0 else "main"
+
+    wt_clean = os.path.join(repo, ".kilo", "worktrees", "feat-err")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat-err", wt_clean], check=True, capture_output=True)
+    with open(os.path.join(wt_clean, "f.txt"), "w") as f:
+        f.write("err\n")
+    subprocess.run(["git", "-C", wt_clean, "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", wt_clean, "commit", "-q", "-m", "feat err"], check=True)
+    subprocess.run(["git", "-C", repo, "merge", "--no-ff", "feat-err", "-m", "merge"], check=True, capture_output=True)
+
+    expected_coll = server._kilo_workspace_collection_name(wt_clean)
+
+    def fake_urlopen_err(req, timeout=10):
+        raise server.urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen_err)
+
+    res_dry = json.loads(asyncio.run(server.kilo_cleanup(working_directory=repo, dry_run=True, base_branch=base_branch)))
+    res_apply = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        dry_run=False,
+        plan_hash=res_dry["plan_hash"],
+        base_branch=base_branch,
+    )))
+
+    # Worktree was still removed!
+    assert not os.path.exists(wt_clean)
+    # Collection error is recorded in executed_actions and skipped
+    coll_action = next(a for a in res_apply["executed_actions"] if a.get("action") == "delete_collection")
+    assert coll_action["success"] is False
+    assert "Connection refused" in coll_action["error"]
+    assert expected_coll not in res_apply["deleted_collections"]
+    assert any(s["id"] == expected_coll for s in res_apply["skipped"])
+
+
+def test_cleanup_delete_sessions_false_never_calls_session_delete(tmp_path, monkeypatch):
+    """delete_sessions=False never calls `kilo session delete`."""
+    repo = _init_git_repo(tmp_path / "repo")
+    base_branch = "master" if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "master"], capture_output=True).returncode == 0 else "main"
+
+    wt_clean = os.path.join(repo, ".kilo", "worktrees", "feat-no-sess")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat-no-sess", wt_clean], check=True, capture_output=True)
+    with open(os.path.join(wt_clean, "f.txt"), "w") as f:
+        f.write("x\n")
+    subprocess.run(["git", "-C", wt_clean, "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", wt_clean, "commit", "-q", "-m", "clean"], check=True)
+    subprocess.run(["git", "-C", repo, "merge", "--no-ff", "feat-no-sess", "-m", "merge"], check=True, capture_output=True)
+
+    session_delete_calls = []
+    original_run_kilo = server._run_kilo
+
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        if len(cmd) >= 3 and cmd[0] == "kilo" and cmd[1] == "session" and cmd[2] == "delete":
+            session_delete_calls.append(cmd)
+            return (0, "", "")
+        return await original_run_kilo(cmd, cwd, env, on_start=on_start)
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    # Dry-run with delete_sessions=False (default)
+    res_dry = json.loads(asyncio.run(server.kilo_cleanup(working_directory=repo, dry_run=True, base_branch=base_branch, delete_sessions=False)))
+    assert not any(c.get("kind") == "session" for c in res_dry["candidates"])
+
+    # Apply
+    res_apply = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        dry_run=False,
+        plan_hash=res_dry["plan_hash"],
+        base_branch=base_branch,
+        delete_sessions=False,
+    )))
+
+    assert len(session_delete_calls) == 0
+    assert res_apply["deleted_sessions"] == []
+
+
+def test_cleanup_delete_sessions_true_calls_only_for_worktree_sessions(tmp_path, monkeypatch):
+    """delete_sessions=True deletes sessions matching removed worktree and leaves others alone."""
+    repo = _init_git_repo(tmp_path / "repo")
+    base_branch = "master" if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "master"], capture_output=True).returncode == 0 else "main"
+
+    wt_clean = os.path.join(repo, ".kilo", "worktrees", "feat-sess")
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat-sess", wt_clean], check=True, capture_output=True)
+    with open(os.path.join(wt_clean, "f.txt"), "w") as f:
+        f.write("x\n")
+    subprocess.run(["git", "-C", wt_clean, "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", wt_clean, "commit", "-q", "-m", "clean"], check=True)
+    subprocess.run(["git", "-C", repo, "merge", "--no-ff", "feat-sess", "-m", "merge"], check=True, capture_output=True)
+
+    sessions_db = [
+        {"id": "ses_wt_1", "directory": wt_clean},
+        {"id": "ses_wt_2", "directory": os.path.join(wt_clean, "sub")},
+        {"id": "ses_other", "directory": "/some/other/repo/.kilo/worktrees/task"},
+        {"id": "ses_main", "directory": repo},
+    ]
+
+    deleted_session_ids = []
+    original_run_kilo = server._run_kilo
+
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        if len(cmd) >= 4 and cmd[:4] == ["kilo", "session", "list", "--format"]:
+            return (0, json.dumps(sessions_db), "")
+        if len(cmd) >= 3 and cmd[:3] == ["kilo", "session", "delete"]:
+            deleted_session_ids.append(cmd[3])
+            return (0, f"Deleted session {cmd[3]}", "")
+        return await original_run_kilo(cmd, cwd, env, on_start=on_start)
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    res_dry = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        dry_run=True,
+        base_branch=base_branch,
+        delete_sessions=True,
+    )))
+
+    session_cands = [c["id"] for c in res_dry["candidates"] if c.get("kind") == "session"]
+    assert "ses_wt_1" in session_cands
+    assert "ses_wt_2" in session_cands
+    assert "ses_other" not in session_cands
+    assert "ses_main" not in session_cands
+
+    # Apply
+    res_apply = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        dry_run=False,
+        plan_hash=res_dry["plan_hash"],
+        base_branch=base_branch,
+        delete_sessions=True,
+    )))
+
+    assert "ses_wt_1" in deleted_session_ids
+    assert "ses_wt_2" in deleted_session_ids
+    assert "ses_other" not in deleted_session_ids
+    assert "ses_main" not in deleted_session_ids
+    assert set(res_apply["deleted_sessions"]) == {"ses_wt_1", "ses_wt_2"}
+
+
+def test_cleanup_prune_dry_run_deletes_nothing(tmp_path, monkeypatch):
+    """prune mode dry-run lists identified removed-worktree collections and deletes nothing."""
+    repo = _init_git_repo(tmp_path / "repo")
+    removed_wt = os.path.join(repo, ".kilo", "worktrees", "removed-task")
+    existing_wt = os.path.join(repo, ".kilo", "worktrees", "existing-task")
+    os.makedirs(existing_wt, exist_ok=True)
+
+    coll_removed = server._kilo_workspace_collection_name(removed_wt)
+    coll_existing = server._kilo_workspace_collection_name(existing_wt)
+    coll_unknown = "ws-1111222233334444"
+
+    qdrant_collections = [
+        {"name": coll_removed},
+        {"name": coll_existing},
+        {"name": coll_unknown},
+        {"name": "not-a-ws-collection"},
+    ]
+
+    http_calls = []
+
+    class FakeResp:
+        def __init__(self, data):
+            self.data = json.dumps(data).encode("utf-8")
+            self.status = 200
+        def read(self):
+            return self.data
+        def getcode(self):
+            return 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    def fake_urlopen(req, timeout=10):
+        http_calls.append({"url": req.full_url, "method": req.get_method()})
+        if req.get_method() == "GET" and "/collections" in req.full_url:
+            return FakeResp({"result": {"collections": qdrant_collections}})
+        raise RuntimeError(f"Unexpected HTTP call: {req.get_method()} {req.full_url}")
+
+    monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+
+    sessions_db = [
+        {"id": "ses_rem", "directory": removed_wt},
+        {"id": "ses_ext", "directory": existing_wt},
+    ]
+
+    original_run_kilo = server._run_kilo
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        if len(cmd) >= 4 and cmd[:4] == ["kilo", "session", "list", "--format"]:
+            return (0, json.dumps(sessions_db), "")
+        return await original_run_kilo(cmd, cwd, env, on_start=on_start)
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    res_raw = asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        prune_orphans=True,
+        dry_run=True,
+    ))
+    res = json.loads(res_raw)
+
+    assert res["prune_orphans"] is True
+    assert res["dry_run"] is True
+    # Prune dry-run must NOT perform any DELETE
+    assert not any(c["method"] == "DELETE" for c in http_calls)
+    assert res["deleted_collections"] == []
+
+    # Candidates only has the removed worktree collection
+    cand_ids = [c["id"] for c in res["candidates"]]
+    assert coll_removed in cand_ids
+    assert coll_existing not in cand_ids
+    assert coll_unknown not in cand_ids
+
+    # Kept has the existing worktree
+    kept_ids = [k["id"] for k in res["kept"]]
+    assert coll_existing in kept_ids
+
+    # Unknown hashes has the unknown collection
+    unk_ids = [u["id"] for u in res["unknown_hashes"]]
+    assert coll_unknown in unk_ids
+
+
+def test_cleanup_prune_deletes_only_identified_removed_worktree_collections(tmp_path, monkeypatch):
+    """prune mode execution deletes only identified removed-worktree collections, never unknown hashes."""
+    repo = _init_git_repo(tmp_path / "repo")
+    removed_wt = os.path.join(repo, ".kilo", "worktrees", "task-to-prune")
+    existing_wt = os.path.join(repo, ".kilo", "worktrees", "live-task")
+    os.makedirs(existing_wt, exist_ok=True)
+    non_wt_path = os.path.join(tmp_path, "deleted-regular-folder")
+
+    coll_removed = server._kilo_workspace_collection_name(removed_wt)
+    coll_existing = server._kilo_workspace_collection_name(existing_wt)
+    coll_non_wt = server._kilo_workspace_collection_name(non_wt_path)
+    coll_unknown = "ws-9999888877776666"
+
+    qdrant_collections = [
+        {"name": coll_removed},
+        {"name": coll_existing},
+        {"name": coll_non_wt},
+        {"name": coll_unknown},
+    ]
+
+    deleted_urls = []
+
+    class FakeResp:
+        def __init__(self, data):
+            self.data = json.dumps(data).encode("utf-8")
+            self.status = 200
+        def read(self):
+            return self.data
+        def getcode(self):
+            return 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    def fake_urlopen(req, timeout=10):
+        if req.get_method() == "GET" and "/collections" in req.full_url:
+            return FakeResp({"result": {"collections": qdrant_collections}})
+        if req.get_method() == "DELETE":
+            deleted_urls.append(req.full_url)
+            return FakeResp({"result": True})
+        raise RuntimeError(f"Unexpected HTTP call: {req.get_method()} {req.full_url}")
+
+    monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+
+    sessions_db = [
+        {"id": "ses_rem", "directory": removed_wt},
+        {"id": "ses_ext", "directory": existing_wt},
+        {"id": "ses_non_wt", "directory": non_wt_path},
+    ]
+
+    original_run_kilo = server._run_kilo
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        if len(cmd) >= 4 and cmd[:4] == ["kilo", "session", "list", "--format"]:
+            return (0, json.dumps(sessions_db), "")
+        return await original_run_kilo(cmd, cwd, env, on_start=on_start)
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    # 1. Preview (dry_run=True)
+    res_dry = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        prune_orphans=True,
+        dry_run=True,
+    )))
+
+    assert len(deleted_urls) == 0
+    assert len(res_dry["candidates"]) == 1
+    assert res_dry["candidates"][0]["id"] == coll_removed
+
+    # 2. Apply (dry_run=False)
+    res_apply = json.loads(asyncio.run(server.kilo_cleanup(
+        working_directory=repo,
+        prune_orphans=True,
+        dry_run=False,
+        plan_hash=res_dry["plan_hash"],
+    )))
+
+    assert res_apply["dry_run"] is False
+    assert res_apply["deleted_collections"] == [coll_removed]
+    # Check that ONLY coll_removed was requested for DELETE
+    assert len(deleted_urls) == 1
+    assert coll_removed in deleted_urls[0]
+    # Confirm unknown and non-wt were never deleted
+    assert not any(coll_unknown in u for u in deleted_urls)
+    assert not any(coll_existing in u for u in deleted_urls)
+    assert not any(coll_non_wt in u for u in deleted_urls)
+
+
+
 
