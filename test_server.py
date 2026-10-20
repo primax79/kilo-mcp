@@ -341,6 +341,10 @@ def test_kilo_implement_file_content(tmp_path, monkeypatch, fake_data_dir):
     idx_report = content.find("## Final Report (mandatory)")
     
     assert -1 < idx_context < idx_task < idx_hints < idx_skills < idx_report
+    # Protected config files are announced right before the report
+    idx_protected = content.find("## Protected files (never edit)")
+    assert idx_skills < idx_protected < idx_report
+    assert "AGENTS.md.proposed" in content
 
 def test_kilo_implement_bad_dir():
     res = asyncio.run(server.kilo_implement(
@@ -2741,3 +2745,27 @@ def test_kilo_implement_refuses_subagent_explore(tmp_path):
 
 
 
+
+
+def test_protected_paths_warning_detects_config_files():
+    w = server._protected_paths_warning("Create AGENTS.md with the build commands", None)
+    assert "PROTECTED FILES" in w and "AGENTS.md" in w
+    w = server._protected_paths_warning("Edit the agent definition", [".kilo/agent/x.md"])
+    assert ".kilo/ or .kilocode/" in w
+    w = server._protected_paths_warning("Update kilo.jsonc permissions", None)
+    assert "kilo.jsonc" in w
+
+
+def test_protected_paths_warning_ignores_plans_and_other_files():
+    assert server._protected_paths_warning("Write the plan to .kilo/plans/p.md", None) == ""
+    assert server._protected_paths_warning("Edit README.md and docs/agents-notes.md", ["src/a.py"]) == ""
+    assert server._protected_paths_warning("Use MY_AGENTS.mdx naming", None) == ""
+
+
+def test_kilo_implement_warns_on_protected_files(tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch):
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Create AGENTS.md at the repository root", working_directory=str(tmp_path),
+        background=False,
+    ))
+    assert "PROTECTED FILES" in res

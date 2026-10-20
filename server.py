@@ -1334,6 +1334,14 @@ same repo. If you don't isolate, the response is prefixed with a collision
 warning whenever another task is already running against the exact same
 `working_directory` — treat that warning as a stop sign, not a formality.
 
+⚠️ PROTECTED CONFIG FILES: Kilo always asks for approval before editing the
+project-root `AGENTS.md`, `kilo.json(c)`, `opencode.json(c)`, or anything
+under `.kilo/` or `.kilocode/` (except `.kilo/plans/`), whatever the
+permissions say. A non-interactive run auto-rejects that ask and ENDS, with
+no Final Report and no commit. The delegated prompt therefore tells Kilo to
+write the intended content to `<path>.proposed` instead; apply it yourself.
+Don't ask Kilo to edit those files directly.
+
 Returns a text report: `Exit Code` (0 = success, None = timed out), `STDOUT`
 (Kilo's final report), `STDERR` (the run trace)."""
     + "\n\n## When to delegate\n"
@@ -1570,6 +1578,7 @@ async def kilo_implement(
         cwd = worktree_path
     else:
         collision_warning = _collision_warning(cwd, exclude_run_id=run_id)
+    collision_warning = _protected_paths_warning(task_instructions, focus_files) + collision_warning
 
     # Section order is deliberate: context files first (read before acting),
     # then the task, then strategy, then skills, and finally the report
@@ -1592,6 +1601,15 @@ async def kilo_implement(
             "Load and follow each of these skills before starting the task:\n"
             f"{skill_list}"
         )
+    sections.append(
+        "## Protected files (never edit)\n"
+        "Do not create, edit or delete the project-root AGENTS.md, kilo.json, kilo.jsonc, "
+        "opencode.json or opencode.jsonc, or anything under .kilo/ or .kilocode/ (except "
+        ".kilo/plans/). This run is unattended: the approval ask for those files is rejected "
+        "and the run ends. When the task needs such a change, write the full intended content "
+        "to `<path>.proposed` (e.g. AGENTS.md.proposed), keep working, and list it under "
+        "Issues in the Final Report."
+    )
     sections.append(
         "## Final Report (mandatory)\n"
         "Your final message MUST be a report with exactly these sections:\n"
@@ -1862,6 +1880,34 @@ def _find_running_tasks_for_cwd(cwd: str, exclude_run_id: Optional[str] = None) 
         if other_dir and os.path.realpath(other_dir) == target:
             matches.append((task_id, record))
     return matches
+
+
+# Files Kilo's ConfigProtection always asks about (packages/opencode/src/kilocode/
+# permission/config-paths.ts): an unattended `kilo run` auto-rejects the ask and
+# ends the run.
+_PROTECTED_ROOT_FILES = ("AGENTS.md", "kilo.json", "kilo.jsonc", "opencode.json", "opencode.jsonc")
+_PROTECTED_DIR_RE = re.compile(r"(?:^|[\s/`'\"(])\.kilo(?:code)?/(?!plans/)")
+_PROTECTED_FILE_RE = re.compile(
+    r"(?:^|[\s`'\"(./])(" + "|".join(re.escape(n) for n in _PROTECTED_ROOT_FILES) + r")\b"
+)
+
+
+def _protected_paths_warning(task_instructions: str, focus_files: Optional[list[str]]) -> str:
+    """Warn when a spec or its focus files mention a file Kilo will refuse to
+    edit unattended. Heuristic and advisory: the prompt already tells Kilo to
+    write `<path>.proposed` instead."""
+    text = (task_instructions or "") + "\n" + "\n".join(focus_files or [])
+    hits = sorted(set(_PROTECTED_FILE_RE.findall(text)))
+    if _PROTECTED_DIR_RE.search(text):
+        hits.append(".kilo/ or .kilocode/")
+    if not hits:
+        return ""
+    return (
+        "⚠️ PROTECTED FILES: the spec mentions " + ", ".join(hits) + ". Kilo never edits the "
+        "project-root AGENTS.md, kilo.json(c), opencode.json(c) or files under .kilo/ / .kilocode/ "
+        "in an unattended run (the approval ask is auto-rejected and the run ends). It has been told "
+        "to write `<path>.proposed` instead; apply those files yourself after the run.\n\n"
+    )
 
 
 def _collision_warning(cwd: str, exclude_run_id: str) -> str:
