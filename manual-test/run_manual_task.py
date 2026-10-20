@@ -36,7 +36,7 @@ TASK_SPEC_PATH = os.path.join(HERE, "task-spec.md")
 KILO_SESSION_DB = os.path.expanduser("~/.local/share/kilo/kilo.db")
 
 AGENT = "code"
-MODEL = "google/gemini-3.5-flash"  # keep in sync with server.py's DEFAULT_MODEL
+MODEL = "google/gemini-3.8-flash"  # keep in sync with server.py's DEFAULT_MODEL
 
 
 def find_session_id(cwd, started_ms, buffer_ms=5000):

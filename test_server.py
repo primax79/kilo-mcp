@@ -1450,7 +1450,7 @@ def test_load_config_file_uses_fallback_when_tomllib_missing(tmp_path, monkeypat
     """_load_config_file must fall back to _minimal_toml_load (instead of
     silently returning {}) when tomllib cannot be imported."""
     cfg_path = tmp_path / "config.toml"
-    cfg_path.write_text('[kilo]\ndefault_model = "google/gemini-3.1-pro-preview"\n')
+    cfg_path.write_text('[kilo]\ndefault_model = "google/gemini-4-argon"\n')
     monkeypatch.setattr(server, "_config_file_candidates", lambda: [str(cfg_path)])
 
     real_import = __import__
@@ -1461,15 +1461,15 @@ def test_load_config_file_uses_fallback_when_tomllib_missing(tmp_path, monkeypat
     monkeypatch.setattr("builtins.__import__", blocked_import)
 
     cfg = server._load_config_file()
-    assert cfg["kilo"]["default_model"] == "google/gemini-3.1-pro-preview"
+    assert cfg["kilo"]["default_model"] == "google/gemini-4-argon"
     assert cfg["_source"] == str(cfg_path)
 
 
 def test_upsert_toml_string_key_creates_file_and_section(tmp_path):
     path = str(tmp_path / "new.toml")
-    server._upsert_toml_string_key(path, "kilo", "default_model", "google/gemini-3.5-flash")
+    server._upsert_toml_string_key(path, "kilo", "default_model", "google/gemini-3.8-flash")
     cfg = server._minimal_toml_load(path)
-    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.8-flash"
 
 
 def test_upsert_toml_string_key_replaces_existing_and_preserves_rest(tmp_path):
@@ -1477,29 +1477,29 @@ def test_upsert_toml_string_key_replaces_existing_and_preserves_rest(tmp_path):
     path.write_text(
         '[kilo]\n'
         'timeout = 1800\n'
-        'default_model = "google/gemini-3.5-flash"\n'
+        'default_model = "google/gemini-3.8-flash"\n'
         '\n'
         '[metrics]\n'
         'chars_per_token = 4.0\n'
     )
-    server._upsert_toml_string_key(str(path), "kilo", "default_model", "google/gemini-3.1-pro-preview")
+    server._upsert_toml_string_key(str(path), "kilo", "default_model", "google/gemini-4-argon")
     text = path.read_text()
-    assert 'default_model = "google/gemini-3.1-pro-preview"' in text
+    assert 'default_model = "google/gemini-4-argon"' in text
     assert "timeout = 1800" in text  # untouched sibling key
     assert "[metrics]" in text and "chars_per_token = 4.0" in text  # untouched section
 
     cfg = server._minimal_toml_load(str(path))
-    assert cfg["kilo"]["default_model"] == "google/gemini-3.1-pro-preview"
+    assert cfg["kilo"]["default_model"] == "google/gemini-4-argon"
     assert cfg["kilo"]["timeout"] == 1800
 
 
 def test_upsert_toml_string_key_adds_new_key_to_existing_section(tmp_path):
     path = tmp_path / "config.toml"
-    path.write_text('[kilo]\ndefault_model = "google/gemini-3.5-flash"\n')
-    server._upsert_toml_string_key(str(path), "kilo", "complex_model", "google/gemini-3.1-pro-preview")
+    path.write_text('[kilo]\ndefault_model = "google/gemini-3.8-flash"\n')
+    server._upsert_toml_string_key(str(path), "kilo", "complex_model", "google/gemini-4-argon")
     cfg = server._minimal_toml_load(str(path))
-    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
-    assert cfg["kilo"]["complex_model"] == "google/gemini-3.1-pro-preview"
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.8-flash"
+    assert cfg["kilo"]["complex_model"] == "google/gemini-4-argon"
 
 
 def test_configure_models_interactive_writes_both_tiers(tmp_path, monkeypatch, capsys):
@@ -1512,20 +1512,20 @@ def test_configure_models_interactive_writes_both_tiers(tmp_path, monkeypatch, c
     monkeypatch.setenv("KILO_MCP_CONFIG", str(cfg_path))
     monkeypatch.setattr(server, "_CONFIG", {})
 
-    fake_models = "google/gemini-3.5-flash\ngoogle/gemini-3.1-pro-preview\nnot-a-model-line\n"
+    fake_models = "google/gemini-3.8-flash\ngoogle/gemini-4-argon\nnot-a-model-line\n"
     def fake_run(cmd, **kwargs):
         assert cmd == ["kilo", "models"]
         return subprocess.CompletedProcess(cmd, 0, stdout=fake_models, stderr="")
     monkeypatch.setattr(server.subprocess, "run", fake_run)
 
-    answers = iter(["google/gemini-3.5-flash", "google/gemini-3.1-pro-preview"])
+    answers = iter(["google/gemini-3.8-flash", "google/gemini-4-argon"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     server.configure_models_interactive()
 
     cfg = server._minimal_toml_load(str(cfg_path))
-    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
-    assert cfg["kilo"]["complex_model"] == "google/gemini-3.1-pro-preview"
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.8-flash"
+    assert cfg["kilo"]["complex_model"] == "google/gemini-4-argon"
     assert cfg["kilo"]["timeout"] == 1800  # untouched pre-existing key
     assert str(cfg_path) in capsys.readouterr().out
 
@@ -1539,7 +1539,7 @@ def test_configure_models_interactive_reprompts_on_unlisted_id(tmp_path, monkeyp
     monkeypatch.setenv("KILO_MCP_CONFIG", str(cfg_path))
     monkeypatch.setattr(server, "_CONFIG", {})
 
-    fake_models = "google/gemini-3.5-flash\n"
+    fake_models = "google/gemini-3.8-flash\n"
     monkeypatch.setattr(
         server.subprocess, "run",
         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=fake_models, stderr="")
@@ -1548,13 +1548,13 @@ def test_configure_models_interactive_reprompts_on_unlisted_id(tmp_path, monkeyp
     # First answer for the "simple" prompt is a typo'd id -> declines to use
     # it anyway -> re-prompted -> gives the real id. Second question: blank
     # (keeps current/default).
-    answers = iter(["google/gemini-typo", "n", "google/gemini-3.5-flash", ""])
+    answers = iter(["google/gemini-typo", "n", "google/gemini-3.8-flash", ""])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     server.configure_models_interactive()
 
     cfg = server._minimal_toml_load(str(cfg_path))
-    assert cfg["kilo"]["default_model"] == "google/gemini-3.5-flash"
+    assert cfg["kilo"]["default_model"] == "google/gemini-3.8-flash"
 
 
 # ==============================================================================
@@ -2643,6 +2643,100 @@ def test_worktree_git_metadata_and_cleanup_prune(tmp_path, fake_data_dir):
     assert "ses_meta123" not in am_after["sessions"]
     assert wt_id not in am_after.get("tabOrder", {})
     assert wt_id not in am_after.get("worktreeOrder", [])
+
+
+# ==============================================================================
+# 28. Model guidance (flash/argon only, banned refused) and agent parameter
+# ==============================================================================
+
+def test_default_model_is_flash():
+    assert server.DEFAULT_MODEL == "google/gemini-3.8-flash"
+    assert server.COMPLEX_MODEL == "google/gemini-4-argon"
+    assert "google/gemini-3.8-flash" in server.ALLOWED_MODELS
+    assert "google/gemini-4-argon" in server.ALLOWED_MODELS
+
+
+def test_is_banned_model():
+    assert server._is_banned_model("google/gemini-3.1-pro")
+    assert server._is_banned_model("google/gemini-3.1-pro-preview")
+    assert server._is_banned_model("google/gemini-3.1-pro-preview-customtools")
+    assert server._is_banned_model("google/gemini-flash-latest")
+    assert not server._is_banned_model("google/gemini-3.8-flash")
+    assert not server._is_banned_model("google/gemini-4-argon")
+
+
+@pytest.mark.parametrize("banned_model", [
+    "google/gemini-3.1-pro",
+    "google/gemini-3.1-pro-preview",
+    "google/gemini-3.1-pro-preview-customtools",
+    "google/gemini-flash-latest",
+])
+def test_banned_model_refused(tmp_path, banned_model):
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Perform test task",
+        working_directory=str(tmp_path),
+        model=banned_model,
+    ))
+    assert "Error:" in res
+    assert "banned by owner policy" in res
+    assert "google/gemini-3.8-flash" in res
+    assert "google/gemini-4-argon" in res
+
+
+def test_descriptions_mention_only_allowed_models():
+    # Tools should mention allowed models and not mention banned ones
+    tools = getattr(server.mcp, "_tool_manager", None)
+    if tools and hasattr(tools, "_tools"):
+        for name, tool in tools._tools.items():
+            desc = getattr(tool, "description", "") or ""
+            assert "gemini-flash-latest" not in desc, f"{name} mentions gemini-flash-latest"
+            assert "3.1-pro" not in desc, f"{name} mentions 3.1-pro"
+            assert "customtools" not in desc, f"{name} mentions customtools"
+
+    # kilo_implement and kilo_list_models docstrings/descriptions check
+    impl_doc = server.kilo_implement.__doc__ or ""
+    assert "gemini-flash-latest" not in impl_doc
+    assert "3.1-pro" not in impl_doc
+    assert "customtools" not in impl_doc
+
+    list_models_doc = server.kilo_list_models.__doc__ or ""
+    assert "google/gemini-3.8-flash" in list_models_doc
+    assert "google/gemini-4-argon" in list_models_doc
+    assert "gemini-flash-latest" not in list_models_doc
+    assert "3.1-pro" not in list_models_doc
+
+
+def test_build_kilo_run_argv_agent_explore():
+    cmd = server._build_kilo_run_argv("/path/to/spec.md", agent="explore")
+    assert "--agent" in cmd
+    idx = cmd.index("--agent")
+    assert cmd[idx + 1] == "explore"
+    # Verify 'code' is not in the built argv when agent='explore'
+    assert "code" not in cmd
+
+
+def test_build_kilo_run_argv_default_stays_code():
+    cmd_none = server._build_kilo_run_argv("/path/to/spec.md", agent=None)
+    assert "--agent" in cmd_none
+    idx = cmd_none.index("--agent")
+    assert cmd_none[idx + 1] == "code"
+
+    cmd_default = server._build_kilo_run_argv("/path/to/spec.md")
+    assert "--agent" in cmd_default
+    idx = cmd_default.index("--agent")
+    assert cmd_default[idx + 1] == "code"
+
+
+def test_kilo_implement_refuses_subagent_explore(tmp_path):
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Read-only explore task",
+        working_directory=str(tmp_path),
+        agent="explore",
+    ))
+    assert "Error:" in res
+    assert "subagent" in res.lower()
+    assert "explore" in res
+    assert "kilo_rag_search" in res
 
 
 

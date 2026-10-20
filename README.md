@@ -217,7 +217,7 @@ Scans for available Kilo skills (`SKILL.md` files). Claude can discover these to
 
 ### `kilo_list_models`
 
-Runs `kilo models` and returns the valid `provider/model` ids Claude can pass to `kilo_implement`. Claude uses this to validate the model **before** delegating, avoiding failed runs from stale/unknown ids (e.g. `google/gemini-3.5-pro` does not exist, `google/gemini-3.5-flash` does).
+Runs `kilo models` and returns the valid `provider/model` ids Claude can pass to `kilo_implement`. Claude uses this to validate the model **before** delegating, avoiding failed runs from stale/unknown ids (e.g. `google/gemini-3.8-flash` for routine work, `google/gemini-4-argon` for complex work).
 
 **Parameters:**
 
@@ -241,8 +241,8 @@ The core execution tool. Claude uses this to delegate work.
 
 - `task_instructions` *(string, required)*: The detailed markdown-formatted specifications. The server routes this through a temporary file bridge (avoids OS argument-size limits and gives Kilo a re-readable spec) and appends a **mandatory Final Report contract** - Outcome / Files changed / Verification / Issues - so Claude can review the run systematically.
 - `working_directory` *(string, optional)*: Where Kilo should run. Defaults to the current directory.
-- `agent` *(string, optional)*: The Kilo agent to use (e.g., `code`, `explore`).
-- `model` *(string, optional)*: Model override in `provider/model` form, as listed by `kilo models`. Defaults to the configured `default_model` tier (see [Server Configuration](#server-configuration) - `default_model`/`complex_model`, out of the box `google/gemini-flash-latest`).
+- `agent` *(string, optional)*: The Kilo agent to use (e.g., `code`). Note: subagents like `explore` cannot be used as primary agents with `kilo_implement` (use `kilo_rag_search` for read-only exploration).
+- `model` *(string, optional)*: Model override in `provider/model` form, as listed by `kilo models`. Defaults to the configured `default_model` tier (see [Server Configuration](#server-configuration) - `default_model`/`complex_model`, out of the box `google/gemini-3.8-flash`). Allowed models by policy: `google/gemini-3.8-flash` (routine work) and `google/gemini-4-argon` (complex/high-risk work). Banned models (such as `google/gemini-3.1-pro*` and `google/gemini-flash-latest`) are refused.
 - `focus_files` *(list[str], optional)*: Files Kilo must read before starting.
 - `execution_hints` *(string, optional)*: Strategic hints, constraints, or configurations for Kilo's execution style.
 - `skills_to_load` *(list[str], optional)*: Specific skills Kilo must utilize.
@@ -373,7 +373,7 @@ Coarse, OS-level diagnosis of running `kilo run` tasks - including delegations w
    - `task_instructions`: The detailed caching architecture it just designed.
    - `focus_files`: The files identified in the RAG search (e.g., `["src/db/connection.py", "src/db/queries.py"]`).
    - `agent`: `"code"`
-   - `model`: `"google/gemini-3.5-flash"`
+   - `model`: `"google/gemini-3.8-flash"`
 5. **Execution**: The MCP server writes the full specification to a temporary file - context files first, then instructions, hints, skills, and a **mandatory Final Report contract** - and spawns `kilo run` as a subprocess. Since `background` defaults to `true`, `kilo_implement` returns **immediately** with a `task_id`, and Claude's conversation is never blocked while Kilo works.
 6. **Monitoring (proportional to risk)**: for this multi-file caching change, Claude polls `kilo_task_progress(task_id)` a few times - seeing Kilo's live plan/todo list, commentary, and running cost pulled straight from its session database. If it looked stuck or off-spec, Claude could `kilo_task_cancel` it and re-delegate corrective instructions via `continue_session_id` into the same session; for a small one-file fix, Claude would just skip straight to the result instead.
 7. **Result**: once done, Kilo has ended with the structured Final Report (*Outcome / Files changed / Verification / Issues*). Claude fetches it with `kilo_task_result(task_id)`; the server has already parsed it, recorded the run to `metrics.jsonl` (including cost estimates and the resolved `session_id`), and returns it together with a `run_id`.

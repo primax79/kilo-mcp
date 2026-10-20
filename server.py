@@ -665,22 +665,62 @@ def _write_db_todos(session_id: str, todos: list[dict]) -> bool:
 # constant so tests can shorten it.
 _CANCEL_GRACE_S = 2.0
 
+# Allowed Kilo models (owner policy, 2026-10-20):
+ALLOWED_MODELS = (
+    "google/gemini-3.8-flash",
+    "google/gemini-4-argon",
+)
+
+# Banned models / patterns (owner policy, 2026-10-20):
+# Never google/gemini-3.1-pro* (banned), and never the vague google/gemini-flash-latest
+BANNED_MODELS = (
+    "google/gemini-3.1-pro*",
+    "google/gemini-flash-latest",
+)
+
+
+def _is_banned_model(model: Optional[str]) -> bool:
+    """Check if model matches any entry in BANNED_MODELS (supports wildcard suffix '*')."""
+    if not model:
+        return False
+    for pattern in BANNED_MODELS:
+        if pattern.endswith("*"):
+            if model.startswith(pattern[:-1]):
+                return True
+        elif model == pattern:
+            return True
+    return False
+
+
 # Default model used by kilo_implement when the caller does not override it —
 # the "simple/routine task" tier. Must be a valid provider/model id as
-# reported by `kilo models`.
-DEFAULT_MODEL = _cfg("KILO_MCP_DEFAULT_MODEL", "kilo", "default_model",
-                     "google/gemini-flash-latest")
+# reported by `kilo models`. Defaults to google/gemini-3.8-flash.
+_raw_default_model = _cfg("KILO_MCP_DEFAULT_MODEL", "kilo", "default_model",
+                          "google/gemini-3.8-flash")
+if _is_banned_model(_raw_default_model):
+    logger.warning(
+        "Configured default_model '%s' is banned by owner policy; falling back to 'google/gemini-3.8-flash'",
+        _raw_default_model,
+    )
+    DEFAULT_MODEL = "google/gemini-3.8-flash"
+else:
+    DEFAULT_MODEL = _raw_default_model
 
 # The "complex/high-risk task" tier: a stronger (usually costlier) model, for
 # tasks with subtle failure modes — read-modify-write races, ambiguous specs,
 # security-sensitive edits, multi-step reasoning — where the connected
 # assistant should NOT reach for the same model it uses for trivial edits.
-# Falls back to DEFAULT_MODEL when unset, so this is fully opt-in. Which
-# providers/models exist at all is environment-specific (see
-# `kilo_list_models`) — kilo-mcp itself stays provider-agnostic; run
-# `--configure-models` to set both tiers interactively.
-COMPLEX_MODEL = _cfg("KILO_MCP_COMPLEX_MODEL", "kilo", "complex_model",
-                     DEFAULT_MODEL)
+# Defaults to google/gemini-4-argon.
+_raw_complex_model = _cfg("KILO_MCP_COMPLEX_MODEL", "kilo", "complex_model",
+                          "google/gemini-4-argon")
+if _is_banned_model(_raw_complex_model):
+    logger.warning(
+        "Configured complex_model '%s' is banned by owner policy; falling back to 'google/gemini-4-argon'",
+        _raw_complex_model,
+    )
+    COMPLEX_MODEL = "google/gemini-4-argon"
+else:
+    COMPLEX_MODEL = _raw_complex_model
 
 # What Kilo's own model tokens cost the operator (USD per million tokens).
 # Defaults to 0 (free) — true for operators whose Kilo API keys are provided
@@ -991,16 +1031,17 @@ async def kilo_list_agents(
 
     Scans the project (`.kilo/agent/`, `.kilocode/agent/`), the global
     (`~/.kilo/agent/`, `~/.kilocode/agent/`) directories and the VS Code
-    extension storage for custom agent definitions. Built-in agents such as
-    `code` (implementation) and `explore` (read-only investigation) always
-    exist even if nothing is listed here.
+    extension storage for custom agent definitions. Built-in primary agent
+    `code` (implementation) always exists even if nothing is listed here.
+    Subagents like `explore` cannot be used as primary agents for kilo_implement
+    (use kilo_rag_search for exploration).
 
     Call this before delegating if you are unsure which agent to target, so you
     pick a real one instead of guessing.
     """
     agent_files = _find_kilo_files("agent*/**/*.md", cwd=working_directory)
     if not agent_files:
-        return "No custom agents found. Default agents (like 'code', 'explore') are available."
+        return "No custom agents found. Default primary agent 'code' is available."
     agents = set(os.path.basename(f).replace(".md", "") for f in agent_files)
     return "Available Kilo Agents:\n" + "\n".join(f"- {agent}" for agent in sorted(agents))
 
@@ -1039,7 +1080,7 @@ async def kilo_list_models(
         Optional[str],
         Field(
             description="Case-insensitive substring to narrow the list (e.g. "
-            "'gemini', 'claude', 'pro'). Leave empty to return every model. "
+            "'gemini', 'claude'). Leave empty to return every model. "
             "The full list can be hundreds of entries, so filtering is recommended."
         ),
     ] = None,
@@ -1048,8 +1089,8 @@ async def kilo_list_models(
 
     Use this to validate the `model` argument of kilo_implement BEFORE
     delegating: passing a model id that Kilo does not know makes the run fail.
-    (For example `google/gemini-3.5-pro` does not exist, but
-    `google/gemini-3.5-flash` does.)
+    Allowed models by policy: `google/gemini-3.8-flash` (routine tasks) and
+    `google/gemini-4-argon` (complex/high-risk tasks).
 
     Reflects the providers you are authenticated with; run `kilo auth login` in
     a terminal to add more. This is a read-only discovery call.
@@ -1300,6 +1341,60 @@ Returns a text report: `Exit Code` (0 = success, None = timed out), `STDOUT`
 )
 
 
+# Kilo subagents that cannot be used as primary agents with `kilo run`.
+# `kilo run` only supports primary agents; passing a subagent causes `kilo run`
+# to print a warning and silently fall back to `code`.
+SUBAGENT_AGENTS = (
+    "explore",
+    "general",
+    "framework-topic-drafter",
+    "kilo-mcp-orchestrator-agent",
+)
+
+
+def _is_subagent(agent_name: Optional[str], cwd: Optional[str] = None) -> bool:
+    """Return True if the named agent is a known subagent, not a primary agent."""
+    if not agent_name:
+        return False
+    if agent_name in SUBAGENT_AGENTS:
+        return True
+    try:
+        agent_files = _find_kilo_files(f"agent*/**/{agent_name}.md", cwd=cwd)
+        for f in agent_files:
+            with open(f, "r", encoding="utf-8") as fh:
+                content = fh.read(1024)
+                if re.search(r"^mode:\s*subagent\b", content, re.MULTILINE):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _build_kilo_run_argv(
+    prompt_file: str,
+    agent: Optional[str] = "code",
+    model: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> list[str]:
+    """Build the argument vector for `kilo run`.
+
+    Explicitly passes `--agent <agent>` with `code` as the default when omitted.
+    """
+    cmd = ["kilo", "run"]
+    if session_id:
+        cmd.extend(["--session", session_id])
+    chosen_agent = agent or "code"
+    cmd.extend(["--agent", chosen_agent])
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(
+        f"The file {prompt_file} contains your full task specification from an "
+        "orchestrating architect. Read it now, then execute it completely. Your "
+        "final message must be the 'Final Report' described in that file."
+    )
+    return cmd
+
+
 @mcp.tool(description=_IMPLEMENT_DESCRIPTION)
 async def kilo_implement(
     task_instructions: Annotated[
@@ -1323,16 +1418,18 @@ async def kilo_implement(
     agent: Annotated[
         str,
         Field(
-            description="Kilo agent to use. `code` for implementation (default); "
-            "`explore` for read-only tasks. Use kilo_list_agents to see custom "
-            "agents."
+            description="Kilo agent to use. `code` for implementation (default). "
+            "Use kilo_list_agents to see custom agents. Note: subagents such as "
+            "`explore` cannot be used as primary agents for implementation."
         ),
     ] = "code",
     model: Annotated[
         str,
         Field(
             description="Model id in `provider/model` form. MUST be a real id "
-            "from kilo_list_models; an unknown id makes the run fail. This "
+            "from kilo_list_models; an unknown id makes the run fail. Allowed "
+            "models by policy: google/gemini-3.8-flash (routine tasks) and "
+            "google/gemini-4-argon (complex/high-risk tasks). This "
             "environment has two configured tiers — pick by task risk, don't "
             "just reuse whatever model you (the connected assistant) happen "
             "to be: simple/routine tasks (mechanical edits, low risk) -> "
@@ -1444,6 +1541,20 @@ async def kilo_implement(
     if not os.path.exists(cwd):
         return f"Error: Working directory {cwd} does not exist."
 
+    if model and _is_banned_model(model):
+        allowed_str = ", ".join(ALLOWED_MODELS)
+        return (
+            f"Error: Model '{model}' is banned by owner policy. "
+            f"Allowed models: {allowed_str}."
+        )
+
+    if agent and _is_subagent(agent, cwd):
+        return (
+            f"Error: Agent '{agent}' is a subagent and cannot be used as a primary agent with 'kilo run' "
+            "(kilo run would silently fall back to 'code', risking unwanted modifications). "
+            "Use a primary agent (e.g. 'code') or use 'kilo_rag_search' for read-only exploration."
+        )
+
     run_id = uuid.uuid4().hex[:12]
     collision_warning = ""
     isolated_branch = None
@@ -1532,17 +1643,11 @@ async def kilo_implement(
             if created_sid:
                 server_session_id = created_sid
 
-    cmd = ["kilo", "run"]
-    if server_session_id:
-        cmd.extend(["--session", server_session_id])
-    if agent:
-        cmd.extend(["--agent", agent])
-    if model:
-        cmd.extend(["--model", model])
-    cmd.append(
-        f"The file {prompt_file} contains your full task specification from an "
-        "orchestrating architect. Read it now, then execute it completely. Your "
-        "final message must be the 'Final Report' described in that file."
+    cmd = _build_kilo_run_argv(
+        prompt_file,
+        agent=agent,
+        model=model,
+        session_id=server_session_id,
     )
     log_path = os.path.join(TASKS_DIR, f"{run_id}.log")
     try:
@@ -1807,17 +1912,11 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         # `kilo run` is non-interactive by default, so it executes the prompt
         # and exits without waiting for approvals. The temp file is cleaned up
         # by this server (finally block) — Kilo must not waste a step on it.
-        cmd = ["kilo", "run"]
-        if continue_session_id:
-            cmd.extend(["--session", continue_session_id])
-        if agent:
-            cmd.extend(["--agent", agent])
-        if model:
-            cmd.extend(["--model", model])
-        cmd.append(
-            f"The file {prompt_file} contains your full task specification from an "
-            "orchestrating architect. Read it now, then execute it completely. Your "
-            "final message must be the 'Final Report' described in that file."
+        cmd = _build_kilo_run_argv(
+            prompt_file,
+            agent=agent,
+            model=model,
+            session_id=continue_session_id,
         )
 
         started = time.monotonic()
@@ -4806,6 +4905,9 @@ def configure_models_interactive():
             raw = input(f"{label} [current: {current}]: ").strip()
             if not raw:
                 return current
+            if _is_banned_model(raw):
+                print(f"'{raw}' is banned by owner policy. Allowed models: {', '.join(ALLOWED_MODELS)}.")
+                continue
             if raw in models:
                 return raw
             confirm = input(f"'{raw}' is not in the list above — use it anyway? [y/N]: ").strip().lower()

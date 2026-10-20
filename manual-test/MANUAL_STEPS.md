@@ -47,7 +47,7 @@ echo "$PROMPT_FILE"
 ## 3. Launch `kilo run` - identical invocation to `kilo_implement`
 
 ```bash
-kilo run --agent code --model google/gemini-3.5-flash \
+kilo run --agent code --model google/gemini-3.8-flash \
   "The file $PROMPT_FILE contains your full task specification from an orchestrating architect. Read it now, then execute it completely. Your final message must be the 'Final Report' described in that file." \
   > /tmp/kilo-manual-out.log 2>&1 &
 KILO_PID=$!
