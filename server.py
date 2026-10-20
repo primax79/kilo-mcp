@@ -1341,14 +1341,12 @@ Returns a text report: `Exit Code` (0 = success, None = timed out), `STDOUT`
 )
 
 
-# Kilo subagents that cannot be used as primary agents with `kilo run`.
-# `kilo run` only supports primary agents; passing a subagent causes `kilo run`
-# to print a warning and silently fall back to `code`.
+# Kilo's built-in subagents, which cannot be used as primary agents with
+# `kilo run`: passing one makes `kilo run` print a warning and silently fall
+# back to `code`. Custom subagents are detected from their `mode: subagent`.
 SUBAGENT_AGENTS = (
     "explore",
     "general",
-    "framework-topic-drafter",
-    "kilo-mcp-orchestrator-agent",
 )
 
 
