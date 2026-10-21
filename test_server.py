@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import pathlib
 import re
 import signal
 import sqlite3
@@ -3844,6 +3845,220 @@ def test_protected_paths_warning_negatives_t021():
     assert server._protected_paths_warning(
         "Create .kilo/plans/roadmap.md", None
     ) == ""
+
+
+# ==============================================================================
+# T022: Context size preflight tests
+# ==============================================================================
+
+
+def test_estimate_initial_context_tokens_prompt_and_focus_files(tmp_path, monkeypatch):
+    """estimate_initial_context_tokens calculates tokens for assembled prompt and focus_files."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    f1 = repo / "small.py"
+    f1.write_text("a" * 400)  # 400 chars -> 100 tokens with default chars_per_token=4.0
+    f2 = repo / "medium.py"
+    f2.write_text("b" * 1200)  # 1200 chars -> 300 tokens
+
+    # Prompt with focus files
+    res = server.estimate_initial_context_tokens(
+        task_instructions="Do the work",
+        working_directory=str(repo),
+        focus_files=["small.py", "medium.py", "missing.py"],
+        execution_hints="Be careful",
+        skills_to_load=["some-skill"],
+    )
+
+    assert isinstance(res["prompt_tokens"], int)
+    assert res["prompt_tokens"] > 0
+    assert res["focus_files_tokens"] == 400  # 100 + 300 + 0
+    assert res["file_breakdown"] == [("small.py", 100), ("medium.py", 300), ("missing.py", 0)]
+    assert res["total_tokens"] == res["prompt_tokens"] + 400
+    assert res["warn_threshold"] == 40000
+    assert res["refuse_threshold"] == 120000
+    assert res["status"] == "ok"
+
+    # Threshold checks: set thresholds below total_tokens
+    monkeypatch.setattr(server, "MAX_CONTEXT_TOKENS_WARN", 200)
+    res_warn = server.estimate_initial_context_tokens(
+        task_instructions="Do the work",
+        working_directory=str(repo),
+        focus_files=["small.py", "medium.py"],
+    )
+    assert res_warn["status"] == "warn"
+
+    monkeypatch.setattr(server, "MAX_CONTEXT_TOKENS_REFUSE", 200)
+    res_refuse = server.estimate_initial_context_tokens(
+        task_instructions="Do the work",
+        working_directory=str(repo),
+        focus_files=["small.py", "medium.py"],
+    )
+    assert res_refuse["status"] == "refuse"
+
+
+def test_kilo_implement_below_warn_threshold(tmp_path, monkeypatch, mock_spawn_kilo_background):
+    """kilo_implement below warn threshold launches without context size warning."""
+    repo = pathlib.Path(_init_git_repo(tmp_path / "repo_below_warn"))
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    f = repo / "file.py"
+    f.write_text("x = 1\n")
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Implement a small change",
+        working_directory=str(repo),
+        focus_files=["file.py"],
+        background=True,
+    ))
+
+    assert "Task started in background." in res
+    assert "Warning: Large initial context" not in res
+    assert "Refusal: Initial context size" not in res
+    assert len(mock_spawn_kilo_background.calls) == 1
+
+
+def test_kilo_implement_between_warn_and_refuse_threshold(tmp_path, monkeypatch, mock_spawn_kilo_background):
+    """kilo_implement between warn and refuse thresholds launches with warning and splitting advice."""
+    repo = pathlib.Path(_init_git_repo(tmp_path / "repo_warn"))
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    f1 = repo / "large1.py"
+    f1.write_text("x" * 2000)  # 500 tokens
+    f2 = repo / "large2.py"
+    f2.write_text("y" * 2000)  # 500 tokens
+
+    # Set warn threshold below total tokens (~1000 + prompt), refuse threshold high
+    monkeypatch.setattr(server, "MAX_CONTEXT_TOKENS_WARN", 500)
+    monkeypatch.setattr(server, "MAX_CONTEXT_TOKENS_REFUSE", 50000)
+
+    # Background mode
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Implement feature with moderate context",
+        working_directory=str(repo),
+        focus_files=["large1.py", "large2.py"],
+        background=True,
+    ))
+
+    assert "Task started in background." in res
+    assert "Warning: Large initial context (~" in res
+    assert "2 focus_files" in res
+    assert "warn threshold=500" in res
+    assert "splitting the task into smaller tasks" in res or "trimming focus_files" in res
+    assert len(mock_spawn_kilo_background.calls) == 1
+
+    # Foreground mode (background=False)
+    async def fake_run_kilo(cmd, cwd=None, env=None, on_start=None):
+        return (0, "Outcome: success\nFiles changed:\n- dummy.py", "")
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+    res_fg = asyncio.run(server.kilo_implement(
+        task_instructions="Implement feature with moderate context",
+        working_directory=str(repo),
+        focus_files=["large1.py", "large2.py"],
+        background=False,
+    ))
+    assert "Warning: Large initial context (~" in res_fg
+    assert "Outcome: success" in res_fg
+
+
+def test_kilo_implement_above_refuse_threshold(tmp_path, monkeypatch, mock_spawn_kilo_background):
+    """kilo_implement above refuse threshold refuses before creating worktree or spawning."""
+    repo = pathlib.Path(_init_git_repo(tmp_path / "repo_refuse"))
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    # Create several files with distinct sizes
+    f1 = repo / "biggest.py"
+    f1.write_text("a" * 8000)   # 2000 tokens
+    f2 = repo / "second.py"
+    f2.write_text("b" * 4000)   # 1000 tokens
+    f3 = repo / "third.py"
+    f3.write_text("c" * 2000)   # 500 tokens
+    f4 = repo / "smallest.py"
+    f4.write_text("d" * 400)    # 100 tokens
+
+    # Refuse threshold set to 1500 tokens (less than f1 alone)
+    monkeypatch.setattr(server, "MAX_CONTEXT_TOKENS_REFUSE", 1500)
+    monkeypatch.setattr(server, "MAX_CONTEXT_TOKENS_WARN", 500)
+
+    worktree_created = False
+    async def fake_create_worktree(cwd, branch, base_branch, env):
+        nonlocal worktree_created
+        worktree_created = True
+        return (str(tmp_path / "wt"), 0, "", "", None)
+
+    monkeypatch.setattr(server, "_create_worktree", fake_create_worktree)
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Implement massive feature",
+        working_directory=str(repo),
+        focus_files=["smallest.py", "biggest.py", "second.py", "third.py"],
+        isolation="worktree",
+        background=True,
+    ))
+
+    # Refused before worktree or spawn
+    assert res.startswith("Refusal: Initial context size")
+    assert "exceeds max_context_tokens_refuse (1500)" in res
+    assert "Split the task into smaller tasks or narrow focus_files" in res
+    assert "(or raise KILO_MCP_MAX_CONTEXT_TOKENS_REFUSE / [kilo].max_context_tokens_refuse)" in res
+
+    # Check top 3 largest files are listed with token estimates in descending order
+    assert "biggest.py (~2000 tokens)" in res
+    assert "second.py (~1000 tokens)" in res
+    assert "third.py (~500 tokens)" in res
+    assert "smallest.py" not in res.split("largest files:")[1].split(")")[0]
+
+    # Verify no worktree was created and no process was spawned
+    assert not worktree_created
+    assert len(mock_spawn_kilo_background.calls) == 0
+
+
+def test_kilo_implement_refusal_disabled_when_zero(tmp_path, monkeypatch, mock_spawn_kilo_background):
+    """Setting max_context_tokens_refuse=0 disables refusal even for huge contexts."""
+    repo = pathlib.Path(_init_git_repo(tmp_path / "repo_no_refuse"))
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    f = repo / "huge.py"
+    f.write_text("z" * 40000)  # 10000 tokens
+
+    monkeypatch.setattr(server, "MAX_CONTEXT_TOKENS_WARN", 1000)
+    monkeypatch.setattr(server, "MAX_CONTEXT_TOKENS_REFUSE", 0)
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Implement task with refusal disabled",
+        working_directory=str(repo),
+        focus_files=["huge.py"],
+        background=True,
+    ))
+
+    # Should not refuse, should warn and launch
+    assert "Refusal: Initial context size" not in res
+    assert "Warning: Large initial context" in res
+    assert "Task started in background." in res
+    assert len(mock_spawn_kilo_background.calls) == 1
+
+
+def test_context_size_preflight_config_keys_and_env(tmp_path, monkeypatch):
+    """Thresholds resolve correctly via environment variables and TOML config file."""
+    # Test env vars override
+    monkeypatch.setenv("KILO_MCP_MAX_CONTEXT_TOKENS_WARN", "25000")
+    monkeypatch.setenv("KILO_MCP_MAX_CONTEXT_TOKENS_REFUSE", "80000")
+    assert server._get_max_context_tokens_warn() == 25000
+    assert server._get_max_context_tokens_refuse() == 80000
+
+    # Test TOML config
+    monkeypatch.delenv("KILO_MCP_MAX_CONTEXT_TOKENS_WARN", raising=False)
+    monkeypatch.delenv("KILO_MCP_MAX_CONTEXT_TOKENS_REFUSE", raising=False)
+    cfg_path = tmp_path / "kilo-mcp.toml"
+    cfg_path.write_text(
+        '[kilo]\n'
+        'max_context_tokens_warn = 30000\n'
+        'max_context_tokens_refuse = 90000\n'
+    )
+    cfg = server._minimal_toml_load(str(cfg_path))
+    assert cfg["kilo"]["max_context_tokens_warn"] == 30000
+    assert cfg["kilo"]["max_context_tokens_refuse"] == 90000
 
 
 
