@@ -126,6 +126,27 @@ This skill provides the concrete `kilo-mcp` tool bindings for orchestrating Kilo
     - `self`: when no independent verifier or owner approval is used, close
       directly as `done with a caveat: self-verified only` rather than
       claiming `verified`.
+  - **Durable Verification Requests (`verify-by` & verification queue):**
+    When a delivered task requires verification by a different workspace or session:
+    - Deliver with `--verify-by <workspace-or-session>`:
+      ```sh
+      ai-orch tasks transition <id> delivered --verify-by <workspace-slug> [--verify-check "what to check"]
+      # or set via:
+      ai-orch tasks set-verify-by <id> <target> [--check "what to check"]
+      # alias:
+      ai-orch tasks request-verification <id> --by <target> [--check "what to check"]
+      ```
+    - This records `- verify-by: <target>` in the task header, `verification pending: <check> (verify-by: <target>)` after the header, and displays `delivered (verify-by: <target>)` in `00-INDEX.md`.
+    - **Session start verification queue draining:** Sessions must drain their verification queue at session start:
+      ```sh
+      ai-orch tasks verification-queue --for <workspace-slug>
+      ```
+      For each delivered task addressed to your workspace, re-run its `Verification` checks from the task file and reply:
+      - If checks pass:
+        `ai-orch tasks transition <id> verified --verifier <workspace-slug> --reason "OK: ..."`
+      - If verification fails:
+        `ai-orch tasks transition <id> bounced --reason "NOT OK: ..."`
+    - Transitioning out of `delivered` clears the pending verification request.
 
   ### Post-Verification Decision Table
 
