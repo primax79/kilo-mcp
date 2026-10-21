@@ -19,8 +19,16 @@ import glob
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, NamedTuple, Optional
 from pydantic import Field
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
 
 # stderr only: stdout is the MCP JSON-RPC framing channel for a stdio server,
 # so anything written there would corrupt the protocol stream.
@@ -721,6 +729,110 @@ if _is_banned_model(_raw_complex_model):
     COMPLEX_MODEL = "google/gemini-4-argon"
 else:
     COMPLEX_MODEL = _raw_complex_model
+
+
+class ResolvedModel(NamedTuple):
+    model: str
+    source: str
+    config_path: Optional[str] = None
+    warnings: list[str] = []
+
+
+def resolve_kilo_model(
+    working_directory: Optional[str] = None,
+    model: Optional[str] = None,
+) -> ResolvedModel:
+    """Resolve the Kilo model to use according to the resolution order:
+    1. Explicit model argument (wins over everything else).
+    2. Nearest workspace ai-orchestration project config (<dir>/.ai-orchestration/orchestration.toml,
+       <dir>/orchestration.toml, or <dir>/.ai-orchestration.local.toml, walking up from
+       working_directory to the filesystem root).
+       Takes [tools.kilo].default_model if present, else [tools.kilo.profiles.<profile>].model
+       where <profile> is [routing].default_profile (defaulting to 'bulk-execution').
+    3. Server default (DEFAULT_MODEL).
+
+    Malformed TOML files are ignored with a warning and walking up continues.
+    """
+    if model:
+        return ResolvedModel(
+            model=model,
+            source="argument",
+            config_path=None,
+            warnings=[],
+        )
+
+    warnings: list[str] = []
+    base_dir = os.path.abspath(working_directory) if working_directory else os.getcwd()
+    cur = pathlib.Path(base_dir).resolve()
+
+    while True:
+        for relpath in (
+            os.path.join(".ai-orchestration", "orchestration.toml"),
+            "orchestration.toml",
+            ".ai-orchestration.local.toml",
+        ):
+            candidate = cur / relpath
+            if candidate.is_file():
+                data = None
+                try:
+                    if tomllib is None:
+                        raise RuntimeError("Python 3.11+ (stdlib tomllib) is required to parse orchestration.toml")
+                    with open(candidate, "rb") as f:
+                        data = tomllib.load(f)
+                except Exception as e:
+                    warnings.append(f"Warning: malformed TOML in {candidate}: {e}")
+                    continue
+
+                if isinstance(data, dict):
+                    tools = data.get("tools")
+                    if isinstance(tools, dict):
+                        kilo_cfg = tools.get("kilo")
+                        if isinstance(kilo_cfg, dict):
+                            # Simpler explicit override: [tools.kilo].default_model (wins over profile)
+                            dm = kilo_cfg.get("default_model")
+                            if isinstance(dm, str) and dm.strip():
+                                return ResolvedModel(
+                                    model=dm.strip(),
+                                    source=f"workspace config: {candidate}",
+                                    config_path=str(candidate),
+                                    warnings=warnings,
+                                )
+
+                            # Profile model: [tools.kilo.profiles.<profile>].model
+                            routing = data.get("routing")
+                            profile = "bulk-execution"
+                            if isinstance(routing, dict):
+                                dp = routing.get("default_profile")
+                                if isinstance(dp, str) and dp.strip():
+                                    profile = dp.strip()
+
+                            profiles = kilo_cfg.get("profiles")
+                            if isinstance(profiles, dict):
+                                prof_entry = profiles.get(profile)
+                                if isinstance(prof_entry, dict):
+                                    m = prof_entry.get("model")
+                                    if isinstance(m, str) and m.strip():
+                                        return ResolvedModel(
+                                            model=m.strip(),
+                                            source=f"workspace config: {candidate}",
+                                            config_path=str(candidate),
+                                            warnings=warnings,
+                                        )
+
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+
+    return ResolvedModel(
+        model=DEFAULT_MODEL,
+        source="server default",
+        config_path=None,
+        warnings=warnings,
+    )
+
+
+_resolve_kilo_model = resolve_kilo_model
 
 # What Kilo's own model tokens cost the operator (USD per million tokens).
 # Defaults to 0 (free) — true for operators whose Kilo API keys are provided
@@ -1452,7 +1564,7 @@ async def kilo_implement(
         ),
     ] = "code",
     model: Annotated[
-        str,
+        Optional[str],
         Field(
             description="Model id in `provider/model` form. MUST be a real id "
             "from kilo_list_models; an unknown id makes the run fail. Allowed "
@@ -1463,11 +1575,12 @@ async def kilo_implement(
             "to be: simple/routine tasks (mechanical edits, low risk) -> "
             + DEFAULT_MODEL + "; complex/high-risk tasks (subtle bugs, "
             "read-modify-write races, security-sensitive edits, multi-step "
-            "reasoning) -> " + COMPLEX_MODEL + ". Defaults to " + DEFAULT_MODEL +
+            "reasoning) -> " + COMPLEX_MODEL + ". Defaults to the workspace's "
+            "configured Kilo model when there is one, or " + DEFAULT_MODEL +
             ". Run `kilo-mcp --configure-models` to change these tiers, or "
             "kilo_list_models for the full catalog."
         ),
-    ] = DEFAULT_MODEL,
+    ] = None,
     focus_files: Annotated[
         Optional[list[str]],
         Field(
@@ -1573,16 +1686,27 @@ async def kilo_implement(
 ) -> str:
     """Delegate a code implementation task to Kilo. See the tool description
     (built from _IMPLEMENT_DESCRIPTION + DELEGATION_POLICY) for full guidance."""
-    cwd = working_directory if working_directory else os.getcwd()
-    if not os.path.exists(cwd):
-        return f"Error: Working directory {cwd} does not exist."
+    orig_cwd = working_directory if working_directory else os.getcwd()
+    if not os.path.exists(orig_cwd):
+        return f"Error: Working directory {orig_cwd} does not exist."
+    cwd = orig_cwd
 
-    if model and _is_banned_model(model):
+    resolved = resolve_kilo_model(working_directory=orig_cwd, model=model)
+    if _is_banned_model(resolved.model):
         allowed_str = ", ".join(ALLOWED_MODELS)
+        if resolved.config_path:
+            return (
+                f"Error: Model '{resolved.model}' configured in {resolved.config_path} is banned by owner policy. "
+                f"Allowed models: {allowed_str}."
+            )
         return (
-            f"Error: Model '{model}' is banned by owner policy. "
+            f"Error: Model '{resolved.model}' is banned by owner policy. "
             f"Allowed models: {allowed_str}."
         )
+
+    model = resolved.model
+    model_source = resolved.source
+    model_warnings = resolved.warnings
 
     if agent and _is_subagent(agent, cwd):
         return (
@@ -1657,6 +1781,10 @@ async def kilo_implement(
         for key, value in env_vars.items():
             env[key] = str(value)
 
+    warnings_prefix = ""
+    if model_warnings:
+        warnings_prefix = "\n\n".join(model_warnings) + "\n\n"
+
     if not background:
         result = await _execute_implement(
             run_id, cwd, full_content, agent, model, env,
@@ -1664,8 +1792,9 @@ async def kilo_implement(
             agent_manager_worktree_id,
             include_trace=include_trace,
             isolated_branch=isolated_branch,
+            model_source=model_source,
         )
-        return collision_warning + result
+        return warnings_prefix + collision_warning + result
 
     # Background mode (the default): launch Kilo as a FULLY DETACHED OS
     # process — its own session (start_new_session=True / setsid), output
@@ -1714,6 +1843,7 @@ async def kilo_implement(
         "working_directory": cwd,
         "agent": agent,
         "model": model,
+        "model_source": model_source,
         "isolated_branch": isolated_branch,
         "agent_manager_worktree_id": agent_manager_worktree_id,
         "pid": pid,
@@ -1755,9 +1885,12 @@ async def kilo_implement(
         "remove it (git worktree remove) once you've reviewed the result.\n"
         if isolated_branch else ""
     )
+    model_note = f"- Model: {model} ({model_source})\n"
     return (
+        warnings_prefix +
         collision_warning +
         f"Task started in background. (task_id: {run_id})\n\n"
+        f"{model_note}"
         f"{session_note}"
         f"{isolation_note}"
         f"- Live progress (plan/todo list, commentary, cost): kilo_task_progress "
@@ -2009,7 +2142,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              continue_session_id: Optional[str] = None,
                              agent_manager_worktree_id: Optional[str] = None,
                              include_trace: bool = False,
-                             isolated_branch: Optional[str] = None) -> str:
+                             isolated_branch: Optional[str] = None,
+                             model_source: Optional[str] = None) -> str:
     """Run one Kilo implementation task end-to-end: temp-file spec bridge,
     subprocess, Final-Report parsing, metrics. Used by the synchronous
     (background=False) path of kilo_implement only — the background path
@@ -2053,12 +2187,15 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         report = _parse_final_report(stdout)
         final_status = "completed" if (returncode == 0 and report.get("outcome") in ("success", "partial")) else "failed"
 
+        source_str = f" ({model_source})" if model_source else ""
         if include_trace:
             result_text = (
                 f"Kilo Execution Finished. (run_id: {run_id} — use it with kilo_log_issue "
                 f"if your review finds defects; session_id: {session_id or 'unknown'} — pass "
                 f"it as continue_session_id on a follow-up kilo_implement call to steer this "
-                f"same session)\n\nExit Code: {returncode}\n\n"
+                f"same session)\n\n"
+                f"- Model: {model}{source_str}\n"
+                f"Exit Code: {returncode}\n\n"
                 f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
             )
         else:
@@ -2067,6 +2204,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                 "",
                 f"- Status: {final_status}",
                 f"- Exit Code: {returncode}",
+                f"- Model: {model}{source_str}",
             ]
             if session_id:
                 lines.append(f"- Session ID: {session_id}")
@@ -2391,6 +2529,11 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
     lines.append(f"- Status: {status}")
     if exit_code is not None:
         lines.append(f"- Exit Code: {exit_code}")
+    model = record.get("model")
+    model_source = record.get("model_source")
+    if model:
+        source_str = f" ({model_source})" if model_source else ""
+        lines.append(f"- Model: {model}{source_str}")
     if session_id:
         lines.append(f"- Session ID: {session_id}")
     if isolated_branch:

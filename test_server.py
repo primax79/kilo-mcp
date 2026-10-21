@@ -3081,3 +3081,216 @@ def test_new_neutral_recovery_wording(tmp_path, monkeypatch):
     res = asyncio.run(server.kilo_task_result(task_id=task_id))
     assert "Result read from the run log (the Kilo process has exited" in res
     assert "recovered by kilo-mcp after its process exited" not in res
+
+
+# ==============================================================================
+# T019: per-workspace default Kilo model
+# ==============================================================================
+
+def test_resolve_kilo_model_nearest_config_walk_up(tmp_path):
+    # Root config
+    root_cfg = tmp_path / "orchestration.toml"
+    root_cfg.write_text("""
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-4-argon"
+""")
+
+    # Subproject directory with its own nearer config
+    sub_dir = tmp_path / "packages" / "sub"
+    sub_dir.mkdir(parents=True)
+    sub_cfg = sub_dir / "orchestration.toml"
+    sub_cfg.write_text("""
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-3.8-flash"
+""")
+
+    leaf_dir = sub_dir / "src" / "deep"
+    leaf_dir.mkdir(parents=True)
+
+    # Resolving from leaf_dir should find nearest config (sub_cfg)
+    res = server.resolve_kilo_model(str(leaf_dir))
+    assert res.model == "google/gemini-3.8-flash"
+    assert res.config_path == str(sub_cfg)
+    assert res.source == f"workspace config: {sub_cfg}"
+
+    # Resolving from another subfolder without its own config finds root_cfg
+    other_dir = tmp_path / "other" / "leaf"
+    other_dir.mkdir(parents=True)
+    res_other = server.resolve_kilo_model(str(other_dir))
+    assert res_other.model == "google/gemini-4-argon"
+    assert res_other.config_path == str(root_cfg)
+    assert res_other.source == f"workspace config: {root_cfg}"
+
+    # Also test .ai-orchestration/orchestration.toml variant
+    third_dir = tmp_path / "third"
+    (third_dir / ".ai-orchestration").mkdir(parents=True)
+    dot_cfg = third_dir / ".ai-orchestration" / "orchestration.toml"
+    dot_cfg.write_text("""
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-3.8-flash"
+""")
+    res_dot = server.resolve_kilo_model(str(third_dir / "sub"))
+    assert res_dot.model == "google/gemini-3.8-flash"
+    assert res_dot.config_path == str(dot_cfg)
+
+
+def test_resolve_kilo_model_default_profile_selection(tmp_path):
+    cfg_file = tmp_path / "orchestration.toml"
+    cfg_file.write_text("""
+[routing]
+default_profile = "deep-reasoning"
+
+[tools.kilo.profiles.deep-reasoning]
+model = "google/gemini-4-argon"
+
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-3.8-flash"
+""")
+    res = server.resolve_kilo_model(str(tmp_path))
+    assert res.model == "google/gemini-4-argon"
+    assert res.config_path == str(cfg_file)
+
+    # When default_profile is not set, defaults to bulk-execution
+    cfg_file.write_text("""
+[tools.kilo.profiles.deep-reasoning]
+model = "google/gemini-4-argon"
+
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-3.8-flash"
+""")
+    res2 = server.resolve_kilo_model(str(tmp_path))
+    assert res2.model == "google/gemini-3.8-flash"
+
+
+def test_resolve_kilo_model_default_model_override(tmp_path):
+    cfg_file = tmp_path / "orchestration.toml"
+    cfg_file.write_text("""
+[routing]
+default_profile = "deep-reasoning"
+
+[tools.kilo]
+default_model = "override-kilo-model"
+
+[tools.kilo.profiles.deep-reasoning]
+model = "google/gemini-4-argon"
+
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-3.8-flash"
+""")
+    res = server.resolve_kilo_model(str(tmp_path))
+    assert res.model == "override-kilo-model"
+    assert res.config_path == str(cfg_file)
+
+
+def test_kilo_implement_explicit_argument_wins(tmp_path, fake_data_dir, mock_run_kilo_custom):
+    cfg_file = tmp_path / "orchestration.toml"
+    cfg_file.write_text("""
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-3.8-flash"
+""")
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Test explicit argument",
+        working_directory=str(tmp_path),
+        model="google/gemini-4-argon",
+        background=False,
+    ))
+    cmd = mock_run_kilo_custom.calls[0]["cmd"]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "google/gemini-4-argon"
+    assert "- Model: google/gemini-4-argon (argument)" in res
+
+
+def test_kilo_implement_banned_model_in_config_refused(tmp_path, fake_data_dir):
+    cfg_file = tmp_path / "orchestration.toml"
+    cfg_file.write_text("""
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-3.1-pro-preview"
+""")
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Test banned model",
+        working_directory=str(tmp_path),
+        background=False,
+    ))
+    assert res.startswith(f"Error: Model 'google/gemini-3.1-pro-preview' configured in {cfg_file} is banned by owner policy.")
+    assert "Allowed models:" in res
+    assert str(cfg_file) in res
+
+
+def test_kilo_implement_malformed_toml_ignored_with_warning(tmp_path, fake_data_dir, mock_run_kilo_custom):
+    # Parent valid config
+    root_cfg = tmp_path / "orchestration.toml"
+    root_cfg.write_text("""
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-4-argon"
+""")
+    # Child malformed config
+    sub_dir = tmp_path / "sub"
+    sub_dir.mkdir()
+    bad_cfg = sub_dir / "orchestration.toml"
+    bad_cfg.write_text("invalid = toml = [broken")
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Test malformed toml",
+        working_directory=str(sub_dir),
+        background=False,
+    ))
+    assert f"Warning: malformed TOML in {bad_cfg}" in res
+    assert "- Model: google/gemini-4-argon" in res
+    assert f"(workspace config: {root_cfg})" in res
+    cmd = mock_run_kilo_custom.calls[0]["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "google/gemini-4-argon"
+
+    # Also check background mode includes the warning and model info
+    res_bg = asyncio.run(server.kilo_implement(
+        task_instructions="Test malformed toml background",
+        working_directory=str(sub_dir),
+        background=True,
+    ))
+    assert f"Warning: malformed TOML in {bad_cfg}" in res_bg
+    assert "- Model: google/gemini-4-argon" in res_bg
+    assert f"(workspace config: {root_cfg})" in res_bg
+
+
+def test_kilo_implement_isolation_worktree_uses_original_directory(tmp_path, fake_data_dir, mock_run_kilo_custom):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    cfg_file = repo_dir / "orchestration.toml"
+    cfg_file.write_text("""
+[tools.kilo.profiles.bulk-execution]
+model = "google/gemini-4-argon"
+""")
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Worktree isolation test",
+        working_directory=str(repo_dir),
+        isolation="worktree",
+        worktree_branch="feat-t019",
+        background=False,
+    ))
+
+    # Kilo was run with model from repo_dir config, even though cwd was switched to worktree
+    kilo_call = mock_run_kilo_custom.calls[1]
+    cmd = kilo_call["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "google/gemini-4-argon"
+    assert f"- Model: google/gemini-4-argon (workspace config: {cfg_file})" in res
+
+
+def test_resolve_kilo_model_no_config_falls_back_to_server_default(tmp_path, fake_data_dir, mock_run_kilo_custom):
+    empty_dir = tmp_path / "empty_workspace"
+    empty_dir.mkdir()
+    res = server.resolve_kilo_model(str(empty_dir))
+    assert res.model == server.DEFAULT_MODEL
+    assert res.source == "server default"
+    assert res.config_path is None
+    assert res.warnings == []
+
+    # Also test via kilo_implement
+    run_res = asyncio.run(server.kilo_implement(
+        task_instructions="Default model run",
+        working_directory=str(empty_dir),
+        background=False,
+    ))
+    cmd = mock_run_kilo_custom.calls[0]["cmd"]
+    assert cmd[cmd.index("--model") + 1] == server.DEFAULT_MODEL
+    assert f"- Model: {server.DEFAULT_MODEL} (server default)" in run_res
+
