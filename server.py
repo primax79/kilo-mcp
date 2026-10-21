@@ -885,6 +885,24 @@ def _parse_final_report(stdout: str) -> dict:
     return {"outcome": outcome, "files_changed": files}
 
 
+def _extract_final_report(text: str) -> Optional[str]:
+    """Extract the Final Report markdown section from task output or log text.
+    Returns the report markdown starting from ## Final Report (or Outcome:),
+    or None if no real Final Report was parsed."""
+    if not text:
+        return None
+    matches = list(re.finditer(r"(?im)^(?:#{1,3}\s*|\*{1,2})Final Report[^\n]*", text))
+    for m in reversed(matches):
+        candidate = text[m.start():]
+        outcome_m = re.search(r"Outcome[^\n]{0,60}?\b(success|partial|failed)\b([^\n]*)", candidate, re.IGNORECASE)
+        if outcome_m and not re.search(r"\|\s*(partial|failed)", outcome_m.group(2), re.IGNORECASE):
+            return candidate.strip()
+    outcome_m = re.search(r"(?im)^Outcome[^\n]{0,60}?\b(success|partial|failed)\b([^\n]*)", text)
+    if outcome_m and not re.search(r"\|\s*(partial|failed)", outcome_m.group(2), re.IGNORECASE):
+        return text[outcome_m.start():].strip()
+    return None
+
+
 def _measure_files(cwd: str, files: list[str]) -> dict:
     """Measure the size of changed files that still exist (deleted ones skip)."""
     total_chars = 0
@@ -1301,13 +1319,16 @@ How to use it well:
 1. (Optional) kilo_rag_search to locate the relevant files.
 2. Write a precise spec in `task_instructions`; pass the key files as
    `focus_files`; add `execution_hints` and `skills_to_load` as needed.
+   When the task instructions enumerate items (a numbered or bulleted list of
+   deliverables), Kilo is instructed to include one line per item ("done" or
+   "not done: why") in the Final Report, in the same order.
 3. Pick a valid `model` (see kilo_list_models) and `agent`.
 4. Scale how closely you watch it to the task's complexity/risk: a small,
    well-scoped change needs only a final kilo_task_result check; a large,
    multi-file, or high-risk delegation deserves periodic kilo_task_progress
    polling so you can catch it drifting off-spec early.
-5. Act as reviewer: check `Exit Code` and read `STDOUT` to verify the
-   strategy was followed; inspect the resulting changes.
+5. Act as reviewer: check `Exit Code` and review the Final Report and changed files;
+   inspect the resulting changes.
 
 STEERING: if a run (background or foreground) drifts off-spec, don't just
 restart from scratch — read its `session_id` (in the result / progress
@@ -1342,8 +1363,9 @@ no Final Report and no commit. The delegated prompt therefore tells Kilo to
 write the intended content to `<path>.proposed` instead; apply it yourself.
 Don't ask Kilo to edit those files directly.
 
-Returns a text report: `Exit Code` (0 = success, None = timed out), `STDOUT`
-(Kilo's final report), `STDERR` (the run trace)."""
+Returns a text report (trimmed by default: status, exit code, session_id,
+worktree/branch when present, parsed Final Report, and log file path; pass
+`include_trace=true` for the full run trace)."""
     + "\n\n## When to delegate\n"
     + DELEGATION_POLICY
 )
@@ -1540,6 +1562,14 @@ async def kilo_implement(
             "worktree add's own default). Ignored unless isolation is set."
         ),
     ] = None,
+    include_trace: Annotated[
+        bool,
+        Field(
+            description="If True, includes the full execution trace in the result. "
+            "Defaults to False (returns status, exit code, session_id, "
+            "worktree/branch when present, Final Report, and log path)."
+        ),
+    ] = False,
 ) -> str:
     """Delegate a code implementation task to Kilo. See the tool description
     (built from _IMPLEMENT_DESCRIPTION + DELEGATION_POLICY) for full guidance."""
@@ -1616,7 +1646,9 @@ async def kilo_implement(
         "- **Outcome**: success | partial | failed, with one sentence why.\n"
         "- **Files changed**: every file created/modified/deleted, one per line.\n"
         "- **Verification**: commands you ran to verify (tests, builds) and their results.\n"
-        "- **Issues**: anything incomplete, skipped, or needing the architect's review; 'none' otherwise."
+        "- **Issues**: anything incomplete, skipped, or needing the architect's review; 'none' otherwise.\n\n"
+        "When the task instructions enumerate items (a numbered or bulleted list of deliverables), "
+        'the report includes one line per item ("done" or "not done: why"), in the same order.'
     )
     full_content = "\n\n".join(sections)
 
@@ -1630,6 +1662,8 @@ async def kilo_implement(
             run_id, cwd, full_content, agent, model, env,
             focus_files, skills_to_load, continue_session_id,
             agent_manager_worktree_id,
+            include_trace=include_trace,
+            isolated_branch=isolated_branch,
         )
         return collision_warning + result
 
@@ -1775,43 +1809,76 @@ def _spawn_kilo_background(cmd: list[str], cwd: str, env: dict, log_path: str) -
     return proc.pid
 
 
-def _is_pid_alive(pid: Optional[int]) -> bool:
-    """True if a PID still refers to a live, non-zombie process. Good enough
-    for our reconcile check since PID reuse inside the few-minutes window a
-    task runs for is astronomically unlikely.
+_CHILD_EXIT_CODES: dict[int, int] = {}
 
-    Two steps, found necessary by a real live test: a detached child
-    (start_new_session=True) is still OUR child for wait() purposes even
-    though it's in its own session/process group — so once it exits, it
-    becomes a zombie (<defunct>) until reaped, and os.kill(pid, 0) alone
-    reports a zombie as "alive" forever (it still exists in the process
-    table, purely pending reap), which made kilo_task_result say a task was
-    "still running" for a task that had already finished its work.
-    1. Try a non-blocking reap first (os.waitpid WNOHANG). If it's our own
-       child and already exited, this both collects it (no more zombie) and
-       tells us it's done.
-    2. ChildProcessError means it's not our child (e.g. a fresh server
-       instance after a restart — the process was reparented to init, which
-       reaps it on its own) — fall back to os.kill(pid, 0)."""
+
+def _get_process_cmdline(pid: int) -> Optional[str]:
+    """Get the command line of a process via `ps -p <pid> -o command=`.
+    Returns None if the process does not exist or ps fails."""
+    try:
+        res = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if res.returncode != 0:
+            return None
+        return res.stdout.strip()
+    except Exception:
+        return None
+
+
+def _is_kilo_cmdline(cmdline: str) -> bool:
+    """True if cmdline matches a kilo run invocation (and is not a zombie)."""
+    if not cmdline:
+        return False
+    if "<defunct>" in cmdline or "(defunct)" in cmdline:
+        return False
+    return bool(
+        re.search(r"(?:^|[\s/])kilo(?:\.py)?\b.*?\brun\b", cmdline)
+        or re.search(r"\bkilo run\b", cmdline)
+        or re.search(r"(?:^|[\s/])kilo\b", cmdline)
+    )
+
+
+def _is_pid_alive(pid: Optional[int]) -> bool:
+    """True if a PID refers to a live, non-zombie Kilo process.
+
+    Combines non-blocking reap (waitpid), os.kill(pid, 0), and a process command
+    line check via `ps -p <pid> -o command=` to ensure a reused PID or a zombie
+    process is never falsely identified as a running Kilo task.
+    """
     if not pid:
         return False
     try:
-        reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+        reaped_pid, status = os.waitpid(pid, os.WNOHANG)
         if reaped_pid == pid:
+            if os.WIFEXITED(status):
+                _CHILD_EXIT_CODES[pid] = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                _CHILD_EXIT_CODES[pid] = -os.WTERMSIG(status)
             return False  # just reaped it — it had already exited
-        # reaped_pid == 0: it's our child and it's still running
     except ChildProcessError:
-        pass  # not our child (different server instance) — fall through
+        pass  # not our child (e.g. fresh server instance) — fall through
     except OSError:
         return False
+
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True  # exists, just not ours to signal — still alive
+        pass  # exists, permission denied — check command line below
     except OSError:
         return False
+
+    cmdline = _get_process_cmdline(pid)
+    if cmdline is None:
+        return False
+    if not _is_kilo_cmdline(cmdline):
+        return False
+
     return True
 
 
@@ -1940,7 +2007,9 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              focus_files: Optional[list],
                              skills_to_load: Optional[list],
                              continue_session_id: Optional[str] = None,
-                             agent_manager_worktree_id: Optional[str] = None) -> str:
+                             agent_manager_worktree_id: Optional[str] = None,
+                             include_trace: bool = False,
+                             isolated_branch: Optional[str] = None) -> str:
     """Run one Kilo implementation task end-to-end: temp-file spec bridge,
     subprocess, Final-Report parsing, metrics. Used by the synchronous
     (background=False) path of kilo_implement only — the background path
@@ -1973,13 +2042,60 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         if session_id:
             _agent_manager_note_session(cwd, session_id, agent_manager_worktree_id)
 
-        result_text = (
-            f"Kilo Execution Finished. (run_id: {run_id} — use it with kilo_log_issue "
-            f"if your review finds defects; session_id: {session_id or 'unknown'} — pass "
-            f"it as continue_session_id on a follow-up kilo_implement call to steer this "
-            f"same session)\n\nExit Code: {returncode}\n\n"
-            f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
-        )
+        os.makedirs(TASKS_DIR, exist_ok=True)
+        log_path = os.path.join(TASKS_DIR, f"{run_id}.log")
+        try:
+            with open(log_path, "w", errors="replace") as f:
+                f.write(f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}")
+        except OSError:
+            pass
+
+        report = _parse_final_report(stdout)
+        final_status = "completed" if (returncode == 0 and report.get("outcome") in ("success", "partial")) else "failed"
+
+        if include_trace:
+            result_text = (
+                f"Kilo Execution Finished. (run_id: {run_id} — use it with kilo_log_issue "
+                f"if your review finds defects; session_id: {session_id or 'unknown'} — pass "
+                f"it as continue_session_id on a follow-up kilo_implement call to steer this "
+                f"same session)\n\nExit Code: {returncode}\n\n"
+                f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
+            )
+        else:
+            lines = [
+                f"Kilo Execution Finished. (run_id: {run_id} — session_id: {session_id or 'unknown'})",
+                "",
+                f"- Status: {final_status}",
+                f"- Exit Code: {returncode}",
+            ]
+            if session_id:
+                lines.append(f"- Session ID: {session_id}")
+            if isolated_branch:
+                lines.append(f"- Branch: {isolated_branch}")
+                lines.append(f"- Worktree: {cwd}")
+            lines.append(f"- Log file: {log_path}")
+            lines.append("")
+
+            final_report_text = _extract_final_report(stdout)
+            if final_report_text:
+                if len(final_report_text) > 8000:
+                    capped = (
+                        final_report_text[:4000]
+                        + f"\n\n[... Final Report truncated ({len(final_report_text) - 8000} characters omitted) ...]\n\n"
+                        + final_report_text[-4000:]
+                    )
+                    lines.append(capped)
+                else:
+                    lines.append(final_report_text)
+            else:
+                out_snippet = stdout.strip()
+                if len(out_snippet) > 4000:
+                    lines.append(f"[... output truncated to last 4000 characters ...]\n{out_snippet[-4000:]}")
+                elif out_snippet:
+                    lines.append(out_snippet)
+                else:
+                    lines.append("(no output captured)")
+            result_text = "\n".join(lines)
 
         report = _parse_final_report(stdout)
         measure = _measure_files(cwd, report["files_changed"])
@@ -2223,6 +2339,91 @@ def _find_task_record_by_pid(pid: int | str) -> Optional[dict]:
     return None
 
 
+def _format_task_result(record: dict, include_trace: bool = False) -> str:
+    """Format the task result text according to include_trace.
+
+    By default (include_trace=False), returns:
+    - Task status
+    - Exit code (if known)
+    - Session ID (if known)
+    - Worktree and Branch (when present; omitted otherwise)
+    - Log file path (if known)
+    - Parsed Final Report (or last ~4000 characters of assistant output)
+    Free-text fields are capped at a sensible size with truncation markers.
+
+    When include_trace=True, returns the full log/trace.
+    """
+    task_id = record.get("task_id") or record.get("run_id") or "unknown"
+    status = record.get("status", "unknown")
+    session_id = record.get("session_id")
+    exit_code = record.get("exit_code")
+    log_path = record.get("log_path")
+    isolated_branch = record.get("isolated_branch")
+    working_directory = record.get("working_directory")
+    note = record.get("note")
+
+    log_content = ""
+    if log_path and os.path.exists(log_path):
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                log_content = f.read()
+        except OSError:
+            pass
+    if not log_content:
+        log_content = record.get("raw_log") or record.get("result") or ""
+
+    if note and "reaped lingering" in note:
+        header = (
+            f"Kilo Execution Finished ({note} — "
+            f"task_id: {task_id}, session_id: {session_id or 'unknown'})."
+        )
+    else:
+        header = (
+            f"Kilo Execution Finished. Result read from the run log "
+            f"(the Kilo process has exited — task_id: {task_id}, session_id: {session_id or 'unknown'})."
+        )
+
+    if include_trace:
+        trace_body = log_content or "(no log content captured)"
+        return f"{header}\n\nLOG:\n{trace_body}"
+
+    lines = [header, ""]
+    lines.append(f"- Status: {status}")
+    if exit_code is not None:
+        lines.append(f"- Exit Code: {exit_code}")
+    if session_id:
+        lines.append(f"- Session ID: {session_id}")
+    if isolated_branch:
+        lines.append(f"- Branch: {isolated_branch}")
+        if working_directory:
+            lines.append(f"- Worktree: {working_directory}")
+    if log_path:
+        lines.append(f"- Log file: {log_path}")
+    lines.append("")
+
+    final_report = _extract_final_report(log_content)
+    if final_report:
+        if len(final_report) > 8000:
+            capped = (
+                final_report[:4000]
+                + f"\n\n[... Final Report truncated ({len(final_report) - 8000} characters omitted) ...]\n\n"
+                + final_report[-4000:]
+            )
+            lines.append(capped)
+        else:
+            lines.append(final_report)
+    else:
+        out_snippet = log_content.strip()
+        if len(out_snippet) > 4000:
+            lines.append(f"[... output truncated to last 4000 characters ...]\n{out_snippet[-4000:]}")
+        elif out_snippet:
+            lines.append(out_snippet)
+        else:
+            lines.append("(no output captured)")
+
+    return "\n".join(lines)
+
+
 def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     """If `record` says status=='running':
     1. If the PID is dead, reconcile as completed/failed from log file.
@@ -2240,6 +2441,35 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     pid = record.get("pid")
     pid_alive = _is_pid_alive(pid)
 
+    reaped = False
+    if pid_alive:
+        # Process is alive. Only reap if finished and idle beyond grace period.
+        time_since_output = _get_time_since_last_output(record)
+        grace = _get_linger_grace()
+        if time_since_output is not None and time_since_output < grace:
+            return record
+
+        log_path = record.get("log_path")
+        log_content = ""
+        if log_path and os.path.exists(log_path):
+            try:
+                with open(log_path, "r", errors="replace") as f:
+                    log_content = f.read()
+            except OSError:
+                pass
+
+        is_finished, report = _is_task_output_finished(log_content)
+        if not is_finished:
+            return record
+
+        # Both (a) finished output and (b) grace period exceeded: reap lingering process
+        logger.info(
+            "Task %s (pid %s) finished output and remained idle for %.1fs (grace %.1fs); reaping process group",
+            task_id, pid, time_since_output, grace
+        )
+        _reap_lingering_process(pid, sigkill_timeout_s=5.0)
+        reaped = True
+
     log_path = record.get("log_path")
     log_content = ""
     if log_path and os.path.exists(log_path):
@@ -2253,47 +2483,35 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     if report is None:
         report = _parse_final_report(log_content) if log_content else {"outcome": "unknown", "files_changed": []}
 
-    reaped = False
-    if pid_alive:
-        # Process is alive. Only reap if finished and idle beyond grace period.
-        if not is_finished:
-            return record
-
-        time_since_output = _get_time_since_last_output(record)
-        grace = _get_linger_grace()
-        if time_since_output is None or time_since_output < grace:
-            return record
-
-        # Both (a) finished output and (b) grace period exceeded: reap lingering process
-        logger.info(
-            "Task %s (pid %s) finished output and remained idle for %.1fs (grace %.1fs); reaping process group",
-            task_id, pid, time_since_output, grace
-        )
-        _reap_lingering_process(pid, sigkill_timeout_s=5.0)
-        reaped = True
-
     cwd = record.get("working_directory")
     session_id = record.get("session_id")
     if not session_id and cwd:
         session_id = _find_session_for_task(cwd, record.get("started", ""), task_id)
 
+    exit_code = _CHILD_EXIT_CODES.get(pid) if pid else None
+    if exit_code is None:
+        exit_code = record.get("exit_code")
+    if exit_code is None:
+        exit_code = 0 if (report.get("outcome") in ("success", "partial") or reaped) else 1
+
     if reaped:
         final_status = "completed"
         note = "reaped lingering process after completion"
-        result_text = (
-            f"Kilo Execution Finished ({note} — "
-            f"task_id: {task_id}, session_id: {session_id or 'unknown'}).\n\n"
-            f"LOG:\n{log_content or '(no log content captured)'}"
-        )
     else:
         final_status = "completed" if report.get("outcome") in ("success", "partial") else "failed"
-        result_text = (
-            f"Kilo Execution Finished (recovered by kilo-mcp after its process "
-            f"exited — task_id: {task_id}, session_id: {session_id or 'unknown'}). "
-            "The MCP server that launched this task may have restarted before "
-            "it could record the outcome itself; this was reconstructed from "
-            f"the task's log file.\n\nLOG:\n{log_content or '(no log content captured)'}"
-        )
+        note = "Result read from the run log (the Kilo process has exited)."
+
+    updates = {
+        "status": final_status,
+        "session_id": session_id,
+        "exit_code": exit_code,
+        "note": note,
+    }
+    temp_record = dict(record)
+    temp_record.update(updates)
+    temp_record["task_id"] = task_id
+    result_text = _format_task_result(temp_record, include_trace=False)
+    updates["result"] = result_text
 
     if cwd:
         measure = _measure_files(cwd, report.get("files_changed") or [])
@@ -2321,9 +2539,6 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
         except OSError:
             pass
 
-    updates = {"status": final_status, "result": result_text, "session_id": session_id}
-    if reaped:
-        updates["note"] = "reaped lingering process after completion"
     _write_task_record(task_id, updates)
     if session_id:
         _agent_manager_note_session(cwd, session_id, record.get("agent_manager_worktree_id"))
@@ -2339,11 +2554,19 @@ async def kilo_task_result(
         Field(description="The task_id returned by kilo_implement when "
               "launched with background=true."),
     ],
+    include_trace: Annotated[
+        bool,
+        Field(description="If True, returns the full run trace. "
+                          "Defaults to False (returns status, exit code, session_id, "
+                          "worktree/branch when present, parsed Final Report, and log file path)."),
+    ] = False,
 ) -> str:
     """Fetch the outcome of a background kilo_implement task.
 
-    Returns the full result (Final Report, exit code, run trace, session_id)
-    once the task completes; while still running it says so — use
+    Returns the task result once completed: by default, returns a trimmed
+    summary with status, exit code, session_id, worktree/branch (when isolated),
+    the parsed Final Report, and the log file path. Pass `include_trace=true` to
+    retrieve the full run trace. While still running it says so — use
     kilo_task_progress for live plan/commentary or kilo_task_status for a
     quick OS-level heuristic. Tasks run as detached OS processes, independent
     of this server: results persist on disk and self-heal across server
@@ -2374,7 +2597,9 @@ async def kilo_task_result(
             f"Task {task_id} was cancelled. "
             + record.get("result", "(no further detail recorded)")
         )
-    return record.get("result", f"Task {task_id} ended with status '{status}' and no stored result.")
+    if not record.get("task_id"):
+        record["task_id"] = task_id
+    return _format_task_result(record, include_trace=include_trace)
 
 
 _TERMINAL_TASK_STATES = ("completed", "failed", "cancelled", "error")
@@ -2390,23 +2615,32 @@ async def kilo_task_wait(
     timeout_seconds: Annotated[
         Optional[int],
         Field(description="Maximum seconds to wait before returning a status "
-              "summary. Defaults to None (wait up to KILO_TIMEOUT)."),
+              "summary. Accepts up to at least 3600 seconds (or more). "
+              "Defaults to None (wait up to KILO_TIMEOUT, at least 3600)."),
     ] = None,
+    include_trace: Annotated[
+        bool,
+        Field(description="If True, includes the full execution trace in the terminal result. "
+                          "Defaults to False (returns trimmed result: status, exit code, session_id, "
+                          "worktree/branch when present, Final Report, and log path)."),
+    ] = False,
 ) -> str:
     """Wait until a background kilo_implement task reaches a terminal state
     (completed, failed, cancelled, error) or `timeout_seconds` elapses, polling
-    every 2 seconds and reconciling orphaned processes from their log files via
+    cheaply every 2 seconds and reconciling orphaned processes from their log files via
     _reconcile_task_if_orphaned.
 
-    When terminal, returns the full kilo_task_result output. On timeout, does
-    not raise: returns a clear status message with current progress and elapsed
-    seconds.
+    Accepts `timeout_seconds` up to at least 3600s (or more) for long runs and
+    returns as soon as the task ends. When terminal, returns the kilo_task_result
+    output (trimmed by default, or full trace with include_trace=True).
+    On timeout, does not raise: returns a clear status message with current progress
+    and elapsed seconds.
     """
     record = _read_task_record(task_id)
     if record is None:
         return f"Unknown task_id '{task_id}'. (Records live in {TASKS_DIR})"
 
-    effective_timeout = KILO_TIMEOUT if timeout_seconds is None else max(0, int(timeout_seconds))
+    effective_timeout = max(3600, KILO_TIMEOUT) if timeout_seconds is None else max(0, int(timeout_seconds))
     started = time.monotonic()
 
     while True:
@@ -2416,7 +2650,7 @@ async def kilo_task_wait(
         record = _reconcile_task_if_orphaned(task_id, record)
         status = record.get("status")
         if status in _TERMINAL_TASK_STATES or status != "running":
-            return await kilo_task_result(task_id=task_id)
+            return await kilo_task_result(task_id=task_id, include_trace=include_trace)
 
         elapsed = time.monotonic() - started
         if elapsed >= effective_timeout:
@@ -2563,6 +2797,10 @@ async def kilo_task_cancel(
         )
 
     note = f"Cancelled by architect. Reason: {reason}" if reason else "Cancelled by architect (no reason given)."
+    if not _is_pid_alive(pid):
+        _write_task_record(task_id, {"status": "cancelled", "result": f"{note} (process had already exited.)"})
+        return f"Task {task_id}: process {pid} was already gone; marked cancelled."
+
     server_pgrp = os.getpgrp()
     try:
         pgid = os.getpgid(pid)
@@ -2579,15 +2817,15 @@ async def kilo_task_cancel(
     await asyncio.sleep(_CANCEL_GRACE_S)
     forced = False
     try:
-        os.kill(pid, 0)  # still alive?
-        if pgid and pgid > 1 and pgid != server_pgrp:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
+        if _is_pid_alive(pid):
+            if pgid and pgid > 1 and pgid != server_pgrp:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    os.kill(pid, signal.SIGKILL)
+            else:
                 os.kill(pid, signal.SIGKILL)
-        else:
-            os.kill(pid, signal.SIGKILL)
-        forced = True
+            forced = True
     except ProcessLookupError:
         pass
     try:

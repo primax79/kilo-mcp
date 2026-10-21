@@ -72,7 +72,7 @@ def mock_spawn_kilo_background(monkeypatch):
             self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "log_path": log_path})
             with open(log_path, "w") as f:
                 f.write(self.log_content)
-            proc = subprocess.Popen(["sleep", "5" if self.alive else "0"])
+            proc = subprocess.Popen(["sh", "-c", "exec -a 'kilo run' sleep 5" if self.alive else "exec -a 'kilo run' sleep 0"])
             if not self.alive:
                 proc.wait()
             self._procs.append(proc)
@@ -83,7 +83,24 @@ def mock_spawn_kilo_background(monkeypatch):
     yield fake
     for p in fake._procs:
         if p.poll() is None:
-            p.kill()
+            try:
+                p.kill()
+                p.wait()
+            except OSError:
+                pass
+
+
+@pytest.fixture
+def live_kilo_pid():
+    """Provides the PID of a genuinely live process whose command line matches `kilo run`."""
+    proc = subprocess.Popen(["sh", "-c", "exec -a 'kilo run' sleep 30"])
+    yield proc.pid
+    if proc.poll() is None:
+        try:
+            proc.kill()
+            proc.wait()
+        except OSError:
+            pass
 
 # ==============================================================================
 # 1. _cfg resolution order
@@ -290,12 +307,13 @@ def test_kilo_implement(tmp_path, fake_data_dir, mock_run_kilo_custom):
     # Check temp file is deleted after call returns
     assert not os.path.exists(temp_file)
     
-    # returns a string containing run_id, exit code, STDOUT and STDERR
+    # returns a string containing run_id, exit code, and parsed Final Report (trimmed default)
     assert "run_id:" in res
     assert "Exit Code: 0" in res
-    assert "STDOUT:\nOutcome: success" in res
-    assert "STDERR:\n" in res
-    
+    assert "Outcome: success" in res
+    assert "Log file:" in res
+    assert "STDOUT:" not in res
+
     # Appends one metrics record
     with open(server.METRICS_FILE) as f:
         lines = f.readlines()
@@ -717,12 +735,12 @@ def test_kilo_task_result_unknown(tmp_path, monkeypatch):
     assert "Unknown task_id" in res
 
 
-def test_kilo_task_result_still_running(tmp_path, monkeypatch):
+def test_kilo_task_result_still_running(tmp_path, monkeypatch, live_kilo_pid):
     monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
     server._write_task_record("abc123", {
         "status": "running", "started": "2026-07-14T00:00:00+00:00",
         "working_directory": "/tmp/w",
-        "pid": os.getpid(),  # a genuinely live pid — this test's own process
+        "pid": live_kilo_pid,  # a genuinely live kilo run pid
     })
     res = asyncio.run(server.kilo_task_result(task_id="abc123"))
     assert "still running" in res and "kilo_task_status" in res
@@ -926,19 +944,19 @@ def test_kilo_task_progress_already_ended(tmp_path, monkeypatch):
     assert "already ended" in res
 
 
-def test_kilo_task_progress_no_session_yet(tmp_path, monkeypatch):
+def test_kilo_task_progress_no_session_yet(tmp_path, monkeypatch, live_kilo_pid):
     monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
     monkeypatch.setattr(server, "KILO_SESSION_DB", str(tmp_path / "does-not-exist.db"))
     server._write_task_record("t2", {
         "status": "running", "working_directory": str(tmp_path),
         "started": "2026-07-14T00:00:00+00:00",
-        "pid": os.getpid(),  # a genuinely live pid — this test's own process
+        "pid": live_kilo_pid,  # a genuinely live kilo run pid
     })
     res = asyncio.run(server.kilo_task_progress(task_id="t2"))
     assert "no matching Kilo session" in res
 
 
-def test_kilo_task_progress_full(tmp_path, monkeypatch):
+def test_kilo_task_progress_full(tmp_path, monkeypatch, live_kilo_pid):
     monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
     db_path = tmp_path / "kilo.db"
     started = "2026-07-14T10:00:00+00:00"
@@ -954,7 +972,7 @@ def test_kilo_task_progress_full(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "KILO_SESSION_DB", str(db_path))
     server._write_task_record("t3", {
         "status": "running", "working_directory": str(tmp_path), "started": started,
-        "pid": os.getpid(),  # a genuinely live pid — this test's own process
+        "pid": live_kilo_pid,  # a genuinely live kilo run pid
     })
 
     res = asyncio.run(server.kilo_task_progress(task_id="t3"))
@@ -1010,7 +1028,7 @@ def test_kilo_task_cancel_real_process(tmp_path, monkeypatch):
 
     async def scenario():
         proc = await asyncio.create_subprocess_exec(
-            "sleep", "30", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            "sh", "-c", "exec -a 'kilo run' sleep 30", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         server._write_task_record("t4", {"status": "running", "pid": proc.pid})
         res = await server.kilo_task_cancel(task_id="t4", reason="going off spec")
@@ -1135,13 +1153,13 @@ def test_kilo_implement_isolation_worktree_failure(tmp_path, fake_data_dir, monk
     assert "already exists" in res
 
 
-def test_kilo_implement_collision_warning(tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch):
+def test_kilo_implement_collision_warning(tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch, live_kilo_pid):
     monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
     cwd = str(tmp_path)
     server._write_task_record("other111", {
         "status": "running", "started": "2026-07-16T00:00:00+00:00",
         "working_directory": cwd, "agent": "code",
-        "pid": os.getpid(),  # a genuinely live pid — this test's own process
+        "pid": live_kilo_pid,  # a genuinely live kilo run pid
     })
 
     res = asyncio.run(server.kilo_implement(
@@ -1195,13 +1213,13 @@ def test_kilo_implement_isolation_bypasses_collision_warning(tmp_path, fake_data
     assert "COLLISION WARNING" not in res
 
 
-def test_kilo_implement_background_collision_warning_and_isolation_note(tmp_path, fake_data_dir, mock_spawn_kilo_background, mock_run_kilo_custom, monkeypatch):
+def test_kilo_implement_background_collision_warning_and_isolation_note(tmp_path, fake_data_dir, mock_spawn_kilo_background, mock_run_kilo_custom, monkeypatch, live_kilo_pid):
     monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
     cwd = str(tmp_path)
     server._write_task_record("other555", {
         "status": "running", "started": "2026-07-16T00:00:00+00:00",
         "working_directory": cwd, "agent": "code",
-        "pid": os.getpid(),  # a genuinely live pid — this test's own process
+        "pid": live_kilo_pid,  # a genuinely live kilo run pid
     })
 
     launch = asyncio.run(server.kilo_implement(task_instructions="Do it", working_directory=cwd))
@@ -1217,7 +1235,7 @@ def test_kilo_implement_background_collision_warning_and_isolation_note(tmp_path
     assert "feat-bg" in launch2
 
 
-def test_find_running_tasks_for_cwd_realpath_normalization(tmp_path, monkeypatch):
+def test_find_running_tasks_for_cwd_realpath_normalization(tmp_path, monkeypatch, live_kilo_pid):
     """A trailing slash or a symlinked path must still match — same-directory
     collision detection compares real paths, not raw strings."""
     monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
@@ -1225,7 +1243,7 @@ def test_find_running_tasks_for_cwd_realpath_normalization(tmp_path, monkeypatch
     real_dir.mkdir()
     server._write_task_record("t1", {
         "status": "running", "working_directory": str(real_dir),
-        "pid": os.getpid(),  # a genuinely live pid — this test's own process
+        "pid": live_kilo_pid,  # a genuinely live kilo run pid
     })
 
     matches = server._find_running_tasks_for_cwd(str(real_dir) + os.sep)
@@ -1391,7 +1409,7 @@ def test_agent_manager_note_session_skips_when_not_git_repo(tmp_path):
     assert not os.path.exists(os.path.join(str(plain_dir), ".kilo"))
 
 
-def test_kilo_task_progress_registers_session_in_agent_manager(tmp_path, monkeypatch):
+def test_kilo_task_progress_registers_session_in_agent_manager(tmp_path, monkeypatch, live_kilo_pid):
     """Once kilo_task_progress resolves a session_id for a running task, it
     must also register that session into the working_directory's
     .kilo/agent-manager.json (the actual feature this section covers)."""
@@ -1401,7 +1419,7 @@ def test_kilo_task_progress_registers_session_in_agent_manager(tmp_path, monkeyp
     server._write_task_record("t9", {
         "status": "running", "working_directory": repo,
         "started": "2026-07-14T00:00:00+00:00",
-        "pid": os.getpid(),  # a genuinely live pid — this test's own process
+        "pid": live_kilo_pid,  # a genuinely live kilo run pid
     })
 
     asyncio.run(server.kilo_task_progress(task_id="t9"))
@@ -1565,7 +1583,7 @@ def test_configure_models_interactive_reprompts_on_unlisted_id(tmp_path, monkeyp
 # 19. kilo_task_wait (T001) and kilo_log_decision + kilo_metrics (T002)
 # ==============================================================================
 
-def test_kilo_task_wait_normal_completion(tmp_path, monkeypatch):
+def test_kilo_task_wait_normal_completion(tmp_path, monkeypatch, live_kilo_pid):
     """kilo_task_wait polls until the task transitions to a terminal state and
     returns the kilo_task_result payload."""
     monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
@@ -1573,7 +1591,7 @@ def test_kilo_task_wait_normal_completion(tmp_path, monkeypatch):
         "status": "running",
         "started": "2026-10-15T00:00:00+00:00",
         "working_directory": str(tmp_path),
-        "pid": os.getpid(),
+        "pid": live_kilo_pid,
     })
 
     sleep_calls = []
@@ -1593,7 +1611,7 @@ def test_kilo_task_wait_normal_completion(tmp_path, monkeypatch):
     assert "waited.py" in res
 
 
-def test_kilo_task_wait_timeout_does_not_raise(tmp_path, monkeypatch):
+def test_kilo_task_wait_timeout_does_not_raise(tmp_path, monkeypatch, live_kilo_pid):
     """When timeout_seconds elapses while the task is still running,
     kilo_task_wait returns a status message with live progress and elapsed
     seconds instead of raising."""
@@ -1603,7 +1621,7 @@ def test_kilo_task_wait_timeout_does_not_raise(tmp_path, monkeypatch):
         "status": "running",
         "started": "2026-10-15T00:00:00+00:00",
         "working_directory": str(tmp_path),
-        "pid": os.getpid(),
+        "pid": live_kilo_pid,
     })
 
     clock = {"now": 100.0}
@@ -2769,3 +2787,297 @@ def test_kilo_implement_warns_on_protected_files(tmp_path, fake_data_dir, mock_r
         background=False,
     ))
     assert "PROTECTED FILES" in res
+
+
+# ==============================================================================
+# 26. T018: Trimmed task results, reliable completion, per-item reports, neutral wording
+# ==============================================================================
+
+def test_kilo_task_result_trimmed_default_and_include_trace(tmp_path, monkeypatch):
+    """By default, kilo_task_result returns a trimmed summary (<MCP tool limit);
+    with include_trace=True it returns the full trace."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    task_id = "trim123"
+    log_path = tasks_dir / f"{task_id}.log"
+    huge_trace = "Running step: build...\n" * 6000  # ~144KB
+    final_report = (
+        "## Final Report\n"
+        "- **Outcome**: success\n"
+        "- **Files changed**:\n"
+        "  - src/feature.py\n"
+        "- **Verification**: pytest passed\n"
+        "- **Issues**: none\n"
+    )
+    log_path.write_text(huge_trace + "\n" + final_report)
+
+    server._write_task_record(task_id, {
+        "status": "completed",
+        "exit_code": 0,
+        "session_id": "ses_trim1",
+        "log_path": str(log_path),
+        "working_directory": "/tmp/worktree",
+        "isolated_branch": "kilo/feature-branch",
+    })
+
+    # Default trimmed result
+    res_trimmed = asyncio.run(server.kilo_task_result(task_id=task_id))
+    assert len(res_trimmed) < 5000
+    assert "- Status: completed" in res_trimmed
+    assert "- Exit Code: 0" in res_trimmed
+    assert "- Session ID: ses_trim1" in res_trimmed
+    assert "- Branch: kilo/feature-branch" in res_trimmed
+    assert "- Worktree: /tmp/worktree" in res_trimmed
+    assert f"- Log file: {log_path}" in res_trimmed
+    assert "## Final Report" in res_trimmed
+    assert "src/feature.py" in res_trimmed
+    assert "Running step: build" not in res_trimmed
+
+    # With include_trace=True
+    res_trace = asyncio.run(server.kilo_task_result(task_id=task_id, include_trace=True))
+    assert len(res_trace) > 100000
+    assert "LOG:\n" in res_trace
+    assert "Running step: build" in res_trace
+    assert "src/feature.py" in res_trace
+
+
+def test_kilo_task_result_fallback_tail_when_no_final_report(tmp_path, monkeypatch):
+    """When no Final Report is found in the output, kilo_task_result falls back
+    to returning the last ~4000 characters with a clear truncation notice."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    task_id = "tail123"
+    log_path = tasks_dir / f"{task_id}.log"
+    raw_content = "Line of output: " + ("x" * 80) + "\n"
+    log_path.write_text(raw_content * 120 + "LAST_LINE_OF_OUTPUT\n")
+
+    server._write_task_record(task_id, {
+        "status": "completed",
+        "exit_code": 0,
+        "session_id": "ses_tail",
+        "log_path": str(log_path),
+    })
+
+    res = asyncio.run(server.kilo_task_result(task_id=task_id))
+    assert "[... output truncated to last 4000 characters ...]" in res
+    assert "LAST_LINE_OF_OUTPUT" in res
+    assert len(res) < 5000
+
+
+def test_kilo_task_result_no_null_fields_omits_absent_keys(tmp_path, monkeypatch):
+    """Tool results must not contain null fields — absent keys are omitted."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    task_id = "omit_absent"
+    server._write_task_record(task_id, {
+        "status": "completed",
+        # exit_code, session_id, log_path, isolated_branch are all absent / None
+        "result": "## Final Report\n- **Outcome**: success\n- **Files changed**: none",
+    })
+
+    res = asyncio.run(server.kilo_task_result(task_id=task_id))
+    assert "- Status: completed" in res
+    assert "- Exit Code:" not in res
+    assert "- Session ID:" not in res
+    assert "- Branch:" not in res
+    assert "- Worktree:" not in res
+    assert "- Log file:" not in res
+    assert "None" not in res
+    assert "null" not in res
+
+
+def test_is_pid_alive_detects_dead_and_reused_pid(monkeypatch):
+    """_is_pid_alive rejects dead PIDs, zombies, and reused PIDs running other processes."""
+    # 1. Non-existent PID
+    assert server._is_pid_alive(None) is False
+    assert server._is_pid_alive(9999999) is False
+
+    # 2. Reused PID (PID exists in OS, but runs an unrelated process)
+    monkeypatch.setattr(server.os, "kill", lambda pid, sig: None)  # os.kill succeeds
+    monkeypatch.setattr(server, "_get_process_cmdline", lambda pid: "/usr/sbin/cron -f")
+    assert server._is_pid_alive(12345) is False
+
+    # 3. Another unrelated process (e.g. nginx or pytest)
+    monkeypatch.setattr(server, "_get_process_cmdline", lambda pid: "python -m pytest test_server.py")
+    assert server._is_pid_alive(12345) is False
+
+    # 4. Zombie process
+    monkeypatch.setattr(server, "_get_process_cmdline", lambda pid: "<defunct>")
+    assert server._is_pid_alive(12345) is False
+
+    # 5. Legitimate live kilo process
+    monkeypatch.setattr(server, "_get_process_cmdline", lambda pid: "kilo run --agent code")
+    assert server._is_pid_alive(12345) is True
+
+    # 6. Legitimate live kilo process with full path
+    monkeypatch.setattr(server, "_get_process_cmdline", lambda pid: "/usr/local/bin/kilo run --session s123")
+    assert server._is_pid_alive(12345) is True
+
+
+def test_reconcile_reused_pid_treated_as_exited(tmp_path, monkeypatch):
+    """When a task has status='running' but its PID belongs to an unrelated reused process,
+    _reconcile_task_if_orphaned reconciles the task from its log file instead of leaving it running."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    task_id = "reused123"
+    log_path = tasks_dir / f"{task_id}.log"
+    log_path.write_text(
+        "Working...\n"
+        "## Final Report\n"
+        "- **Outcome**: success\n"
+        "- **Files changed**:\n"
+        "  - foo.py\n"
+    )
+
+    monkeypatch.setattr(server.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(server, "_get_process_cmdline", lambda pid: "/bin/bash")
+
+    record = {
+        "status": "running",
+        "pid": 88888,
+        "log_path": str(log_path),
+        "working_directory": str(tmp_path),
+    }
+    server._write_task_record(task_id, record)
+
+    updated = server._reconcile_task_if_orphaned(task_id, record)
+    assert updated["status"] == "completed"
+    assert "Result read from the run log (the Kilo process has exited" in updated["note"]
+
+
+def test_collision_warning_ignores_reused_pid(tmp_path, monkeypatch):
+    """Collision detection ignores tasks whose PID is a reused PID of an unrelated process."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    cwd = str(tmp_path)
+
+    monkeypatch.setattr(server.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(server, "_get_process_cmdline", lambda pid: "/usr/sbin/syslogd")
+
+    server._write_task_record("reused_task", {
+        "status": "running",
+        "working_directory": cwd,
+        "pid": 77777,
+    })
+
+    running = server._find_running_tasks_for_cwd(cwd)
+    assert running == []
+
+
+def test_kilo_task_wait_accepts_long_timeout_and_returns_on_completion(tmp_path, monkeypatch, live_kilo_pid):
+    """kilo_task_wait accepts timeout_seconds up to at least 3600 (or more),
+    polls cheaply, and returns as soon as the task ends."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    task_id = "long_wait_ok"
+    log_path = tasks_dir / f"{task_id}.log"
+    log_path.write_text("## Final Report\n- **Outcome**: success\n- **Files changed**: - done.py\n")
+
+    server._write_task_record(task_id, {
+        "status": "running",
+        "started": "2026-10-15T00:00:00+00:00",
+        "working_directory": str(tmp_path),
+        "pid": live_kilo_pid,
+        "log_path": str(log_path),
+    })
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        server._write_task_record(task_id, {
+            "status": "completed",
+            "exit_code": 0,
+            "result": "Kilo Execution Finished.\nOutcome: success\nFiles changed:\n- done.py",
+        })
+
+    monkeypatch.setattr(server.asyncio, "sleep", fake_sleep)
+
+    res = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=3600))
+    assert sleep_calls == [2.0]
+    assert "Kilo Execution Finished" in res
+    assert "done.py" in res
+
+    res_7200 = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=7200))
+    assert "Kilo Execution Finished" in res_7200
+
+
+def test_kilo_task_wait_include_trace(tmp_path, monkeypatch):
+    """kilo_task_wait respects include_trace=True vs include_trace=False."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    task_id = "wait_trace"
+    log_path = tasks_dir / f"{task_id}.log"
+    log_path.write_text("DETAILED_STEP_LOG_CONTENT\n\n## Final Report\n- **Outcome**: success\n- **Files changed**: none\n")
+
+    server._write_task_record(task_id, {
+        "status": "completed",
+        "exit_code": 0,
+        "log_path": str(log_path),
+    })
+
+    res_trimmed = asyncio.run(server.kilo_task_wait(task_id=task_id, include_trace=False))
+    assert "DETAILED_STEP_LOG_CONTENT" not in res_trimmed
+    assert "- Status: completed" in res_trimmed
+
+    res_trace = asyncio.run(server.kilo_task_wait(task_id=task_id, include_trace=True))
+    assert "DETAILED_STEP_LOG_CONTENT" in res_trace
+    assert "LOG:\n" in res_trace
+
+
+def test_kilo_implement_per_item_prompt_text(tmp_path, fake_data_dir):
+    """The delegated prompt includes the per-item Final Report rule."""
+    captured_content = []
+
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        import re
+        m = re.search(r"The file (/\S+) contains", cmd[-1])
+        with open(m.group(1)) as f:
+            captured_content.append(f.read())
+        return (0, "Outcome: success\nFiles changed:\n- x.py", "")
+
+    from unittest.mock import patch
+
+    with patch.object(server, "_run_kilo", side_effect=fake_run_kilo):
+        asyncio.run(server.kilo_implement(
+            task_instructions="1. Deliverable A\n2. Deliverable B",
+            working_directory=str(tmp_path),
+            background=False,
+        ))
+
+    assert len(captured_content) == 1
+    prompt = captured_content[0]
+    expected_rule = (
+        'when the task instructions enumerate items (a numbered or bulleted list of deliverables), '
+        'the report includes one line per item ("done" or "not done: why"), in the same order.'
+    )
+    assert expected_rule.lower() in prompt.lower()
+
+
+def test_new_neutral_recovery_wording(tmp_path, monkeypatch):
+    """When a task process has exited, results use neutral wording instead of error-like text."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    task_id = "neutral_word"
+    log_path = tasks_dir / f"{task_id}.log"
+    log_path.write_text("## Final Report\n- **Outcome**: success\n- **Files changed**: - a.py\n")
+
+    server._write_task_record(task_id, {
+        "status": "running",
+        "pid": 9999999,
+        "log_path": str(log_path),
+    })
+
+    res = asyncio.run(server.kilo_task_result(task_id=task_id))
+    assert "Result read from the run log (the Kilo process has exited" in res
+    assert "recovered by kilo-mcp after its process exited" not in res
