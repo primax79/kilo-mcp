@@ -15,6 +15,17 @@
 # env: KILO_MCP_TIMEOUT
 timeout = 1800
 
+# Context size preflight thresholds (estimated tokens across prompt + focus_files).
+# Large initial contexts can cause connection resets or gateway timeouts.
+# Warn threshold: launches Kilo but prepends a warning with advice to split the task or trim focus_files.
+# env: KILO_MCP_MAX_CONTEXT_TOKENS_WARN
+max_context_tokens_warn = 40000
+
+# Refuse threshold: refuses to launch before creating a worktree or spawning Kilo.
+# Set to 0 to disable refusal.
+# env: KILO_MCP_MAX_CONTEXT_TOKENS_REFUSE
+max_context_tokens_refuse = 120000
+
 # Default provider/model id for kilo_implement (must exist in `kilo models`) —
 # the "simple/routine task" tier. Allowed models by policy: `google/gemini-3.8-flash`
 # (default: routine work, reviews, exploration) and `google/gemini-4-argon` (complex work).

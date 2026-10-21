@@ -301,14 +301,48 @@ and it occupies your context while it waits.
 - **Keep your context lean.** After capturing a task, keep only its one-line
   entry in the registry. Read its files again only when you pick it up.
 
+## Reaching the task engine
+
+The `tasks/` tree is plain, Git-tracked Markdown by design: every file (`00-INDEX.md`, `CONTEXT.md`, `AGENTS.md`, `NN-<slug>/plan.md`, `<category>/T###-<slug>.md`, `questions/Q###-<slug>.md`, `_inbox/`) is usable directly by any developer or AI assistant — even on a machine without the VS Code extension, the broker MCP server, or the `ai-orch` CLI installed. Use the highest tier available in the current environment, and never run the engine from a versioned plugin-cache path or a stale vendored copy:
+
+1. **Tier 1 — Broker MCP tools (`ai-orch mcp`, preferred when registered):**
+   - `whoami` — Report broker identity (`pid`, `version`, `started_at`) and `unread_mail`.
+   - `workspaces.list` — List registered workspaces (`uuid`, `slug`, `title`, `path`, `orchestrator`, `unread_mail`), paged.
+   - `projects.list` — List projects (`uuid`, `slug`, `path`, `kind`) in a `workspace`, paged.
+   - `tasks.list` — Return compact, paged task rows for `workspace` and `project` (filterable by `state`, `kind`, `label`, `text`).
+   - `tasks.show` — Return full details (`header`, `goal`, `steps`, `verification`, `children`, `attachments`, `hash`, `path`) for one task `(workspace, project, id)`.
+   - `tasks.next` — Return actionable ready-queue tasks for `workspace` (and optional `project`), paged.
+   - `tasks.graph` — Return the dependency graph (`nodes`, `edges`, `ready` queue) for `workspace` and `project`.
+   - `tasks.new` — Create an emergent task in `(workspace, project)` (`title`, `short`, `goal`, optional `category`, `priority`, `priority_reason`, `kind`, `parent`, `idempotency_key`, `expect_hash`, `preview`).
+   - `tasks.transition` — Transition task state in `(workspace, project, id, to)` (optional `note`, `idempotency_key`, `expect_hash`, `preview`).
+   - `tasks.set` — Update a task field (`priority`, `size`, `deps`, `kind`, `labels`, `short`) on `(workspace, project, id)` (optional `idempotency_key`, `expect_hash`, `preview`).
+   - `questions.list` — List blocking questions for `workspace` (and optional `project`, `status`), paged.
+   - `questions.ask` — File a blocking question in `(workspace, project)` (`question`, `short`, `context`, `options`, optional `recommended`, `blocks`, `idempotency_key`, `expect_hash`, `preview`).
+   - `questions.answer` — Record an answer to a blocking question `(workspace, project, id, choice)` and unblock waiting tasks (optional `text`, `idempotency_key`, `expect_hash`, `preview`).
+   - `inbox.add_note` — Add an inbox note in `(workspace, project)` (`title`, `body`, optional `kind`, `idempotency_key`, `expect_hash`, `preview`).
+   - `orchestrator.status` — Inspect workspace orchestrator status (`state`, `tool`, `model`, `generation`, `queue_length`, `worker`, `unread_mail`).
+   - **Broker MCP conventions:**
+     - **Addressing:** Every tool takes explicit `workspace` (slug or uuid) and, where it acts on a task tree, `project` (slug, or `_workspace` for the workspace-level coordination tree). Inside a project, task/question/note IDs are bare (`T###`, `NN.T`, `Q###`, `N###`).
+     - **Mutations:** Every mutating tool (`tasks.new`, `tasks.transition`, `tasks.set`, `questions.ask`, `questions.answer`, `inbox.add_note`) accepts `expect_hash` (optimistic CAS against the hash from the last read), `idempotency_key` (safe retry returning the stored result), and `preview: true` (dry-run without writing), and returns the new `hash`.
+     - **Paging:** List tools (`workspaces.list`, `projects.list`, `tasks.list`, `tasks.next`, `questions.list`) return compact rows with `cursor` / `next_cursor` (`limit` default 50, max 200; responses capped at 256 KiB with `truncated: true`); fetch full task bodies on demand with `tasks.show`.
+     - **No nulls:** Tool arguments and responses never carry `null` fields (omitted instead of `null`).
+   - **Setup:** The Environment Doctor (`ai-orch env status`) detects missing or stale broker MCP registrations across Claude Code, Kilo, and Codex and offers a preview/apply plan (`ai-orch env register-broker --assistants all --apply --expect-hash <hash>`). `ai-orch install-launcher` (`--apply --expect-hash <hash>`) writes the version-free launcher at `~/.local/bin/ai-orch` so MCP registrations (`~/.local/bin/ai-orch mcp`) survive plugin updates.
+2. **Tier 2 — Standalone CLI (no MCP server and no VS Code extension required):**
+   - When a session has no broker MCP tools, run the CLI through the version-free launcher path (`~/.local/bin/ai-orch tasks …`, `ai-orch questions …`, `ai-orch inbox …`), or invoke the bundled stdlib-only script (`python3 <skill-dir>/scripts/tasks_engine.py …`) when only `task-pipeline` is installed.
+3. **Tier 3 — Direct Markdown + Git (zero install: no extension, no MCP, and no CLI installed):**
+   - When neither the VS Code extension, nor the MCP server, nor the `ai-orch` CLI is installed, read, create, transition, and close tasks directly in Markdown + Git (`git mv` to `tasks/done/<category>/`) following the format rules, header field order, section skeletons, and `00-INDEX.md` table columns documented in `task-pipeline` and in `tasks/AGENTS.md`. Preserve the `<!-- ai-orch:generated ... -->` HTML comment markers in `tasks/00-INDEX.md` when updating tables by hand.
+- **Citation rule:** Always cite tasks and questions as `ID (short title)`, qualified as `project/ID (short title)` across projects (see "Citing tasks and questions: id plus a short title" below).
+
 ## Citing tasks and questions: id plus a short title
 
 The owner cannot map bare ids to work. Whenever you mention a task, plan task,
 initiative, use case or question in chat, in a summary, in a Final Report or in
 a question's text, write the id followed by a 3-4 word short title in
-parentheses: "T007 (shared release manager)", "12.16 (UI proposal confirm)",
-"Q007 (security-audit release)". Never a bare id, tables included (add a
-short-title column or put the title next to the id).
+parentheses: `T007 (shared release manager)`, `12.16 (UI proposal confirm)`,
+`Q007 (security-audit release)`. Across projects, qualify the id as
+`project/ID (short title)` (and across workspaces as `workspace:project/ID (short title)`).
+Never use a bare id, tables included (add a short-title column or put the title
+next to the id).
 
 - Take the short title from the task's `Short:` / `short:` field when it exists;
   otherwise derive 3-4 words from its full title (keep them stable within a session).
@@ -320,15 +354,15 @@ short-title column or put the title next to the id).
 When an architectural, security, scope, or financial fork requires a decision,
 the orchestrator must never guess or decide on the owner's behalf.
 
-- **File questions with `ai-orch questions ask`:** Create a question file in
-  `tasks/questions/Q###-<slug>.md` using `ai-orch questions ask`. Provide a
-  standalone question (≤160 chars, ending with `?`), complete context,
-  clear options with consequences, and link the blocked tasks (`--blocks T###`).
+- **File questions with `questions.ask` (or `ai-orch questions ask` fallback):** Create a question file in
+  `tasks/questions/Q###-<slug>.md` using the broker MCP `questions.ask` tool (or `ai-orch questions ask` CLI fallback). Provide a
+  standalone question (≤160 chars, ending with `?`), a 3-4 word `short` title, complete context,
+  clear options with consequences, and link the blocked tasks (`blocks`).
   The blocked tasks automatically transition to `waiting` (`decider: Q###`).
 - **File questions from executors or runs:** When an Executor or headless run
   finishes and its Final Report contains a fenced ` ```ai-orch-question ` JSON
   block, the orchestrator (or the run supervisor) files it immediately via
-  `ai-orch questions ask`, ensuring the question is recorded in `tasks/questions/`
+  `questions.ask` (or `ai-orch questions ask`), ensuring the question is recorded in `tasks/questions/`
   and the blocked task is marked `waiting`.
 - **Batching rules:** Batch multiple questions together into one turn or review
   only when they are strictly independent. If question B depends on the answer
@@ -388,6 +422,19 @@ multiple tasks or sessions.
 | You abandon it | `waiting`/`blocked` with the reason, or `dropped` |
 
 A task being worked on while still `open`, or finished while still `in progress`, is a bookkeeping bug: fix it before anything else. `ai-orch run start` performs the dispatch transition itself; for every other way of dispatching, you do.
+
+## Tooling feedback
+
+When you hit friction, a defect, a missing feature or a wrong default in `ai-orch`, its UI, the VS Code extension or the delegation tooling, or when a new need appears, report it at once with `ai-orch feedback`:
+
+```bash
+ai-orch feedback --kind bug|feature|idea|request --title "<short>" --body "<what, where, expected vs actual>"
+```
+
+- **Report immediately:** do not work around tooling issues silently.
+- **One note per item:** capture what you ran, what you expected, and what happened.
+- **No sensitive data:** never include secrets, private hostnames, or audit findings in notes.
+- **Triage:** maintainers triage notes into tasks and reply with the task ID and short title.
 
 Remember: the RAG index behind `kilo_rag_search` is a standing resource for your own exploration and Q&A too — use it even when you are not delegating anything.
 

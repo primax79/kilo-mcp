@@ -62,6 +62,12 @@ def find_ai_architect_executor(explicit=None):
         return pathlib.Path(env).resolve()
     if DEFAULT_UPSTREAM.exists():
         return DEFAULT_UPSTREAM
+    cur = REPO_ROOT
+    while cur.parent != cur:
+        candidate = cur.parent / 'ai-orchestration'
+        if candidate.is_dir():
+            return candidate.resolve()
+        cur = cur.parent
     return (REPO_ROOT / '..' / 'ai-architect-executor').resolve()
 
 

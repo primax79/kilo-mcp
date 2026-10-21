@@ -259,6 +259,34 @@ def _get_linger_grace() -> float:
         float
     )
 
+# Context size preflight thresholds (estimated tokens across prompt + focus_files)
+MAX_CONTEXT_TOKENS_WARN = _cfg(
+    "KILO_MCP_MAX_CONTEXT_TOKENS_WARN", "kilo", "max_context_tokens_warn", 40000, int
+)
+MAX_CONTEXT_TOKENS_REFUSE = _cfg(
+    "KILO_MCP_MAX_CONTEXT_TOKENS_REFUSE", "kilo", "max_context_tokens_refuse", 120000, int
+)
+
+
+def _get_max_context_tokens_warn() -> int:
+    val = os.environ.get("KILO_MCP_MAX_CONTEXT_TOKENS_WARN")
+    if val is not None:
+        try:
+            return int(val)
+        except ValueError:
+            pass
+    return MAX_CONTEXT_TOKENS_WARN
+
+
+def _get_max_context_tokens_refuse() -> int:
+    val = os.environ.get("KILO_MCP_MAX_CONTEXT_TOKENS_REFUSE")
+    if val is not None:
+        try:
+            return int(val)
+        except ValueError:
+            pass
+    return MAX_CONTEXT_TOKENS_REFUSE
+
 # Server API Endpoint Configuration (for communicating with running kilo serve instance)
 KILO_SERVER_URL = _cfg("KILO_SERVER_URL", "kilo", "server_url", "")
 KILO_SERVER_PASSWORD = _cfg("KILO_SERVER_PASSWORD", "kilo", "server_password", "")
@@ -936,9 +964,141 @@ INLINE_INPUT_PER_OUTPUT = _cfg("KILO_MCP_INLINE_INPUT_PER_OUTPUT", "metrics",
                                "inline_input_per_output", 40.0, float)
 
 
+def _get_chars_per_token() -> float:
+    val = os.environ.get("KILO_MCP_CHARS_PER_TOKEN")
+    if val is not None:
+        try:
+            return float(val)
+        except ValueError:
+            pass
+    return CHARS_PER_TOKEN
+
+
 def _tok(chars: int) -> int:
     """Rough chars→tokens estimate."""
-    return int(chars / CHARS_PER_TOKEN)
+    cpt = _get_chars_per_token()
+    if cpt <= 0:
+        cpt = 4.0
+    return int(chars / cpt)
+
+
+def _assemble_task_prompt(
+    task_instructions: str,
+    focus_files: Optional[list[str]] = None,
+    execution_hints: Optional[str] = None,
+    skills_to_load: Optional[list[str]] = None,
+    proposed_files: str = "untracked",
+) -> str:
+    """Assemble the structured Markdown prompt file delivered to Kilo."""
+    sections = ["# Task Specification from the Orchestrating Architect"]
+    if focus_files:
+        file_list = "\n".join(f"- {f}" for f in focus_files)
+        sections.append(
+            "## Context Files — read these FIRST\n"
+            "Before doing anything else, read the following files to build context:\n"
+            f"{file_list}"
+        )
+    sections.append("## Task Instructions\n" + task_instructions)
+    if execution_hints:
+        sections.append("## Execution Hints & Strategy\n" + execution_hints)
+    if skills_to_load:
+        skill_list = "\n".join(f"- {s}" for s in skills_to_load)
+        sections.append(
+            "## Required Skills\n"
+            "Load and follow each of these skills before starting the task:\n"
+            f"{skill_list}"
+        )
+    protected_section = (
+        "## Protected files (never edit)\n"
+        "Do not create, edit or delete the project-root AGENTS.md, kilo.json, kilo.jsonc, "
+        "opencode.json or opencode.jsonc, or anything under .kilo/ or .kilocode/ (except "
+        ".kilo/plans/). This run is unattended: the approval ask for those files is rejected "
+        "and the run ends. When the task needs such a change, write the full intended content "
+        "to `<path>.proposed` (e.g. AGENTS.md.proposed), keep working, and list it under "
+        "Issues in the Final Report."
+    )
+    if proposed_files == "untracked":
+        protected_section += (
+            " Leave `*.proposed` files uncommitted: never `git add` them, and if the task asks for a commit, commit everything else."
+        )
+    sections.append(protected_section)
+    sections.append(
+        "## Final Report (mandatory)\n"
+        "Your final message MUST be a report with exactly these sections:\n"
+        "- **Outcome**: success | partial | failed, with one sentence why.\n"
+        "- **Files changed**: every file created/modified/deleted, one per line.\n"
+        "- **Verification**: commands you ran to verify (tests, builds) and their results.\n"
+        "- **Issues**: anything incomplete, skipped, or needing the architect's review; 'none' otherwise.\n\n"
+        "When the task instructions enumerate items (a numbered or bulleted list of deliverables), "
+        'the report includes one line per item ("done" or "not done: why"), in the same order.'
+    )
+    return "\n\n".join(sections)
+
+
+def estimate_initial_context_tokens(
+    task_instructions: str,
+    working_directory: Optional[str] = None,
+    focus_files: Optional[list[str]] = None,
+    execution_hints: Optional[str] = None,
+    skills_to_load: Optional[list[str]] = None,
+) -> dict:
+    """Estimate total initial context tokens across assembled prompt and focus_files.
+
+    Returns:
+        dict with {
+            "total_tokens": int,
+            "prompt_tokens": int,
+            "focus_files_tokens": int,
+            "file_breakdown": list[tuple[str, int]],
+            "warn_threshold": int,
+            "refuse_threshold": int,
+            "status": "ok" | "warn" | "refuse"
+        }
+    """
+    target_dir = str(working_directory) if working_directory else os.getcwd()
+    prompt = _assemble_task_prompt(
+        task_instructions=task_instructions,
+        focus_files=focus_files,
+        execution_hints=execution_hints,
+        skills_to_load=skills_to_load,
+    )
+    prompt_tokens = _tok(len(prompt))
+
+    file_breakdown: list[tuple[str, int]] = []
+    focus_files_tokens = 0
+    if focus_files:
+        for f in focus_files:
+            full_path = f if os.path.isabs(f) else os.path.join(target_dir, f)
+            tokens = 0
+            try:
+                if os.path.isfile(full_path) and os.access(full_path, os.R_OK):
+                    size = os.path.getsize(full_path)
+                    tokens = _tok(size)
+            except OSError:
+                tokens = 0
+            file_breakdown.append((f, tokens))
+            focus_files_tokens += tokens
+
+    total_tokens = prompt_tokens + focus_files_tokens
+    warn_threshold = _get_max_context_tokens_warn()
+    refuse_threshold = _get_max_context_tokens_refuse()
+
+    if refuse_threshold > 0 and total_tokens > refuse_threshold:
+        status = "refuse"
+    elif warn_threshold > 0 and total_tokens > warn_threshold:
+        status = "warn"
+    else:
+        status = "ok"
+
+    return {
+        "total_tokens": total_tokens,
+        "prompt_tokens": prompt_tokens,
+        "focus_files_tokens": focus_files_tokens,
+        "file_breakdown": file_breakdown,
+        "warn_threshold": warn_threshold,
+        "refuse_threshold": refuse_threshold,
+        "status": status,
+    }
 
 
 def _append_jsonl(path: str, record: dict) -> None:
@@ -1434,6 +1594,9 @@ How to use it well:
    When the task instructions enumerate items (a numbered or bulleted list of
    deliverables), Kilo is instructed to include one line per item ("done" or
    "not done: why") in the Final Report, in the same order.
+   Initial context size (prompt + focus_files) is checked by preflight: warns above
+   `max_context_tokens_warn` (default 40,000) and refuses above `max_context_tokens_refuse`
+   (default 120,000; 0 disables) to avoid connection resets.
 3. Pick a valid `model` (see kilo_list_models) and `agent`.
 4. Scale how closely you watch it to the task's complexity/risk: a small,
    well-scoped change needs only a final kilo_task_result check; a large,
@@ -1602,7 +1765,9 @@ async def kilo_implement(
         Field(
             description="Paths (absolute, or relative to working_directory) that "
             "Kilo must read before making changes. Populate this with the files "
-            "you identified via kilo_rag_search to keep Kilo focused."
+            "you identified via kilo_rag_search to keep Kilo focused. Preflight "
+            "checks initial context size (prompt + focus_files) against configurable "
+            "warn/refuse thresholds to avoid connection resets."
         ),
     ] = None,
     execution_hints: Annotated[
@@ -1806,6 +1971,45 @@ async def kilo_implement(
                     return f"Error: git {refresh_base} {base_branch_for_task} failed:\n{err_detail}"
                 base_commit_for_task = _git_rev_parse(target_worktree, base_branch_for_task)
 
+    preflight = estimate_initial_context_tokens(
+        task_instructions=task_instructions,
+        working_directory=cwd,
+        focus_files=focus_files,
+        execution_hints=execution_hints,
+        skills_to_load=skills_to_load,
+    )
+    if preflight["status"] == "refuse":
+        total_tok = preflight["total_tokens"]
+        p_tok = preflight["prompt_tokens"]
+        f_tok = preflight["focus_files_tokens"]
+        r_thresh = preflight["refuse_threshold"]
+        breakdown = preflight["file_breakdown"]
+        sorted_files = sorted([entry for entry in breakdown if entry[1] > 0], key=lambda x: x[1], reverse=True)[:3]
+        if not sorted_files and breakdown:
+            sorted_files = breakdown[:3]
+        if sorted_files:
+            largest_files_str = ", ".join(f"{f} (~{tok} tokens)" for f, tok in sorted_files)
+        else:
+            largest_files_str = "none"
+        return (
+            f"Refusal: Initial context size (~{total_tok} tokens: prompt ~{p_tok} tokens, "
+            f"focus_files ~{f_tok} tokens; largest files: {largest_files_str}) "
+            f"exceeds max_context_tokens_refuse ({r_thresh}). "
+            "Split the task into smaller tasks or narrow focus_files "
+            "(or raise KILO_MCP_MAX_CONTEXT_TOKENS_REFUSE / [kilo].max_context_tokens_refuse)."
+        )
+
+    context_warning = ""
+    if preflight["status"] == "warn":
+        total_tok = preflight["total_tokens"]
+        num_focus = len(focus_files) if focus_files else 0
+        w_thresh = preflight["warn_threshold"]
+        context_warning = (
+            f"Warning: Large initial context (~{total_tok} tokens across prompt + "
+            f"{num_focus} focus_files; warn threshold={w_thresh}). "
+            "Consider splitting the task into smaller tasks or trimming focus_files.\n\n"
+        )
+
     run_id = uuid.uuid4().hex[:12]
     collision_warning = ""
     isolated_branch = None
@@ -1830,61 +2034,22 @@ async def kilo_implement(
         collision_warning = _collision_warning(cwd, exclude_run_id=run_id)
     collision_warning = _protected_paths_warning(task_instructions, focus_files) + collision_warning
 
-    # Section order is deliberate: context files first (read before acting),
-    # then the task, then strategy, then skills, and finally the report
-    # contract that Claude-as-reviewer parses from STDOUT.
-    sections = ["# Task Specification from the Orchestrating Architect"]
-    if focus_files:
-        file_list = "\n".join(f"- {f}" for f in focus_files)
-        sections.append(
-            "## Context Files — read these FIRST\n"
-            "Before doing anything else, read the following files to build context:\n"
-            f"{file_list}"
-        )
-    sections.append("## Task Instructions\n" + task_instructions)
-    if execution_hints:
-        sections.append("## Execution Hints & Strategy\n" + execution_hints)
-    if skills_to_load:
-        skill_list = "\n".join(f"- {s}" for s in skills_to_load)
-        sections.append(
-            "## Required Skills\n"
-            "Load and follow each of these skills before starting the task:\n"
-            f"{skill_list}"
-        )
-    protected_section = (
-        "## Protected files (never edit)\n"
-        "Do not create, edit or delete the project-root AGENTS.md, kilo.json, kilo.jsonc, "
-        "opencode.json or opencode.jsonc, or anything under .kilo/ or .kilocode/ (except "
-        ".kilo/plans/). This run is unattended: the approval ask for those files is rejected "
-        "and the run ends. When the task needs such a change, write the full intended content "
-        "to `<path>.proposed` (e.g. AGENTS.md.proposed), keep working, and list it under "
-        "Issues in the Final Report."
+    full_content = _assemble_task_prompt(
+        task_instructions=task_instructions,
+        focus_files=focus_files,
+        execution_hints=execution_hints,
+        skills_to_load=skills_to_load,
+        proposed_files=proposed_files,
     )
-    if proposed_files == "untracked":
-        protected_section += (
-            " Leave `*.proposed` files uncommitted: never `git add` them, and if the task asks for a commit, commit everything else."
-        )
-    sections.append(protected_section)
-    sections.append(
-        "## Final Report (mandatory)\n"
-        "Your final message MUST be a report with exactly these sections:\n"
-        "- **Outcome**: success | partial | failed, with one sentence why.\n"
-        "- **Files changed**: every file created/modified/deleted, one per line.\n"
-        "- **Verification**: commands you ran to verify (tests, builds) and their results.\n"
-        "- **Issues**: anything incomplete, skipped, or needing the architect's review; 'none' otherwise.\n\n"
-        "When the task instructions enumerate items (a numbered or bulleted list of deliverables), "
-        'the report includes one line per item ("done" or "not done: why"), in the same order.'
-    )
-    full_content = "\n\n".join(sections)
 
     env = os.environ.copy()
     if env_vars:
         for key, value in env_vars.items():
             env[key] = str(value)
 
-    warnings_prefix = ""
+    warnings_prefix = context_warning
     if model_warnings:
-        warnings_prefix = "\n\n".join(model_warnings) + "\n\n"
+        warnings_prefix += "\n\n".join(model_warnings) + "\n\n"
 
     if not background:
         result = await _execute_implement(
