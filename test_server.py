@@ -3294,3 +3294,368 @@ def test_resolve_kilo_model_no_config_falls_back_to_server_default(tmp_path, fak
     assert cmd[cmd.index("--model") + 1] == server.DEFAULT_MODEL
     assert f"- Model: {server.DEFAULT_MODEL} (server default)" in run_res
 
+
+# ==============================================================================
+# T020 tests: worktree hygiene, base refresh, running session refusal, notes
+# ==============================================================================
+
+def test_kilo_implement_running_session_refusal(tmp_path, fake_data_dir, monkeypatch):
+    """If continue_session_id targets a session with an active running task,
+    kilo_implement must refuse to spawn a second process and return a clear refusal."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    session_id = "ses_running_active_1"
+    running_task_id = "task_running_123"
+
+    # Write a running task record
+    server._write_task_record(running_task_id, {
+        "status": "running",
+        "started": "2026-10-21T07:00:00Z",
+        "working_directory": str(tmp_path),
+        "session_id": session_id,
+        "pid": 98765,
+    })
+
+    # Mock _is_pid_alive to report PID 98765 as alive
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: pid == 98765)
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Follow-up instructions",
+        working_directory=str(tmp_path),
+        continue_session_id=session_id,
+        background=False,
+    ))
+
+    assert not res.startswith("Error:")
+    assert "Refusal: session 'ses_running_active_1' already has a running task (task_running_123)" in res
+    assert "kilo_task_wait" in res
+    assert "kilo_task_cancel" in res
+
+
+def test_exclude_worktrees_from_git(tmp_path):
+    """_ensure_worktrees_excluded appends /.kilo/ to <git common dir>/info/exclude
+    only once, does not duplicate, skips when already ignored, and never touches .gitignore."""
+    repo = _init_git_repo(tmp_path / "repo1")
+
+    # Before exclude: check-ignore returns non-zero
+    chk1 = subprocess.run(["git", "-C", repo, "check-ignore", "-q", ".kilo/worktrees"])
+    assert chk1.returncode != 0
+
+    # Ensure excluded
+    ok = server._ensure_worktrees_excluded(repo)
+    assert ok is True
+
+    # Now check-ignore returns 0
+    chk2 = subprocess.run(["git", "-C", repo, "check-ignore", "-q", ".kilo/worktrees"])
+    assert chk2.returncode == 0
+
+    exclude_file = os.path.join(repo, ".git", "info", "exclude")
+    assert os.path.exists(exclude_file)
+    with open(exclude_file, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "/.kilo/" in content
+
+    # Call a second time: must not duplicate
+    server._ensure_worktrees_excluded(repo)
+    with open(exclude_file, "r", encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f.read().splitlines() if ln.strip() == "/.kilo/"]
+    assert len(lines) == 1
+
+    # Check gitignore was not created or modified
+    gitignore_file = os.path.join(repo, ".gitignore")
+    assert not os.path.exists(gitignore_file)
+
+    # In a repo where .gitignore already ignores .kilo/, info/exclude is skipped
+    repo2 = _init_git_repo(tmp_path / "repo2")
+    with open(os.path.join(repo2, ".gitignore"), "w") as f:
+        f.write(".kilo/\n")
+    subprocess.run(["git", "-C", repo2, "add", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", repo2, "commit", "-m", "ignore .kilo"], check=True)
+
+    exclude_file2 = os.path.join(repo2, ".git", "info", "exclude")
+    initial_content = ""
+    if os.path.exists(exclude_file2):
+        with open(exclude_file2, "r", encoding="utf-8") as f:
+            initial_content = f.read()
+
+    server._ensure_worktrees_excluded(repo2)
+    if os.path.exists(exclude_file2):
+        with open(exclude_file2, "r", encoding="utf-8") as f:
+            assert f.read() == initial_content
+
+
+def test_worktree_base_branch_and_commit_recorded(tmp_path, fake_data_dir, mock_spawn_kilo_background, mock_run_kilo_custom, monkeypatch):
+    """When creating a worktree (isolation='worktree'), base_branch and base_commit
+    are recorded in the task record."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_base")
+    head_sha = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    current_branch = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Isolated work",
+        working_directory=repo,
+        isolation="worktree",
+        worktree_branch="feat-t020-rec",
+        background=True,
+    ))
+    assert "feat-t020-rec" in res
+
+    # Find the task record
+    tasks = [f for f in os.listdir(server.TASKS_DIR) if f.endswith(".json")]
+    assert len(tasks) == 1
+    record = server._read_task_record(tasks[0][:-5])
+    assert record["base_branch"] == current_branch
+    assert record["base_commit"] == head_sha
+    assert record["isolated_branch"] == "feat-t020-rec"
+
+
+def test_refresh_base_merge_success(tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch):
+    """refresh_base='merge' merges changes from base_branch into the worktree."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_merge")
+    base_branch = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    wt_path = os.path.join(repo, ".kilo", "worktrees", "feat-merge-test")
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-b", "feat-merge-test", wt_path],
+        check=True, capture_output=True,
+    )
+
+    # Make a commit on base branch
+    with open(os.path.join(repo, "new_on_base.txt"), "w") as f:
+        f.write("from base\n")
+    subprocess.run(["git", "-C", repo, "add", "new_on_base.txt"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-m", "base update"], check=True)
+
+    session_id = "ses_merge_1"
+    server._write_task_record("task_merge_0", {
+        "status": "completed",
+        "working_directory": wt_path,
+        "session_id": session_id,
+        "base_branch": base_branch,
+        "isolated_branch": "feat-merge-test",
+    })
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Continue session with merge",
+        working_directory=wt_path,
+        continue_session_id=session_id,
+        refresh_base="merge",
+        background=False,
+    ))
+    assert not res.startswith("Error:")
+    # Verify that new_on_base.txt now exists in the worktree
+    assert os.path.exists(os.path.join(wt_path, "new_on_base.txt"))
+
+
+def test_refresh_base_rebase_success(tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch):
+    """refresh_base='rebase' rebases the worktree onto base_branch."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_rebase")
+    base_branch = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    wt_path = os.path.join(repo, ".kilo", "worktrees", "feat-rebase-test")
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-b", "feat-rebase-test", wt_path],
+        check=True, capture_output=True,
+    )
+
+    # Commit on base branch
+    with open(os.path.join(repo, "rebase_base.txt"), "w") as f:
+        f.write("rebase base\n")
+    subprocess.run(["git", "-C", repo, "add", "rebase_base.txt"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-m", "rebase base update"], check=True)
+
+    # Commit on feature worktree
+    with open(os.path.join(wt_path, "feature.txt"), "w") as f:
+        f.write("feature work\n")
+    subprocess.run(["git", "-C", wt_path, "add", "feature.txt"], check=True)
+    subprocess.run(["git", "-C", wt_path, "commit", "-m", "wt commit"], check=True)
+
+    session_id = "ses_rebase_1"
+    server._write_task_record("task_rebase_0", {
+        "status": "completed",
+        "working_directory": wt_path,
+        "session_id": session_id,
+        "base_branch": base_branch,
+        "isolated_branch": "feat-rebase-test",
+    })
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Continue session with rebase",
+        working_directory=wt_path,
+        continue_session_id=session_id,
+        refresh_base="rebase",
+        background=False,
+    ))
+    assert not res.startswith("Error:")
+    assert os.path.exists(os.path.join(wt_path, "rebase_base.txt"))
+    assert os.path.exists(os.path.join(wt_path, "feature.txt"))
+
+
+def test_refresh_base_merge_conflict_rollback(tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch):
+    """When merge conflicts occur during refresh_base='merge', abort and leave worktree untouched."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_conflict_m")
+    base_branch = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    wt_path = os.path.join(repo, ".kilo", "worktrees", "feat-cm-test")
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-b", "feat-cm-test", wt_path],
+        check=True, capture_output=True,
+    )
+
+    # Conflicting changes in README.md
+    with open(os.path.join(repo, "README.md"), "w") as f:
+        f.write("Base version of conflict\n")
+    subprocess.run(["git", "-C", repo, "commit", "-am", "base conflict"], check=True)
+
+    with open(os.path.join(wt_path, "README.md"), "w") as f:
+        f.write("Worktree version of conflict\n")
+    subprocess.run(["git", "-C", wt_path, "commit", "-am", "wt conflict"], check=True)
+
+    session_id = "ses_conf_m"
+    server._write_task_record("task_conf_m_0", {
+        "status": "completed",
+        "working_directory": wt_path,
+        "session_id": session_id,
+        "base_branch": base_branch,
+        "isolated_branch": "feat-cm-test",
+    })
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Continue with conflict merge",
+        working_directory=wt_path,
+        continue_session_id=session_id,
+        refresh_base="merge",
+        background=False,
+    ))
+
+    assert res.startswith("Error:")
+    assert "merge conflicts encountered" in res
+    assert "README.md" in res
+
+    # Verify rollback: status must be clean and file has wt version
+    st = subprocess.run(["git", "-C", wt_path, "status", "--porcelain"], capture_output=True, text=True)
+    assert st.stdout.strip() == ""
+    with open(os.path.join(wt_path, "README.md")) as f:
+        assert f.read() == "Worktree version of conflict\n"
+
+
+def test_refresh_base_rebase_conflict_rollback(tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch):
+    """When rebase conflicts occur during refresh_base='rebase', abort and leave worktree untouched."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_conflict_r")
+    base_branch = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    wt_path = os.path.join(repo, ".kilo", "worktrees", "feat-cr-test")
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-b", "feat-cr-test", wt_path],
+        check=True, capture_output=True,
+    )
+
+    with open(os.path.join(repo, "README.md"), "w") as f:
+        f.write("Base version of conflict for rebase\n")
+    subprocess.run(["git", "-C", repo, "commit", "-am", "base conflict r"], check=True)
+
+    with open(os.path.join(wt_path, "README.md"), "w") as f:
+        f.write("Worktree version of conflict for rebase\n")
+    subprocess.run(["git", "-C", wt_path, "commit", "-am", "wt conflict r"], check=True)
+
+    session_id = "ses_conf_r"
+    server._write_task_record("task_conf_r_0", {
+        "status": "completed",
+        "working_directory": wt_path,
+        "session_id": session_id,
+        "base_branch": base_branch,
+        "isolated_branch": "feat-cr-test",
+    })
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Continue with conflict rebase",
+        working_directory=wt_path,
+        continue_session_id=session_id,
+        refresh_base="rebase",
+        background=False,
+    ))
+
+    assert res.startswith("Error:")
+    assert "rebase conflicts encountered" in res
+    assert "README.md" in res
+
+    st = subprocess.run(["git", "-C", wt_path, "status", "--porcelain"], capture_output=True, text=True)
+    assert st.stdout.strip() == ""
+    with open(os.path.join(wt_path, "README.md")) as f:
+        assert f.read() == "Worktree version of conflict for rebase\n"
+
+
+def test_base_moved_note_in_task_result_and_workspace_status(tmp_path, fake_data_dir, monkeypatch):
+    """kilo_task_result and kilo_workspace_status note when base_branch moved since creation."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_moved")
+    base_branch = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    c0 = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    wt_path = os.path.join(repo, ".kilo", "worktrees", "feat-moved")
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-b", "feat-moved", wt_path],
+        check=True, capture_output=True,
+    )
+
+    task_id = "task_moved_test_1"
+    server._write_task_record(task_id, {
+        "status": "completed",
+        "working_directory": wt_path,
+        "isolated_branch": "feat-moved",
+        "base_branch": base_branch,
+        "base_commit": c0,
+        "exit_code": 0,
+    })
+
+    # Before base moves: no note
+    st_initial = asyncio.run(server.kilo_workspace_status(working_directory=wt_path))
+    assert "base moved by" not in st_initial
+
+    res_initial = asyncio.run(server.kilo_task_result(task_id))
+    assert "base moved by" not in res_initial
+
+    # Advance base branch by 2 commits
+    for i in range(2):
+        with open(os.path.join(repo, f"step_{i}.txt"), "w") as f:
+            f.write(f"step {i}\n")
+        subprocess.run(["git", "-C", repo, "add", "."], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-m", f"base step {i}"], check=True)
+
+    # After base moves: note must appear
+    st_after = asyncio.run(server.kilo_workspace_status(working_directory=wt_path))
+    expected_note = f"base moved by 2 commits; merge with refresh_base='merge' or review with git diff {base_branch}...feat-moved"
+    assert expected_note in st_after
+
+    res_after = asyncio.run(server.kilo_task_result(task_id))
+    assert expected_note in res_after
+
+

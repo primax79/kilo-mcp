@@ -1447,9 +1447,12 @@ restart from scratch — read its `session_id` (in the result / progress
 report), optionally kilo_task_cancel the current run, then call
 kilo_implement again with `continue_session_id` set to that id and corrective
 `task_instructions`. Kilo resumes the SAME session with full memory of what
-it already built, rather than starting blind. (The Kilo CLI queues a
-follow-up message even into a still-running session, so this also works as a
-live nudge without cancelling first.)
+it already built, rather than starting blind. If a task is still actively
+running on that session, kilo_implement refuses to spawn a second process —
+wait for it to complete with kilo_task_wait or stop it with kilo_task_cancel
+before continuing. When continuing a session in an isolated worktree, pass
+refresh_base='merge' or refresh_base='rebase' to update the worktree from the
+current tip of its base branch before resuming.
 
 Parallelism: emitting several kilo_implement calls in one turn runs them
 concurrently (independent Kilo subprocesses) — useful for isolated features
@@ -1466,6 +1469,10 @@ single trivial edit, and always when dispatching parallel tasks against the
 same repo. If you don't isolate, the response is prefixed with a collision
 warning whenever another task is already running against the exact same
 `working_directory` — treat that warning as a stop sign, not a formality.
+
+When to skip a worktree: a worktree adds nothing for a brand new repository or
+a directory nobody else writes to; it is still recommended whenever another
+writer (a session, the user, another task) may touch the same tree.
 
 ⚠️ PROTECTED CONFIG FILES: Kilo always asks for approval before editing the
 project-root `AGENTS.md`, `kilo.json(c)`, `opencode.json(c)`, or anything
@@ -1683,6 +1690,16 @@ async def kilo_implement(
             "worktree/branch when present, Final Report, and log path)."
         ),
     ] = False,
+    refresh_base: Annotated[
+        Literal["no", "merge", "rebase"],
+        Field(
+            description="When continuing a session in a worktree (via continue_session_id), "
+            "optionally update the worktree from the current tip of the base branch before "
+            "resuming: 'no' (default, leave worktree as is), 'merge' (git merge <base_branch>), "
+            "or 'rebase' (git rebase <base_branch>). If conflicts occur, the merge/rebase is "
+            "aborted, leaving the worktree untouched, and an error listing conflicting files is returned."
+        ),
+    ] = "no",
 ) -> str:
     """Delegate a code implementation task to Kilo. See the tool description
     (built from _IMPLEMENT_DESCRIPTION + DELEGATION_POLICY) for full guidance."""
@@ -1715,12 +1732,68 @@ async def kilo_implement(
             "Use a primary agent (e.g. 'code') or use 'kilo_rag_search' for read-only exploration."
         )
 
+    if continue_session_id:
+        running_task = _find_running_task_for_session(continue_session_id)
+        if running_task:
+            running_task_id, _ = running_task
+            return (
+                f"Refusal: session '{continue_session_id}' already has a running task ({running_task_id}). "
+                f"Wait for it to finish with kilo_task_wait (task_id='{running_task_id}') or cancel it with "
+                f"kilo_task_cancel (task_id='{running_task_id}') before continuing the session."
+            )
+
+    prior_rec = None
+    target_worktree = None
+    base_branch_for_task = None
+    base_commit_for_task = None
+
+    if continue_session_id:
+        prior_rec = _find_task_record_by_session_id(continue_session_id)
+        if working_directory and _is_git_worktree(working_directory):
+            target_worktree = working_directory
+        elif prior_rec and prior_rec.get("working_directory") and _is_git_worktree(prior_rec["working_directory"]):
+            target_worktree = prior_rec["working_directory"]
+        elif _is_git_worktree(cwd):
+            target_worktree = cwd
+
+        if target_worktree:
+            cwd = target_worktree
+            if prior_rec and prior_rec.get("base_branch"):
+                base_branch_for_task = prior_rec["base_branch"]
+            if not base_branch_for_task:
+                meta = _read_worktree_git_metadata(target_worktree)
+                if meta and meta.get("parentBranch"):
+                    base_branch_for_task = meta["parentBranch"]
+            if not base_branch_for_task:
+                base_branch_for_task = "main"
+
+            if prior_rec and prior_rec.get("base_commit"):
+                base_commit_for_task = prior_rec["base_commit"]
+            if not base_commit_for_task:
+                meta = _read_worktree_git_metadata(target_worktree)
+                if meta and meta.get("baseCommit"):
+                    base_commit_for_task = meta["baseCommit"]
+
+            if refresh_base in ("merge", "rebase"):
+                ok, err_detail, conflicts = _refresh_worktree_base(target_worktree, base_branch_for_task, refresh_base)
+                if not ok:
+                    if conflicts:
+                        conflict_list = "\n".join(f"- {f}" for f in conflicts)
+                        return (
+                            f"Error: {refresh_base} conflicts encountered while updating worktree from base branch '{base_branch_for_task}':\n"
+                            f"{conflict_list}"
+                        )
+                    return f"Error: git {refresh_base} {base_branch_for_task} failed:\n{err_detail}"
+                base_commit_for_task = _git_rev_parse(target_worktree, base_branch_for_task)
+
     run_id = uuid.uuid4().hex[:12]
     collision_warning = ""
     isolated_branch = None
     agent_manager_worktree_id = None
     if isolation == "worktree":
         isolated_branch = worktree_branch or f"kilo/{run_id}"
+        base_branch_for_task = worktree_base_branch or _current_branch(cwd) or "main"
+        base_commit_for_task = _git_rev_parse(cwd, base_branch_for_task)
         worktree_path, wt_rc, wt_stdout, wt_stderr, agent_manager_worktree_id = await _create_worktree(
             cwd, isolated_branch, worktree_base_branch, os.environ.copy()
         )
@@ -1730,6 +1803,9 @@ async def kilo_implement(
                 f"under {cwd}.\nExit code: {wt_rc}\nSTDOUT: {wt_stdout}\nSTDERR: {wt_stderr}"
             )
         cwd = worktree_path
+    elif target_worktree:
+        isolated_branch = (prior_rec.get("isolated_branch") if prior_rec else None) or _current_branch(target_worktree)
+        agent_manager_worktree_id = prior_rec.get("agent_manager_worktree_id") if prior_rec else None
     else:
         collision_warning = _collision_warning(cwd, exclude_run_id=run_id)
     collision_warning = _protected_paths_warning(task_instructions, focus_files) + collision_warning
@@ -1793,6 +1869,8 @@ async def kilo_implement(
             include_trace=include_trace,
             isolated_branch=isolated_branch,
             model_source=model_source,
+            base_branch=base_branch_for_task,
+            base_commit=base_commit_for_task,
         )
         return warnings_prefix + collision_warning + result
 
@@ -1837,7 +1915,7 @@ async def kilo_implement(
         return collision_warning + f"Error launching Kilo in background: {e}"
 
     started_iso = datetime.now(timezone.utc).isoformat()
-    _write_task_record(run_id, {
+    bg_rec = {
         "status": "running",
         "started": started_iso,
         "working_directory": cwd,
@@ -1852,7 +1930,12 @@ async def kilo_implement(
         # Continuing or created session_id: record it up front so kilo_task_progress
         # finds it immediately from the first millisecond.
         "session_id": server_session_id,
-    })
+    }
+    if base_branch_for_task:
+        bg_rec["base_branch"] = base_branch_for_task
+    if base_commit_for_task:
+        bg_rec["base_commit"] = base_commit_for_task
+    _write_task_record(run_id, bg_rec)
     if server_session_id:
         _agent_manager_note_session(cwd, server_session_id, agent_manager_worktree_id)
     else:
@@ -2082,6 +2165,273 @@ def _find_running_tasks_for_cwd(cwd: str, exclude_run_id: Optional[str] = None) 
     return matches
 
 
+def _find_running_task_for_session(session_id: str) -> Optional[tuple[str, dict]]:
+    """Return (task_id, record) for a task still marked 'running' with a live process
+    whose session_id matches the given session_id. Verified using _is_pid_alive which
+    checks process liveness and command line via ps."""
+    if not session_id or not os.path.isdir(TASKS_DIR):
+        return None
+    try:
+        filenames = os.listdir(TASKS_DIR)
+    except OSError:
+        return None
+    for filename in filenames:
+        if not filename.endswith(".json"):
+            continue
+        task_id = filename[:-len(".json")]
+        record = _read_task_record(task_id)
+        if not record or record.get("status") != "running":
+            continue
+        rec_session = record.get("session_id")
+        if not rec_session:
+            rec_session = _find_session_for_task(
+                record.get("working_directory", ""),
+                record.get("started", ""),
+                task_id,
+            )
+            if rec_session:
+                record["session_id"] = rec_session
+                _write_task_record(task_id, record)
+        if rec_session != session_id:
+            continue
+        if _is_pid_alive(record.get("pid")):
+            return task_id, record
+    return None
+
+
+def _find_task_record_by_session_id(session_id: str) -> Optional[dict]:
+    """Find the most relevant/recent task record matching session_id."""
+    if not session_id or not os.path.isdir(TASKS_DIR):
+        return None
+    try:
+        filenames = os.listdir(TASKS_DIR)
+    except OSError:
+        return None
+    matches = []
+    for filename in filenames:
+        if not filename.endswith(".json"):
+            continue
+        task_id = filename[:-len(".json")]
+        record = _read_task_record(task_id)
+        if not record:
+            continue
+        if record.get("session_id") == session_id:
+            record["task_id"] = task_id
+            matches.append(record)
+    if not matches:
+        return None
+    matches.sort(key=lambda r: r.get("started") or "", reverse=True)
+    return matches[0]
+
+
+def _ensure_worktrees_excluded(cwd: str) -> bool:
+    """Make sure .kilo/worktrees (or /.kilo/) is ignored in <git common dir>/info/exclude.
+    Does nothing if already ignored by an existing rule or if cwd is not a git repo.
+    Never edits the repo's tracked .gitignore."""
+    try:
+        res = subprocess.run(
+            ["git", "check-ignore", "-q", ".kilo/worktrees"],
+            cwd=cwd, capture_output=True, timeout=5,
+        )
+        if res.returncode == 0:
+            return True
+
+        common_res = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+        if common_res.returncode == 0 and common_res.stdout.strip():
+            git_common_dir = common_res.stdout.strip()
+        else:
+            fallback_res = subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=cwd, capture_output=True, text=True, timeout=5,
+            )
+            if fallback_res.returncode != 0 or not fallback_res.stdout.strip():
+                return False
+            raw_dir = fallback_res.stdout.strip()
+            git_common_dir = os.path.normpath(os.path.join(cwd, raw_dir)) if not os.path.isabs(raw_dir) else raw_dir
+
+        exclude_file = os.path.join(git_common_dir, "info", "exclude")
+        os.makedirs(os.path.dirname(exclude_file), exist_ok=True)
+        content = ""
+        if os.path.exists(exclude_file):
+            try:
+                with open(exclude_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except OSError:
+                content = ""
+
+        lines = [ln.strip() for ln in content.splitlines()]
+        if any(ln in ("/.kilo/", "/.kilo", ".kilo/", ".kilo") for ln in lines):
+            return True
+
+        with open(exclude_file, "a", encoding="utf-8") as f:
+            if content and not content.endswith("\n"):
+                f.write("\n")
+            f.write("/.kilo/\n")
+        return True
+    except Exception:
+        return False
+
+
+def _is_git_worktree(cwd: str) -> bool:
+    """Return True if cwd is a linked git worktree (not the main repository root)."""
+    if not cwd or not os.path.exists(cwd):
+        return False
+    git_entry = os.path.join(cwd, ".git")
+    if os.path.isfile(git_entry):
+        return True
+    try:
+        git_dir_res = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+        common_dir_res = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+        if git_dir_res.returncode == 0 and common_dir_res.returncode == 0:
+            gd = os.path.realpath(os.path.abspath(os.path.join(cwd, git_dir_res.stdout.strip())))
+            cd = os.path.realpath(os.path.abspath(os.path.join(cwd, common_dir_res.stdout.strip())))
+            return gd != cd
+    except Exception:
+        pass
+    return False
+
+
+def _git_rev_parse(cwd: str, ref: str) -> Optional[str]:
+    """Resolve a git ref/commit to a full commit hash."""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", ref],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _refresh_worktree_base(wt_dir: str, base_branch: str, mode: str) -> tuple[bool, Optional[str], list[str]]:
+    """Update a worktree from the current tip of base_branch via merge or rebase.
+    Returns (success, error_detail, conflicting_files). On conflict, aborts the operation
+    leaving the worktree untouched and lists the conflicting files."""
+    if mode == "no":
+        return True, None, []
+    if mode not in ("merge", "rebase"):
+        return False, f"Unknown refresh_base mode '{mode}'", []
+    try:
+        cmd = ["git", mode, base_branch]
+        res = subprocess.run(cmd, cwd=wt_dir, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0:
+            return True, None, []
+
+        diff_res = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=wt_dir, capture_output=True, text=True, timeout=5,
+        )
+        conflicts = [ln.strip() for ln in diff_res.stdout.splitlines() if ln.strip()]
+
+        # Abort the merge/rebase
+        subprocess.run(["git", mode, "--abort"], cwd=wt_dir, capture_output=True, text=True, timeout=10)
+
+        err_detail = res.stderr.strip() or res.stdout.strip()
+        return False, err_detail, conflicts
+    except Exception as e:
+        return False, str(e), []
+
+
+def _check_base_moved(
+    cwd: Optional[str],
+    base_branch: Optional[str] = None,
+    base_commit: Optional[str] = None,
+    branch: Optional[str] = None,
+) -> Optional[str]:
+    """Check if the base branch has moved since the worktree was created.
+    Returns the note string if moved, else None."""
+    if not cwd or not os.path.exists(cwd):
+        return None
+    if not _is_git_worktree(cwd):
+        return None
+
+    if not branch:
+        branch = _current_branch(cwd) or "HEAD"
+
+    if not base_branch:
+        if os.path.isdir(TASKS_DIR):
+            for fname in os.listdir(TASKS_DIR):
+                if fname.endswith(".json"):
+                    rec = _read_task_record(fname[:-5])
+                    if rec and rec.get("working_directory") and os.path.realpath(rec["working_directory"]) == os.path.realpath(cwd):
+                        if rec.get("base_branch"):
+                            base_branch = rec["base_branch"]
+                            if not base_commit and rec.get("base_commit"):
+                                base_commit = rec["base_commit"]
+                            break
+
+    if not base_branch:
+        meta = _read_worktree_git_metadata(cwd)
+        if meta and meta.get("parentBranch"):
+            base_branch = meta["parentBranch"]
+            if not base_commit and meta.get("baseCommit"):
+                base_commit = meta["baseCommit"]
+
+    if not base_branch:
+        root = _agent_manager_root(cwd)
+        if root:
+            am_data = _agent_manager_read(root)
+            for wt in am_data.get("worktrees", {}).values():
+                if os.path.realpath(wt.get("path", "")) == os.path.realpath(cwd):
+                    base_branch = wt.get("parentBranch")
+                    if not base_commit and wt.get("baseCommit"):
+                        base_commit = wt["baseCommit"]
+                    break
+
+    if not base_branch:
+        return None
+
+    # Check if base_branch ref exists in git
+    verify_res = subprocess.run(
+        ["git", "rev-parse", "--verify", base_branch],
+        cwd=cwd, capture_output=True, text=True, timeout=5,
+    )
+    if verify_res.returncode != 0:
+        return None
+
+    if not base_commit:
+        # Fallback to merge-base between branch and base_branch
+        mb_res = subprocess.run(
+            ["git", "merge-base", branch, base_branch],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+        if mb_res.returncode == 0 and mb_res.stdout.strip():
+            base_commit = mb_res.stdout.strip()
+
+    if not base_commit:
+        return None
+
+    res = subprocess.run(
+        ["git", "rev-list", "--count", f"{base_commit}..{base_branch}"],
+        cwd=cwd, capture_output=True, text=True, timeout=5,
+    )
+    if res.returncode != 0:
+        return None
+    try:
+        count = int(res.stdout.strip())
+    except ValueError:
+        return None
+
+    if count > 0:
+        plural = "commit" if count == 1 else "commits"
+        return (
+            f"base moved by {count} {plural}; "
+            f"merge with refresh_base='merge' or review with git diff {base_branch}...{branch}"
+        )
+    return None
+
+
 # Files Kilo's ConfigProtection always asks about (packages/opencode/src/kilocode/
 # permission/config-paths.ts): an unattended `kilo run` auto-rejects the ask and
 # ends the run.
@@ -2143,7 +2493,9 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              agent_manager_worktree_id: Optional[str] = None,
                              include_trace: bool = False,
                              isolated_branch: Optional[str] = None,
-                             model_source: Optional[str] = None) -> str:
+                             model_source: Optional[str] = None,
+                             base_branch: Optional[str] = None,
+                             base_commit: Optional[str] = None) -> str:
     """Run one Kilo implementation task end-to-end: temp-file spec bridge,
     subprocess, Final-Report parsing, metrics. Used by the synchronous
     (background=False) path of kilo_implement only — the background path
@@ -2187,13 +2539,40 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         report = _parse_final_report(stdout)
         final_status = "completed" if (returncode == 0 and report.get("outcome") in ("success", "partial")) else "failed"
 
+        task_rec = {
+            "status": final_status,
+            "started": started_wall,
+            "working_directory": cwd,
+            "agent": agent,
+            "model": model,
+            "model_source": model_source,
+            "isolated_branch": isolated_branch,
+            "agent_manager_worktree_id": agent_manager_worktree_id,
+            "exit_code": returncode,
+            "log_path": log_path,
+            "session_id": session_id,
+        }
+        if base_branch:
+            task_rec["base_branch"] = base_branch
+        if base_commit:
+            task_rec["base_commit"] = base_commit
+        _write_task_record(run_id, task_rec)
+
+        base_moved_note = _check_base_moved(
+            cwd=cwd,
+            base_branch=base_branch,
+            base_commit=base_commit,
+            branch=isolated_branch,
+        )
+
         source_str = f" ({model_source})" if model_source else ""
         if include_trace:
+            note_str = f"\n\nNote: {base_moved_note}" if base_moved_note else ""
             result_text = (
                 f"Kilo Execution Finished. (run_id: {run_id} — use it with kilo_log_issue "
                 f"if your review finds defects; session_id: {session_id or 'unknown'} — pass "
                 f"it as continue_session_id on a follow-up kilo_implement call to steer this "
-                f"same session)\n\n"
+                f"same session){note_str}\n\n"
                 f"- Model: {model}{source_str}\n"
                 f"Exit Code: {returncode}\n\n"
                 f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
@@ -2212,6 +2591,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                 lines.append(f"- Branch: {isolated_branch}")
                 lines.append(f"- Worktree: {cwd}")
             lines.append(f"- Log file: {log_path}")
+            if base_moved_note:
+                lines.append(f"- Note: {base_moved_note}")
             lines.append("")
 
             final_report_text = _extract_final_report(stdout)
@@ -2521,9 +2902,17 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
             f"(the Kilo process has exited — task_id: {task_id}, session_id: {session_id or 'unknown'})."
         )
 
+    base_moved_note = _check_base_moved(
+        cwd=working_directory,
+        base_branch=record.get("base_branch"),
+        base_commit=record.get("base_commit"),
+        branch=isolated_branch,
+    )
+
     if include_trace:
         trace_body = log_content or "(no log content captured)"
-        return f"{header}\n\nLOG:\n{trace_body}"
+        note_str = f"\n\nNote: {base_moved_note}" if base_moved_note else ""
+        return f"{header}{note_str}\n\nLOG:\n{trace_body}"
 
     lines = [header, ""]
     lines.append(f"- Status: {status}")
@@ -2542,6 +2931,8 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
             lines.append(f"- Worktree: {working_directory}")
     if log_path:
         lines.append(f"- Log file: {log_path}")
+    if base_moved_note:
+        lines.append(f"- Note: {base_moved_note}")
     lines.append("")
 
     final_report = _extract_final_report(log_content)
@@ -3376,10 +3767,24 @@ def _worktree_git_dir(worktree_path: str) -> Optional[str]:
         return None
 
 
+def _read_worktree_git_metadata(worktree_path: str) -> Optional[dict]:
+    git_dir = _worktree_git_dir(worktree_path)
+    if not git_dir or not os.path.isdir(git_dir):
+        return None
+    meta_file = os.path.join(git_dir, GIT_METADATA_FILE)
+    try:
+        with open(meta_file, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+            return meta if isinstance(meta, dict) else None
+    except Exception:
+        return None
+
+
 def _write_worktree_git_metadata(worktree_path: str, *,
                                   session_id: Optional[str] = None,
                                   parent_branch: Optional[str] = None,
-                                  remote: Optional[str] = None) -> None:
+                                  remote: Optional[str] = None,
+                                  base_commit: Optional[str] = None) -> None:
     """Write or update `<worktree_gitdir>/kilo-agent-manager-metadata.json`
     (`GIT_METADATA_FILE` in `WorktreeManager.ts`), which the Kilo VS Code
     extension's `discoverWorktrees()` / `restoreWorktrees()` reads to recover
@@ -3402,6 +3807,8 @@ def _write_worktree_git_metadata(worktree_path: str, *,
             meta["parentBranch"] = parent_branch
         if remote:
             meta["remote"] = remote
+        if base_commit:
+            meta["baseCommit"] = base_commit
         tmp_file = f"{meta_file}.{os.getpid()}.tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(meta, f)
@@ -3469,7 +3876,8 @@ def _agent_manager_prune_stale(root: str, removed_paths: Optional[set[str]] = No
 
 def _agent_manager_register_worktree(root: str, *, branch: str, path: str,
                                       parent_branch: str, label: Optional[str] = None,
-                                      remote: Optional[str] = None) -> str:
+                                      remote: Optional[str] = None,
+                                      base_commit: Optional[str] = None) -> str:
     """Add a worktree entry to agent-manager.json and return its synthetic id
     (used to link sessions to it via ManagedSession.worktreeId)."""
     wt_id = f"wt-mcp-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
@@ -3486,13 +3894,15 @@ def _agent_manager_register_worktree(root: str, *, branch: str, path: str,
             entry["label"] = label
         if remote:
             entry["remote"] = remote
+        if base_commit:
+            entry["baseCommit"] = base_commit
         data["worktrees"][wt_id] = entry
         order = data.setdefault("worktreeOrder", [])
         if wt_id not in order:
             order.append(wt_id)
 
     _agent_manager_locked_update(root, mutate)
-    _write_worktree_git_metadata(path, parent_branch=parent_branch, remote=remote)
+    _write_worktree_git_metadata(path, parent_branch=parent_branch, remote=remote, base_commit=base_commit)
     return wt_id
 
 
@@ -3588,6 +3998,7 @@ async def _create_worktree(cwd: str, branch_name: str, base_branch: Optional[str
     agent_manager_worktree_id_or_None)."""
     dir_name = _worktree_dir_name(branch_name)
     worktree_rel = os.path.join(".kilo", "worktrees", dir_name)
+    _ensure_worktrees_excluded(cwd)
     cmd = ["git", "worktree", "add", "-b", branch_name, worktree_rel]
     if base_branch:
         cmd.append(base_branch)
@@ -3600,11 +4011,13 @@ async def _create_worktree(cwd: str, branch_name: str, base_branch: Optional[str
         root = _agent_manager_root(cwd)
         if root:
             parent_branch = base_branch or _current_branch(cwd) or "main"
+            base_commit = _git_rev_parse(cwd, parent_branch)
             try:
                 agent_manager_worktree_id = _agent_manager_register_worktree(
                     root, branch=branch_name, path=worktree_path,
                     parent_branch=parent_branch,
                     remote=_resolve_parent_remote(cwd, parent_branch),
+                    base_commit=base_commit,
                 )
             except OSError:
                 logger.warning("Agent Manager worktree registration failed (root=%s, branch=%s) — "
@@ -3763,7 +4176,10 @@ async def kilo_workspace_status(
     returncode, stdout, stderr = await _run_kilo(["git", "status", "-s"], cwd=cwd, env=os.environ.copy())
     if returncode != 0:
         return f"git status failed (exit code {returncode}):\n{stderr}"
-    return f"Workspace status:\n{stdout or '(clean — no uncommitted changes)'}"
+    status_text = stdout or "(clean — no uncommitted changes)"
+    base_moved_note = _check_base_moved(cwd=cwd)
+    note_suffix = f"\n\nNote: {base_moved_note}" if base_moved_note else ""
+    return f"Workspace status:\n{status_text}{note_suffix}"
 
 
 async def _git_head_async(cwd: str) -> Optional[str]:
