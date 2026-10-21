@@ -1482,6 +1482,15 @@ no Final Report and no commit. The delegated prompt therefore tells Kilo to
 write the intended content to `<path>.proposed` instead; apply it yourself.
 Don't ask Kilo to edit those files directly.
 
+Handling of `*.proposed` files is controlled by `proposed_files`:
+- `proposed_files='untracked'` (default): Kilo is instructed to leave `*.proposed`
+  files uncommitted (never `git add` them, committing everything else). After the
+  run, kilo-mcp lists any `*.proposed` files present in the working tree in the
+  result ("Proposed files to apply: …"). If one got committed anyway, the result
+  says so explicitly.
+- `proposed_files='commit'`: Kilo is allowed to commit `*.proposed` files alongside
+  other changes as before.
+
 Returns a text report (trimmed by default: status, exit code, session_id,
 worktree/branch when present, parsed Final Report, and log file path; pass
 `include_trace=true` for the full run trace)."""
@@ -1700,9 +1709,20 @@ async def kilo_implement(
             "aborted, leaving the worktree untouched, and an error listing conflicting files is returned."
         ),
     ] = "no",
+    proposed_files: Annotated[
+        Literal["untracked", "commit"],
+        Field(
+            description="How to handle `*.proposed` files written when Kilo needs to modify "
+            "protected config files (AGENTS.md, kilo.json(c), etc.): 'untracked' (default, tells Kilo to leave "
+            "them uncommitted and lists any in the working tree after the run for the orchestrator to apply) "
+            "or 'commit' (allow Kilo to commit `*.proposed` files alongside other changes as before)."
+        ),
+    ] = "untracked",
 ) -> str:
     """Delegate a code implementation task to Kilo. See the tool description
     (built from _IMPLEMENT_DESCRIPTION + DELEGATION_POLICY) for full guidance."""
+    if proposed_files not in ("untracked", "commit"):
+        return f"Error: proposed_files must be 'untracked' or 'commit', got '{proposed_files}'."
     orig_cwd = working_directory if working_directory else os.getcwd()
     if not os.path.exists(orig_cwd):
         return f"Error: Working directory {orig_cwd} does not exist."
@@ -1831,7 +1851,7 @@ async def kilo_implement(
             "Load and follow each of these skills before starting the task:\n"
             f"{skill_list}"
         )
-    sections.append(
+    protected_section = (
         "## Protected files (never edit)\n"
         "Do not create, edit or delete the project-root AGENTS.md, kilo.json, kilo.jsonc, "
         "opencode.json or opencode.jsonc, or anything under .kilo/ or .kilocode/ (except "
@@ -1840,6 +1860,11 @@ async def kilo_implement(
         "to `<path>.proposed` (e.g. AGENTS.md.proposed), keep working, and list it under "
         "Issues in the Final Report."
     )
+    if proposed_files == "untracked":
+        protected_section += (
+            " Leave `*.proposed` files uncommitted: never `git add` them, and if the task asks for a commit, commit everything else."
+        )
+    sections.append(protected_section)
     sections.append(
         "## Final Report (mandatory)\n"
         "Your final message MUST be a report with exactly these sections:\n"
@@ -1871,6 +1896,7 @@ async def kilo_implement(
             model_source=model_source,
             base_branch=base_branch_for_task,
             base_commit=base_commit_for_task,
+            proposed_files=proposed_files,
         )
         return warnings_prefix + collision_warning + result
 
@@ -1930,6 +1956,7 @@ async def kilo_implement(
         # Continuing or created session_id: record it up front so kilo_task_progress
         # finds it immediately from the first millisecond.
         "session_id": server_session_id,
+        "proposed_files": proposed_files,
     }
     if base_branch_for_task:
         bg_rec["base_branch"] = base_branch_for_task
@@ -2436,28 +2463,140 @@ def _check_base_moved(
 # permission/config-paths.ts): an unattended `kilo run` auto-rejects the ask and
 # ends the run.
 _PROTECTED_ROOT_FILES = ("AGENTS.md", "kilo.json", "kilo.jsonc", "opencode.json", "opencode.jsonc")
-_PROTECTED_DIR_RE = re.compile(r"(?:^|[\s/`'\"(])\.kilo(?:code)?/(?!plans/)")
-_PROTECTED_FILE_RE = re.compile(
-    r"(?:^|[\s`'\"(./])(" + "|".join(re.escape(n) for n in _PROTECTED_ROOT_FILES) + r")\b"
+
+_EDIT_VERBS = (
+    r"(?:create|creating|created|creates|"
+    r"edit|editing|edited|edits|"
+    r"update|updating|updated|updates|"
+    r"modify|modifying|modified|modifies|"
+    r"write|writing|writes|wrote|written|"
+    r"rewrite|rewriting|rewrites|rewrote|rewritten|"
+    r"change|changing|changed|changes|"
+    r"add(?:\s+to|-to)|adding(?:\s+to|-to)|adds(?:\s+to|-to)|added(?:\s+to|-to)|"
+    r"delete|deleting|deleted|deletes|"
+    r"remove|removing|removed|removes|"
+    r"touch|touching|touched|touches)"
+)
+
+_CONNECTOR_WORDS = r"(?:to|in|into|at|the|a|an|our|this|that|new|root|project-root|repo-root|project|repo|file)"
+_CONNECTORS = rf"(?:{_CONNECTOR_WORDS}\s+){{0,3}}"
+_ROOT_FILES_ALT = "|".join(re.escape(n) for n in _PROTECTED_ROOT_FILES)
+
+# Matches edit verbs near protected root files (ensuring name is not inside a longer path like docs/AGENTS.md)
+_ROOT_EDIT_RE = re.compile(
+    rf"\b({_EDIT_VERBS}\s+{_CONNECTORS}[`\'\"]?(?:\./)?(?:{_ROOT_FILES_ALT})\b(?!\.proposed)[`\'\"]?)",
+    re.IGNORECASE,
+)
+
+# Matches explicit edit of something under .kilo/ or .kilocode/ other than .kilo/plans/
+_DIR_TARGET = r"[`\'\"]?(?:\./)?\.(?:kilo|kilocode)/(?!plans/)[^\s`\'\"()]+[`\'\"]?"
+_DIR_EDIT_RE = re.compile(
+    rf"\b({_EDIT_VERBS}\s+{_CONNECTORS}{_DIR_TARGET})",
+    re.IGNORECASE,
 )
 
 
 def _protected_paths_warning(task_instructions: str, focus_files: Optional[list[str]]) -> str:
-    """Warn when a spec or its focus files mention a file Kilo will refuse to
-    edit unattended. Heuristic and advisory: the prompt already tells Kilo to
+    """Warn when a spec expresses edit intent on a protected file or includes
+    one in focus_files. Heuristic and advisory: the prompt already tells Kilo to
     write `<path>.proposed` instead."""
-    text = (task_instructions or "") + "\n" + "\n".join(focus_files or [])
-    hits = sorted(set(_PROTECTED_FILE_RE.findall(text)))
-    if _PROTECTED_DIR_RE.search(text):
-        hits.append(".kilo/ or .kilocode/")
+    hits: list[str] = []
+
+    if focus_files:
+        for f in focus_files:
+            clean_f = f.strip().strip("`'\"")
+            norm_f = clean_f.removeprefix("./")
+            if norm_f in _PROTECTED_ROOT_FILES:
+                hits.append(clean_f)
+            elif (norm_f.startswith(".kilo/") or norm_f.startswith(".kilocode/")) and not (
+                norm_f.startswith(".kilo/plans/") or norm_f.startswith(".kilocode/plans/")
+            ):
+                hits.append(clean_f)
+
+    if task_instructions:
+        for m in _ROOT_EDIT_RE.finditer(task_instructions):
+            phrase = m.group(1).strip()
+            hits.append(phrase)
+        for m in _DIR_EDIT_RE.finditer(task_instructions):
+            phrase = m.group(1).strip()
+            hits.append(phrase)
+
     if not hits:
         return ""
+
+    unique_hits = sorted(set(hits))
+    quoted_hits = ", ".join(f'"{h}"' for h in unique_hits)
+
     return (
-        "⚠️ PROTECTED FILES: the spec mentions " + ", ".join(hits) + ". Kilo never edits the "
-        "project-root AGENTS.md, kilo.json(c), opencode.json(c) or files under .kilo/ / .kilocode/ "
-        "in an unattended run (the approval ask is auto-rejected and the run ends). It has been told "
-        "to write `<path>.proposed` instead; apply those files yourself after the run.\n\n"
+        f'⚠️ PROTECTED FILES: the spec appears to edit protected files ({quoted_hits}). '
+        f'Kilo never edits the project-root AGENTS.md, kilo.json(c), opencode.json(c) or '
+        f'files under .kilo/ or .kilocode/ in an unattended run (the approval ask is auto-rejected '
+        f'and the run ends). It has been told to write `<path>.proposed` instead; '
+        f'apply those files yourself after the run.\n\n'
     )
+
+
+def _is_git_committed(cwd: str, rel_path: str) -> bool:
+    """Check if rel_path is committed in HEAD or tracked in git."""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--verify", f"HEAD:{rel_path}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            return True
+        res2 = subprocess.run(
+            ["git", "ls-files", "--", rel_path],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res2.returncode == 0 and res2.stdout.strip():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _check_proposed_files(cwd: Optional[str]) -> Optional[str]:
+    """Find any *.proposed files present in the working tree.
+    Returns a formatted string '- Proposed files to apply: ...' if any exist,
+    explicitly flagging any that were committed to git, or None if none exist."""
+    if not cwd or not os.path.exists(cwd) or not os.path.isdir(cwd):
+        return None
+
+    proposed_paths: list[str] = []
+    try:
+        for root, dirs, files in os.walk(cwd):
+            if ".git" in dirs:
+                dirs.remove(".git")
+            # Avoid traversing into sibling worktrees inside .kilo/worktrees
+            if os.path.basename(root) == ".kilo" and "worktrees" in dirs:
+                dirs.remove("worktrees")
+            for f in files:
+                if f.endswith(".proposed"):
+                    full_path = os.path.join(root, f)
+                    rel = os.path.relpath(full_path, cwd).replace(os.sep, "/")
+                    proposed_paths.append(rel)
+    except Exception:
+        return None
+
+    if not proposed_paths:
+        return None
+
+    proposed_paths.sort()
+    entries: list[str] = []
+    for rel_path in proposed_paths:
+        if _is_git_committed(cwd, rel_path):
+            entries.append(f"{rel_path} (committed anyway)")
+        else:
+            entries.append(rel_path)
+
+    return f"- Proposed files to apply: {', '.join(entries)}"
 
 
 def _collision_warning(cwd: str, exclude_run_id: str) -> str:
@@ -2495,7 +2634,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              isolated_branch: Optional[str] = None,
                              model_source: Optional[str] = None,
                              base_branch: Optional[str] = None,
-                             base_commit: Optional[str] = None) -> str:
+                             base_commit: Optional[str] = None,
+                             proposed_files: str = "untracked") -> str:
     """Run one Kilo implementation task end-to-end: temp-file spec bridge,
     subprocess, Final-Report parsing, metrics. Used by the synchronous
     (background=False) path of kilo_implement only — the background path
@@ -2539,6 +2679,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         report = _parse_final_report(stdout)
         final_status = "completed" if (returncode == 0 and report.get("outcome") in ("success", "partial")) else "failed"
 
+        proposed_note = _check_proposed_files(cwd) if proposed_files != "commit" else None
+
         task_rec = {
             "status": final_status,
             "started": started_wall,
@@ -2551,7 +2693,10 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             "exit_code": returncode,
             "log_path": log_path,
             "session_id": session_id,
+            "proposed_files": proposed_files,
         }
+        if proposed_note:
+            task_rec["proposed_note"] = proposed_note
         if base_branch:
             task_rec["base_branch"] = base_branch
         if base_commit:
@@ -2568,12 +2713,14 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         source_str = f" ({model_source})" if model_source else ""
         if include_trace:
             note_str = f"\n\nNote: {base_moved_note}" if base_moved_note else ""
+            prop_str = f"\n{proposed_note}" if proposed_note else ""
             result_text = (
                 f"Kilo Execution Finished. (run_id: {run_id} — use it with kilo_log_issue "
                 f"if your review finds defects; session_id: {session_id or 'unknown'} — pass "
                 f"it as continue_session_id on a follow-up kilo_implement call to steer this "
                 f"same session){note_str}\n\n"
-                f"- Model: {model}{source_str}\n"
+                f"- Model: {model}{source_str}"
+                f"{prop_str}\n"
                 f"Exit Code: {returncode}\n\n"
                 f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
             )
@@ -2593,6 +2740,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             lines.append(f"- Log file: {log_path}")
             if base_moved_note:
                 lines.append(f"- Note: {base_moved_note}")
+            if proposed_note:
+                lines.append(proposed_note)
             lines.append("")
 
             final_report_text = _extract_final_report(stdout)
@@ -2909,10 +3058,16 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
         branch=isolated_branch,
     )
 
+    proposed_files_mode = record.get("proposed_files", "untracked")
+    proposed_note = record.get("proposed_note")
+    if not proposed_note and proposed_files_mode != "commit" and working_directory:
+        proposed_note = _check_proposed_files(working_directory)
+
     if include_trace:
         trace_body = log_content or "(no log content captured)"
         note_str = f"\n\nNote: {base_moved_note}" if base_moved_note else ""
-        return f"{header}{note_str}\n\nLOG:\n{trace_body}"
+        prop_str = f"\n\n{proposed_note}" if proposed_note else ""
+        return f"{header}{note_str}{prop_str}\n\nLOG:\n{trace_body}"
 
     lines = [header, ""]
     lines.append(f"- Status: {status}")
@@ -2933,6 +3088,8 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
         lines.append(f"- Log file: {log_path}")
     if base_moved_note:
         lines.append(f"- Note: {base_moved_note}")
+    if proposed_note:
+        lines.append(proposed_note)
     lines.append("")
 
     final_report = _extract_final_report(log_content)
@@ -3044,6 +3201,12 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     temp_record = dict(record)
     temp_record.update(updates)
     temp_record["task_id"] = task_id
+    proposed_files_mode = record.get("proposed_files", "untracked")
+    if proposed_files_mode != "commit" and cwd:
+        prop_note = _check_proposed_files(cwd)
+        if prop_note:
+            temp_record["proposed_note"] = prop_note
+            updates["proposed_note"] = prop_note
     result_text = _format_task_result(temp_record, include_trace=False)
     updates["result"] = result_text
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -3657,5 +3658,192 @@ def test_base_moved_note_in_task_result_and_workspace_status(tmp_path, fake_data
 
     res_after = asyncio.run(server.kilo_task_result(task_id))
     assert expected_note in res_after
+
+
+# ==============================================================================
+# 31. T021: .proposed file handling and precise protected-files warning
+# ==============================================================================
+
+def test_proposed_files_prompt_text_untracked_and_commit(tmp_path, monkeypatch):
+    """'untracked' mode instructs Kilo to leave *.proposed files uncommitted;
+    'commit' mode preserves the previous behavior without that instruction."""
+    captured = {}
+
+    async def fake_run_kilo(cmd, cwd=None, env=None, on_start=None):
+        m = re.search(r"The file (/\S+) contains", cmd[-1])
+        if m:
+            with open(m.group(1)) as f:
+                captured["content"] = f.read()
+        return (0, "## Final Report\n- **Outcome**: success\n- **Files changed**: none\n- **Verification**: none\n- **Issues**: none", "")
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    # 1. Untracked mode (default)
+    asyncio.run(server.kilo_implement(
+        task_instructions="Implement feature",
+        working_directory=str(tmp_path),
+        background=False,
+    ))
+    prompt_untracked = captured.get("content", "")
+    assert "Leave `*.proposed` files uncommitted: never `git add` them" in prompt_untracked
+    assert "if the task asks for a commit, commit everything else" in prompt_untracked
+
+    # 2. Commit mode
+    captured.clear()
+    asyncio.run(server.kilo_implement(
+        task_instructions="Implement feature",
+        working_directory=str(tmp_path),
+        proposed_files="commit",
+        background=False,
+    ))
+    prompt_commit = captured.get("content", "")
+    assert "Leave `*.proposed` files uncommitted" not in prompt_commit
+    assert "AGENTS.md.proposed" in prompt_commit
+
+
+def test_proposed_files_result_listing_untracked_and_committed(tmp_path, monkeypatch):
+    """Result lists *.proposed files in working tree; explicitly flags any committed anyway."""
+    repo = _init_git_repo(tmp_path / "repo_proposed")
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    # Create untracked .proposed file
+    with open(os.path.join(repo, "AGENTS.md.proposed"), "w") as f:
+        f.write("# Proposed Agents\n")
+
+    # Create committed .proposed file
+    with open(os.path.join(repo, "kilo.json.proposed"), "w") as f:
+        f.write("{}\n")
+    subprocess.run(["git", "-C", repo, "add", "kilo.json.proposed"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-m", "commit proposed file"], check=True)
+
+    async def fake_run_kilo(cmd, cwd=None, env=None, on_start=None):
+        return (0, "## Final Report\n- **Outcome**: success\n- **Files changed**: none\n- **Verification**: none\n- **Issues**: none", "")
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Check proposed",
+        working_directory=repo,
+        proposed_files="untracked",
+        background=False,
+    ))
+
+    assert "- Proposed files to apply:" in res
+    assert "AGENTS.md.proposed" in res
+    assert "kilo.json.proposed (committed anyway)" in res
+
+
+def test_proposed_files_commit_mode_does_not_list(tmp_path, monkeypatch):
+    """In 'commit' mode, kilo-mcp does not append 'Proposed files to apply:' to result."""
+    repo = _init_git_repo(tmp_path / "repo_commit_mode")
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    with open(os.path.join(repo, "AGENTS.md.proposed"), "w") as f:
+        f.write("# Proposed Agents\n")
+
+    async def fake_run_kilo(cmd, cwd=None, env=None, on_start=None):
+        return (0, "## Final Report\n- **Outcome**: success\n- **Files changed**: none\n- **Verification**: none\n- **Issues**: none", "")
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Check proposed in commit mode",
+        working_directory=repo,
+        proposed_files="commit",
+        background=False,
+    ))
+
+    assert "Proposed files to apply:" not in res
+
+
+def test_proposed_files_in_kilo_task_result_background(tmp_path, monkeypatch):
+    """kilo_task_result formats Proposed files note for completed background tasks."""
+    repo = _init_git_repo(tmp_path / "repo_bg_proposed")
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    with open(os.path.join(repo, "AGENTS.md.proposed"), "w") as f:
+        f.write("# Proposed Agents\n")
+    with open(os.path.join(repo, "kilo.json.proposed"), "w") as f:
+        f.write("{}\n")
+    subprocess.run(["git", "-C", repo, "add", "kilo.json.proposed"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-m", "commit proposed"], check=True)
+
+    task_id = "task_bg_prop_1"
+    server._write_task_record(task_id, {
+        "status": "completed",
+        "working_directory": repo,
+        "proposed_files": "untracked",
+        "exit_code": 0,
+    })
+
+    res = asyncio.run(server.kilo_task_result(task_id))
+    assert "- Proposed files to apply:" in res
+    assert "AGENTS.md.proposed" in res
+    assert "kilo.json.proposed (committed anyway)" in res
+
+    # Trace mode
+    res_trace = asyncio.run(server.kilo_task_result(task_id, include_trace=True))
+    assert "Proposed files to apply:" in res_trace
+
+    # When proposed_files == 'commit'
+    task_id_c = "task_bg_prop_commit"
+    server._write_task_record(task_id_c, {
+        "status": "completed",
+        "working_directory": repo,
+        "proposed_files": "commit",
+        "exit_code": 0,
+    })
+    res_c = asyncio.run(server.kilo_task_result(task_id_c))
+    assert "Proposed files to apply:" not in res_c
+
+
+def test_protected_paths_warning_positives_t021():
+    """Warn only on edit intent near protected root file or protected path in focus_files."""
+    # Positive: Create AGENTS.md at the root
+    w1 = server._protected_paths_warning("Create AGENTS.md at the root", None)
+    assert "PROTECTED FILES" in w1
+    assert '"Create AGENTS.md"' in w1
+
+    # Positive: update kilo.jsonc
+    w2 = server._protected_paths_warning("update kilo.jsonc", None)
+    assert "PROTECTED FILES" in w2
+    assert '"update kilo.jsonc"' in w2
+
+    # Positive: focus file .kilo/agent/x.md
+    w3 = server._protected_paths_warning("Perform implementation work", [".kilo/agent/x.md"])
+    assert "PROTECTED FILES" in w3
+    assert '".kilo/agent/x.md"' in w3
+    assert ".kilo/ or .kilocode/" in w3
+
+
+def test_protected_paths_warning_negatives_t021():
+    """Do not warn on mere mentions, non-edit verbs, non-root paths, or .kilo/plans/."""
+    # Negative: mention in explanation/code context, not edit intent
+    assert server._protected_paths_warning(
+        "the code that upgrade uses to write a skeleton AGENTS.md", None
+    ) == ""
+
+    # Negative: non-edit verb (exclude)
+    assert server._protected_paths_warning(
+        "exclude .kilo/worktrees from git", None
+    ) == ""
+
+    # Negative: not at the root
+    assert server._protected_paths_warning(
+        "edit docs/AGENTS.md", None
+    ) == ""
+
+    # Negative: under .kilo/plans/
+    assert server._protected_paths_warning(
+        ".kilo/plans/p.md", None
+    ) == ""
+    assert server._protected_paths_warning(
+        "Write the plan to .kilo/plans/p.md", None
+    ) == ""
+    assert server._protected_paths_warning(
+        "Create .kilo/plans/roadmap.md", None
+    ) == ""
+
 
 
