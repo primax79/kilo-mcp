@@ -4241,5 +4241,272 @@ def test_kilo_implement_worktree_resolves_brief_and_log_dir_against_original_cwd
     assert "Outcome: success" in expected_log_copy_abs.read_text(encoding="utf-8")
 
 
+# ==============================================================================
+# T032. Batch queue with concurrency cap and detached queue runner
+# ==============================================================================
+
+
+def test_queue_enqueue_5_cap_2_fifo_and_second_pass(tmp_path, monkeypatch, fake_data_dir):
+    """Enqueue 5 runs with cap 2: after one pass exactly 2 started, 3 queued in FIFO
+    order; after the 2 finish, the next pass starts 2 more."""
+    tasks_dir = tmp_path / "kilo-mcp" / "tasks"
+    monkeypatch.setattr(server, "TASKS_DIR", str(tasks_dir))
+    monkeypatch.setattr(server, "MAX_CONCURRENT_RUNS", 10)
+    monkeypatch.setattr(server, "_ensure_queue_runner_started", lambda: False)
+
+    alive_pids = set()
+    next_pid = [1000]
+    spawned_calls = []
+
+    def fake_spawn(cmd, cwd, env, log_path):
+        next_pid[0] += 1
+        pid = next_pid[0]
+        alive_pids.add(pid)
+        spawned_calls.append({"pid": pid, "cmd": cmd, "cwd": cwd, "log_path": log_path})
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("Outcome: success\n- **Files changed**:\n- out.py\n")
+        return pid
+
+    monkeypatch.setattr(server, "_spawn_kilo_background", fake_spawn)
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: pid in alive_pids)
+
+    task_ids = []
+    for i in range(5):
+        out = asyncio.run(server.kilo_implement(
+            task_instructions=f"Queued task #{i + 1}",
+            working_directory=str(tmp_path),
+            background=True,
+            queue="audit-batch",
+            queue_concurrency=2,
+        ))
+        assert "Task queued in background." in out
+        assert f"- Position in queue: {i + 1}" in out
+        tid = out.split("task_id: ")[1].split(")")[0]
+        task_ids.append(tid)
+        rec = server._read_task_record(tid)
+        assert rec["status"] == "queued"
+        assert rec["queue"] == "audit-batch"
+        assert os.path.isfile(rec["prompt_file"])
+
+    # Nothing spawned on enqueue
+    assert len(spawned_calls) == 0
+
+    # Pass 1: starts first 2 in FIFO order; 3 remain queued in FIFO order
+    summary1 = server.run_queue_once()
+    assert summary1["started"] == task_ids[:2]
+    assert summary1["running"] == 2
+    assert summary1["queued_remaining"] == 3
+
+    for tid in task_ids[:2]:
+        assert server._read_task_record(tid)["status"] == "running"
+    for idx, tid in enumerate(task_ids[2:], start=1):
+        assert server._read_task_record(tid)["status"] == "queued"
+        assert server._get_queue_position(tid, "audit-batch") == idx
+
+    # First 2 finish (pids no longer alive) -> next pass reconciles them and starts 2 more
+    alive_pids.clear()
+    summary2 = server.run_queue_once()
+    assert summary2["started"] == task_ids[2:4]
+    assert summary2["running"] == 2
+    assert summary2["queued_remaining"] == 1
+
+    for tid in task_ids[:2]:
+        assert server._read_task_record(tid)["status"] == "completed"
+    for tid in task_ids[2:4]:
+        assert server._read_task_record(tid)["status"] == "running"
+    assert server._read_task_record(task_ids[4])["status"] == "queued"
+    assert server._get_queue_position(task_ids[4], "audit-batch") == 1
+
+
+def test_queue_per_queue_cap_and_shared_global_cap(tmp_path, monkeypatch, fake_data_dir):
+    """Per-queue cap lower than global cap is respected; two queues share the global cap."""
+    tasks_dir = tmp_path / "kilo-mcp" / "tasks"
+    monkeypatch.setattr(server, "TASKS_DIR", str(tasks_dir))
+    monkeypatch.setenv("KILO_MCP_MAX_CONCURRENT_RUNS", "3")
+    monkeypatch.setattr(server, "_ensure_queue_runner_started", lambda: False)
+
+    alive_pids = set()
+    next_pid = [2000]
+
+    def fake_spawn(cmd, cwd, env, log_path):
+        next_pid[0] += 1
+        pid = next_pid[0]
+        alive_pids.add(pid)
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("Outcome: success\n")
+        return pid
+
+    monkeypatch.setattr(server, "_spawn_kilo_background", fake_spawn)
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: pid in alive_pids)
+
+    # Queue A has per-queue cap 1 (< global cap 3), enqueue 3 tasks
+    q_a = []
+    for i in range(3):
+        out = asyncio.run(server.kilo_implement(
+            task_instructions=f"A-{i}",
+            working_directory=str(tmp_path),
+            background=True,
+            queue="queue-a",
+            queue_concurrency=1,
+        ))
+        q_a.append(out.split("task_id: ")[1].split(")")[0])
+
+    # Queue B has per-queue cap 3, enqueue 3 tasks
+    q_b = []
+    for i in range(3):
+        out = asyncio.run(server.kilo_implement(
+            task_instructions=f"B-{i}",
+            working_directory=str(tmp_path),
+            background=True,
+            queue="queue-b",
+            queue_concurrency=3,
+        ))
+        q_b.append(out.split("task_id: ")[1].split(")")[0])
+
+    # One pass: queue-a can start only 1 (its per-queue cap=1), then queue-b can start 2
+    # before hitting the shared global cap of 3.
+    summary = server.run_queue_once()
+    assert summary["running"] == 3
+    assert summary["started"] == [q_a[0], q_b[0], q_b[1]]
+    assert summary["queued_remaining"] == 3
+
+
+def test_queue_cancel_queued_run_keeps_worktree(tmp_path, monkeypatch, fake_data_dir):
+    """Cancel a queued run: never started, status cancelled, worktree kept and named in the result."""
+    tasks_dir = tmp_path / "kilo-mcp" / "tasks"
+    monkeypatch.setattr(server, "TASKS_DIR", str(tasks_dir))
+    monkeypatch.setattr(server, "_ensure_queue_runner_started", lambda: False)
+    repo = _init_git_repo(tmp_path / "repo")
+
+    spawned = []
+    monkeypatch.setattr(server, "_spawn_kilo_background", lambda *a, **kw: spawned.append(a) or 9999)
+
+    out = asyncio.run(server.kilo_implement(
+        task_instructions="Queued isolated worktree task",
+        working_directory=repo,
+        isolation="worktree",
+        worktree_branch="feat/queued-cancel",
+        background=True,
+        queue="cancel-q",
+        queue_concurrency=2,
+    ))
+    tid = out.split("task_id: ")[1].split(")")[0]
+    rec_before = server._read_task_record(tid)
+    wt_path = rec_before["working_directory"]
+    assert os.path.isdir(wt_path)
+
+    cancel_res = asyncio.run(server.kilo_task_cancel(task_id=tid, reason="no longer needed"))
+    assert "cancelled" in cancel_res.lower()
+    assert wt_path in cancel_res
+    assert "feat/queued-cancel" in cancel_res
+    assert os.path.isdir(wt_path)
+
+    rec_after = server._read_task_record(tid)
+    assert rec_after["status"] == "cancelled"
+
+    # Runner pass never starts the cancelled task
+    summary = server.run_queue_once()
+    assert summary["started"] == []
+    assert len(spawned) == 0
+
+    res_out = asyncio.run(server.kilo_task_result(task_id=tid))
+    assert "cancelled" in res_out.lower()
+    assert wt_path in res_out
+    assert "feat/queued-cancel" in res_out
+
+
+def test_queue_visibility_status_result_and_wait(tmp_path, monkeypatch, fake_data_dir):
+    """kilo_task_status lists queues and positions; single queued task shows its position;
+    kilo_task_result reports queued + position; kilo_task_wait waits through queued -> running -> terminal."""
+    tasks_dir = tmp_path / "kilo-mcp" / "tasks"
+    monkeypatch.setattr(server, "TASKS_DIR", str(tasks_dir))
+    monkeypatch.setattr(server, "_ensure_queue_runner_started", lambda: False)
+
+    tids = []
+    for i in range(2):
+        out = asyncio.run(server.kilo_implement(
+            task_instructions=f"Status test {i}",
+            working_directory=str(tmp_path),
+            background=True,
+            queue="vis-q",
+            queue_concurrency=2,
+        ))
+        tids.append(out.split("task_id: ")[1].split(")")[0])
+
+    # Queue listing via kilo_task_status(queue=...) and kilo_task_status()
+    q_status = asyncio.run(server.kilo_task_status(queue="vis-q"))
+    assert "vis-q" in q_status
+    assert "queued=2, running=0, finished=0" in q_status
+    assert f"{tids[0]}, {tids[1]}" in q_status
+
+    # Single queued task status and kilo_task_result show status queued and position
+    t1_status = asyncio.run(server.kilo_task_status(task_id=tids[0]))
+    assert "status=queued" in t1_status and "queue=vis-q" in t1_status and "position=1" in t1_status
+    t2_status = asyncio.run(server.kilo_task_status(task_id=tids[1]))
+    assert "status=queued" in t2_status and "queue=vis-q" in t2_status and "position=2" in t2_status
+
+    t2_res = asyncio.run(server.kilo_task_result(task_id=tids[1]))
+    assert "queued" in t2_res and "vis-q" in t2_res and "position 2" in t2_res
+
+    # kilo_task_wait keeps waiting through queued -> running -> completed
+    monkeypatch.setattr(server, "KILO_LINGER_GRACE", 0.2)
+
+    async def drive_and_wait():
+        async def transition():
+            await asyncio.sleep(0.15)
+            # Transition t1 to running, then completed
+            log_path = os.path.join(str(tasks_dir), f"{tids[0]}.log")
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("Outcome: success\n- **Files changed**:\n- waited.py\n")
+            server._write_task_record(tids[0], {
+                "status": "running",
+                "started": "2026-10-25T00:00:00+00:00",
+                "pid": 999999,
+                "log_path": log_path,
+            })
+        driver = asyncio.create_task(transition())
+        res = await server.kilo_task_wait(task_id=tids[0], timeout_seconds=5)
+        await driver
+        return res
+
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: False)
+    wait_res = asyncio.run(drive_and_wait())
+    assert "Kilo Execution Finished" in wait_res
+    assert "waited.py" in wait_res
+
+
+def test_queue_with_background_false_errors(tmp_path, monkeypatch, fake_data_dir, mock_spawn_kilo_background, mock_run_kilo_custom):
+    """queue + background=false -> error, nothing queued."""
+    tasks_dir = tmp_path / "kilo-mcp" / "tasks"
+    monkeypatch.setattr(server, "TASKS_DIR", str(tasks_dir))
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Should fail",
+        working_directory=str(tmp_path),
+        background=False,
+        queue="bad-q",
+    ))
+    assert res.startswith("Error:")
+    assert "background" in res
+    assert len(mock_spawn_kilo_background.calls) == 0
+    assert len(mock_run_kilo_custom.calls) == 0
+    assert not tasks_dir.exists() or len(list(tasks_dir.glob("*.json"))) == 0
+
+
+def test_queue_runner_single_instance_flock(tmp_path, monkeypatch, fake_data_dir):
+    """Runner single-instance: second lock attempt fails non-blocking."""
+    lock_file = str(tmp_path / "kilo-mcp" / "queue-runner.lock")
+    fd1 = server._try_acquire_queue_runner_lock(lock_path=lock_file)
+    assert fd1 is not None
+    try:
+        fd2 = server._try_acquire_queue_runner_lock(lock_path=lock_file)
+        assert fd2 is None
+        assert server._is_queue_runner_locked(lock_path=lock_file) is True
+    finally:
+        fd1.close()
+    assert server._is_queue_runner_locked(lock_path=lock_file) is False
+
+
+
 
 
