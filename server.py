@@ -287,6 +287,30 @@ def _get_max_context_tokens_refuse() -> int:
             pass
     return MAX_CONTEXT_TOKENS_REFUSE
 
+
+# Global cap on concurrent Kilo runs across all queues (default 3)
+MAX_CONCURRENT_RUNS = _cfg(
+    "KILO_MCP_MAX_CONCURRENT_RUNS", "kilo", "max_concurrent_runs", 3, int
+)
+
+
+def _get_max_concurrent_runs() -> int:
+    val = os.environ.get("KILO_MCP_MAX_CONCURRENT_RUNS")
+    if val is not None:
+        try:
+            return max(1, int(val))
+        except ValueError:
+            pass
+    try:
+        if "max_concurrent_runs" in _CONFIG.get("kilo", {}):
+            return max(1, int(_CONFIG["kilo"]["max_concurrent_runs"]))
+        if "max_concurrent_runs" in _CONFIG:
+            return max(1, int(_CONFIG["max_concurrent_runs"]))
+    except (TypeError, ValueError):
+        pass
+    return max(1, int(MAX_CONCURRENT_RUNS))
+
+
 # Server API Endpoint Configuration (for communicating with running kilo serve instance)
 KILO_SERVER_URL = _cfg("KILO_SERVER_URL", "kilo", "server_url", "")
 KILO_SERVER_PASSWORD = _cfg("KILO_SERVER_PASSWORD", "kilo", "server_password", "")
@@ -1622,9 +1646,15 @@ before continuing. When continuing a session in an isolated worktree, pass
 refresh_base='merge' or refresh_base='rebase' to update the worktree from the
 current tip of its base branch before resuming.
 
-Parallelism: emitting several kilo_implement calls in one turn runs them
-concurrently (independent Kilo subprocesses) — useful for isolated features
-in different directories.
+Parallelism & Batch Queues: emitting several kilo_implement calls in one turn
+runs them concurrently (independent Kilo subprocesses). For large batches, pass
+`queue='<name>'` (with `background=true`) and optional `queue_concurrency=<int>`
+to enqueue runs in FIFO order instead of spawning all at once. A detached queue
+runner (`python server.py --queue-runner`) starts queued tasks while slots are
+free under both the queue's cap and the global `max_concurrent_runs` cap
+(config `[kilo].max_concurrent_runs` / env `KILO_MCP_MAX_CONCURRENT_RUNS`,
+default 3), so the queue keeps draining even after the calling session and MCP
+server process exit.
 
 ⚠️ NO ISOLATION, NO LOCKING BY DEFAULT: Kilo runs directly in
 `working_directory` with nothing preventing a concurrent writer — another
@@ -1918,11 +1948,41 @@ async def kilo_implement(
             "log lands in the requester's tree."
         ),
     ] = None,
+    queue: Annotated[
+        Optional[str],
+        Field(
+            description="Queue name to enqueue this background run into instead of "
+            "spawning immediately (e.g. 'audit-batch'; pass 'default' for the default "
+            "queue). Requires `background=true`. A detached queue-runner process "
+            "(`python server.py --queue-runner`) starts queued tasks in FIFO order "
+            "respecting both the per-queue concurrency cap (`queue_concurrency`) and "
+            "the global `max_concurrent_runs` cap (default 3). Because the queue "
+            "state and runner live on disk/OS outside the calling session and MCP "
+            "server process, the queue keeps draining even after both exit."
+        ),
+    ] = None,
+    queue_concurrency: Annotated[
+        Optional[int],
+        Field(
+            description="Concurrency cap for `queue` (stored in `<data_dir>/queues/<name>.json`; "
+            "last value given wins). A queue's runs count against both `queue_concurrency` "
+            "and the global `max_concurrent_runs` cap."
+        ),
+    ] = None,
 ) -> str:
     """Delegate a code implementation task to Kilo. See the tool description
     (built from _IMPLEMENT_DESCRIPTION + DELEGATION_POLICY) for full guidance."""
     if proposed_files not in ("untracked", "commit"):
         return f"Error: proposed_files must be 'untracked' or 'commit', got '{proposed_files}'."
+    queue_name: Optional[str] = None
+    if queue is not None:
+        queue_name = str(queue).strip()
+        if not queue_name:
+            return "Error: queue name cannot be empty."
+        if not background:
+            return "Error: queue cannot be used with background=false (queued runs require background=true)."
+    if queue_concurrency is not None and int(queue_concurrency) < 1:
+        return "Error: queue_concurrency must be at least 1."
     orig_cwd = working_directory if working_directory else os.getcwd()
     if not os.path.exists(orig_cwd):
         return f"Error: Working directory {orig_cwd} does not exist."
@@ -2178,26 +2238,17 @@ async def kilo_implement(
         session_id=server_session_id,
     )
     log_path = os.path.join(TASKS_DIR, f"{run_id}.log")
-    try:
-        pid = _spawn_kilo_background(cmd, cwd, env, log_path)
-    except FileNotFoundError:
-        return collision_warning + "Error: The 'kilo' executable was not found in the PATH."
-    except Exception as e:
-        return collision_warning + f"Error launching Kilo in background: {e}"
-
-    started_iso = datetime.now(timezone.utc).isoformat()
     bg_rec = {
-        "status": "running",
-        "started": started_iso,
         "working_directory": cwd,
         "agent": agent,
         "model": model,
         "model_source": model_source,
         "isolated_branch": isolated_branch,
         "agent_manager_worktree_id": agent_manager_worktree_id,
-        "pid": pid,
         "log_path": log_path,
         "prompt_file": prompt_file,
+        "cmd": cmd,
+        "env_overrides": {k: str(v) for k, v in env_vars.items()} if env_vars else {},
         # Continuing or created session_id: record it up front so kilo_task_progress
         # finds it immediately from the first millisecond.
         "session_id": server_session_id,
@@ -2211,10 +2262,69 @@ async def kilo_implement(
         bg_rec["brief_file"] = brief_abs
     if log_dir_abs:
         bg_rec["log_dir"] = log_dir_abs
-    _write_task_record(run_id, bg_rec)
-    if server_session_id:
-        _agent_manager_note_session(cwd, server_session_id, agent_manager_worktree_id)
-    else:
+
+    session_note = (
+        f"- Continuing session: {continue_session_id}\n"
+        if continue_session_id else
+        "- Session id: not yet created; kilo_task_progress will surface it "
+        "once Kilo starts.\n"
+    )
+    isolation_note = (
+        f"- Isolated in worktree: {cwd} (branch '{isolated_branch}') — merge or "
+        "remove it (git worktree remove) once you've reviewed the result.\n"
+        if isolated_branch else ""
+    )
+    brief_note = f"- Brief: {brief_abs}\n" if brief_abs else ""
+    log_copy_note = f"- Log copy: {os.path.join(log_dir_abs, f'{run_id}.log')}\n" if log_dir_abs else ""
+    model_note = f"- Model: {model} ({model_source})\n"
+
+    if queue_name is not None:
+        if queue_concurrency is not None:
+            _set_queue_concurrency(queue_name, int(queue_concurrency))
+        queued_iso = datetime.now(timezone.utc).isoformat()
+        bg_rec.update({
+            "status": "queued",
+            "queue": queue_name,
+            "queued_at": queued_iso,
+        })
+        _write_task_record(run_id, bg_rec)
+        pos = _get_queue_position(run_id, queue_name) or 1
+        eff_cap, q_cap, g_cap = _get_effective_queue_cap(queue_name)
+        _ensure_queue_runner_started()
+        cap_detail = (
+            f"{eff_cap} (queue cap: {q_cap}, global max_concurrent_runs: {g_cap})"
+            if q_cap is not None else f"{eff_cap} (global max_concurrent_runs: {g_cap})"
+        )
+        return (
+            warnings_prefix +
+            collision_warning +
+            f"Task queued in background. (task_id: {run_id})\n\n"
+            f"- Queue: {queue_name}\n"
+            f"- Position in queue: {pos}\n"
+            f"- Concurrency cap: {cap_detail}\n"
+            f"{model_note}"
+            f"{session_note}"
+            f"{isolation_note}"
+            f"{brief_note}"
+            f"{log_copy_note}"
+            f"- Queue status & positions: kilo_task_status (queue='{queue_name}' or task_id='{run_id}')\n"
+            f"- Wait for completion: kilo_task_wait with task_id '{run_id}'\n"
+            f"- Fetch the result when done: kilo_task_result with task_id '{run_id}'\n"
+            f"- Cancel before or during run: kilo_task_cancel with task_id '{run_id}'\n"
+            "Note: the queue is drained by a detached queue-runner process "
+            "(`python server.py --queue-runner`) independent of this session and "
+            "MCP server process."
+        )
+
+    try:
+        pid = _start_task_from_record(run_id, bg_rec, base_env=env)
+    except FileNotFoundError:
+        return collision_warning + "Error: The 'kilo' executable was not found in the PATH."
+    except Exception as e:
+        return collision_warning + f"Error launching Kilo in background: {e}"
+
+    started_iso = bg_rec["started"]
+    if not server_session_id:
         # Schedule lazy session linking fallback if session creation via REST wasn't available
         try:
             loop = asyncio.get_running_loop()
@@ -2233,20 +2343,6 @@ async def kilo_implement(
         except Exception:
             pass
 
-    session_note = (
-        f"- Continuing session: {continue_session_id}\n"
-        if continue_session_id else
-        "- Session id: not yet created; kilo_task_progress will surface it "
-        "once Kilo starts.\n"
-    )
-    isolation_note = (
-        f"- Isolated in worktree: {cwd} (branch '{isolated_branch}') — merge or "
-        "remove it (git worktree remove) once you've reviewed the result.\n"
-        if isolated_branch else ""
-    )
-    brief_note = f"- Brief: {brief_abs}\n" if brief_abs else ""
-    log_copy_note = f"- Log copy: {os.path.join(log_dir_abs, f'{run_id}.log')}\n" if log_dir_abs else ""
-    model_note = f"- Model: {model} ({model_source})\n"
     return (
         warnings_prefix +
         collision_warning +
@@ -2408,6 +2504,49 @@ def _read_task_record(task_id: str) -> Optional[dict]:
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def _start_task_from_record(task_id: str, record: dict, base_env: Optional[dict] = None) -> int:
+    """Spawn a background Kilo run from a persisted (or freshly assembled) task record,
+    updating the record on disk to status='running' with pid and started timestamp.
+    Shared by both immediate background execution and the detached queue runner."""
+    cwd = record.get("working_directory") or os.getcwd()
+    prompt_file = record.get("prompt_file")
+    agent = record.get("agent") or "code"
+    model = record.get("model")
+    session_id = record.get("session_id")
+    cmd = record.get("cmd")
+    if not cmd:
+        if not prompt_file:
+            raise ValueError(f"Task {task_id} record is missing both cmd and prompt_file")
+        cmd = _build_kilo_run_argv(
+            prompt_file,
+            agent=agent,
+            model=model,
+            session_id=session_id,
+        )
+    log_path = record.get("log_path") or os.path.join(TASKS_DIR, f"{task_id}.log")
+    os.makedirs(os.path.dirname(log_path) or TASKS_DIR, exist_ok=True)
+    env = dict(base_env) if base_env is not None else os.environ.copy()
+    env_overrides = record.get("env_overrides") or {}
+    for k, v in env_overrides.items():
+        env[str(k)] = str(v)
+
+    pid = _spawn_kilo_background(cmd, cwd, env, log_path)
+    started_iso = datetime.now(timezone.utc).isoformat()
+    updates = {
+        "status": "running",
+        "started": started_iso,
+        "pid": pid,
+        "log_path": log_path,
+        "cmd": cmd,
+    }
+    record.update(updates)
+    _write_task_record(task_id, record)
+    if session_id:
+        _agent_manager_note_session(cwd, session_id, record.get("agent_manager_worktree_id"))
+    return pid
+
 
 
 def _find_running_tasks_for_cwd(cwd: str, exclude_run_id: Optional[str] = None) -> list[tuple[str, dict]]:
@@ -3278,6 +3417,299 @@ def _reconcile_all_tasks() -> None:
                 _reconcile_task_if_orphaned(task_id, rec)
 
 
+def _queues_dir() -> str:
+    if os.path.isdir(TASKS_DIR) or TASKS_DIR != os.path.join(_DEFAULT_DATA_DIR, "tasks"):
+        return os.path.join(os.path.dirname(TASKS_DIR), "queues")
+    return os.path.join(DATA_DIR, "queues")
+
+
+def _queue_runner_lock_path() -> str:
+    if os.path.isdir(TASKS_DIR) or TASKS_DIR != os.path.join(_DEFAULT_DATA_DIR, "tasks"):
+        return os.path.join(os.path.dirname(TASKS_DIR), "queue-runner.lock")
+    return os.path.join(DATA_DIR, "queue-runner.lock")
+
+
+def _queue_runner_log_path() -> str:
+    if os.path.isdir(TASKS_DIR) or TASKS_DIR != os.path.join(_DEFAULT_DATA_DIR, "tasks"):
+        return os.path.join(os.path.dirname(TASKS_DIR), "queue-runner.log")
+    return os.path.join(DATA_DIR, "queue-runner.log")
+
+
+def _queue_config_path(queue_name: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", queue_name) or "default"
+    return os.path.join(_queues_dir(), f"{safe_name}.json")
+
+
+def _read_queue_config(queue_name: str) -> dict:
+    path = _queue_config_path(queue_name)
+    if not os.path.exists(path):
+        return {"name": queue_name}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except (OSError, ValueError):
+        pass
+    return {"name": queue_name}
+
+
+def _set_queue_concurrency(queue_name: str, concurrency: int) -> None:
+    try:
+        os.makedirs(_queues_dir(), exist_ok=True)
+        path = _queue_config_path(queue_name)
+        data = _read_queue_config(queue_name)
+        data["name"] = queue_name
+        data["concurrency"] = max(1, int(concurrency))
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def _get_queue_concurrency(queue_name: str) -> Optional[int]:
+    data = _read_queue_config(queue_name)
+    cap = data.get("concurrency")
+    if cap is not None:
+        try:
+            return max(1, int(cap))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _get_effective_queue_cap(queue_name: str) -> tuple[int, Optional[int], int]:
+    """Return (effective_cap, queue_cap, global_cap)."""
+    global_cap = _get_max_concurrent_runs()
+    queue_cap = _get_queue_concurrency(queue_name)
+    effective_cap = min(queue_cap, global_cap) if queue_cap is not None else global_cap
+    return effective_cap, queue_cap, global_cap
+
+
+def _list_queued_tasks_fifo(queue_name: Optional[str] = None) -> list[tuple[str, dict]]:
+    """Return (task_id, record) for all tasks with status=='queued' (optionally filtered
+    to `queue_name`), ordered FIFO by queued_at then task_id."""
+    if not os.path.isdir(TASKS_DIR):
+        return []
+    try:
+        filenames = os.listdir(TASKS_DIR)
+    except OSError:
+        return []
+    items: list[tuple[str, dict]] = []
+    for filename in filenames:
+        if not filename.endswith(".json"):
+            continue
+        task_id = filename[:-len(".json")]
+        rec = _read_task_record(task_id)
+        if not rec or rec.get("status") != "queued":
+            continue
+        if queue_name is not None and rec.get("queue") != queue_name:
+            continue
+        items.append((task_id, rec))
+    items.sort(key=lambda pair: (pair[1].get("queued_at") or "", pair[0]))
+    return items
+
+
+def _get_queue_position(task_id: str, queue_name: Optional[str] = None) -> Optional[int]:
+    """Return 1-based FIFO position of `task_id` within its queue (or None if not queued)."""
+    if queue_name is None:
+        rec = _read_task_record(task_id)
+        if not rec or rec.get("status") != "queued":
+            return None
+        queue_name = rec.get("queue")
+    queued = _list_queued_tasks_fifo(queue_name)
+    for idx, (tid, _) in enumerate(queued, start=1):
+        if tid == task_id:
+            return idx
+    return None
+
+
+def _try_acquire_queue_runner_lock(lock_path: Optional[str] = None):
+    """Acquire non-blocking exclusive flock on queue-runner.lock.
+    Returns the open file object if acquired, or None if another runner holds it."""
+    target = lock_path or _queue_runner_lock_path()
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    fd = open(target, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        fd.close()
+        return None
+    try:
+        fd.seek(0)
+        fd.truncate()
+        fd.write(f"{os.getpid()}\n")
+        fd.flush()
+    except OSError:
+        pass
+    return fd
+
+
+def _is_queue_runner_locked(lock_path: Optional[str] = None) -> bool:
+    """True if a queue-runner currently holds the exclusive flock."""
+    fd = _try_acquire_queue_runner_lock(lock_path=lock_path)
+    if fd is None:
+        return True
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    fd.close()
+    return False
+
+
+def run_queue_once() -> dict[str, Any]:
+    """Perform one queue-runner pass:
+    1. Reconcile all running records (via _reconcile_task_if_orphaned).
+    2. Count alive running tasks globally and per queue.
+    3. Start queued records in FIFO order (by queued_at) while both the queue's
+       cap and the global max_concurrent_runs cap have free slots.
+
+    Returns a summary dict with `started` (list of task_ids started in this pass),
+    `running` (total running after this pass), and `queued_remaining` (count of
+    still-queued tasks)."""
+    _reconcile_all_tasks()
+
+    global_cap = _get_max_concurrent_runs()
+    total_running = 0
+    running_by_queue: dict[str, int] = {}
+
+    if os.path.isdir(TASKS_DIR):
+        try:
+            filenames = os.listdir(TASKS_DIR)
+        except OSError:
+            filenames = []
+        for filename in filenames:
+            if not filename.endswith(".json"):
+                continue
+            tid = filename[:-len(".json")]
+            rec = _read_task_record(tid)
+            if not rec or rec.get("status") != "running":
+                continue
+            if _is_pid_alive(rec.get("pid")):
+                total_running += 1
+                q = rec.get("queue")
+                if q:
+                    running_by_queue[q] = running_by_queue.get(q, 0) + 1
+
+    queued_all = _list_queued_tasks_fifo()
+    started_ids: list[str] = []
+
+    for task_id, rec in queued_all:
+        if total_running >= global_cap:
+            break
+        fresh = _read_task_record(task_id)
+        if not fresh or fresh.get("status") != "queued":
+            continue
+        q_name = fresh.get("queue") or "default"
+        q_cap = _get_queue_concurrency(q_name)
+        q_running = running_by_queue.get(q_name, 0)
+        if q_cap is not None and q_running >= q_cap:
+            continue
+        try:
+            _start_task_from_record(task_id, fresh)
+            started_ids.append(task_id)
+            total_running += 1
+            running_by_queue[q_name] = q_running + 1
+        except Exception as e:
+            logger.error("Queue runner failed to start task %s: %s", task_id, e)
+            _write_task_record(task_id, {
+                "status": "failed",
+                "exit_code": 1,
+                "note": f"Queue runner failed to spawn task: {e}",
+                "result": f"Error launching queued task {task_id}: {e}",
+            })
+
+    remaining = len(_list_queued_tasks_fifo())
+    return {
+        "started": started_ids,
+        "running": total_running,
+        "queued_remaining": remaining,
+    }
+
+
+def _spawn_queue_runner_detached() -> Optional[int]:
+    """Spawn `python server.py --queue-runner` as a detached OS process
+    (`start_new_session=True`, logging to `<data_dir>/queue-runner.log`)."""
+    log_path = _queue_runner_log_path()
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    server_script = os.path.abspath(__file__)
+    cmd = [sys.executable, server_script, "--queue-runner"]
+    env = os.environ.copy()
+    env["KILO_MCP_DATA_DIR"] = os.path.dirname(TASKS_DIR) if TASKS_DIR != os.path.join(_DEFAULT_DATA_DIR, "tasks") else DATA_DIR
+    log_fd = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(server_script) or os.getcwd(),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        return proc.pid
+    except Exception as e:
+        logger.warning("Failed to spawn detached queue runner: %s", e)
+        return None
+    finally:
+        log_fd.close()
+
+
+def _ensure_queue_runner_started() -> bool:
+    """Start the detached queue runner if queued tasks exist and no runner holds the lock."""
+    if not _list_queued_tasks_fifo():
+        return False
+    if _is_queue_runner_locked():
+        return False
+    pid = _spawn_queue_runner_detached()
+    return pid is not None
+
+
+def run_queue_runner_daemon(poll_interval: float = 5.0) -> int:
+    """Entry point for `python server.py --queue-runner`.
+    Acquires non-blocking flock on `<data_dir>/queue-runner.lock` (exiting immediately
+    if another instance holds it), loops every ~5s running `run_queue_once()`, and
+    exits when no queued records remain."""
+    lock_fd = _try_acquire_queue_runner_lock()
+    if lock_fd is None:
+        return 0
+    log_path = _queue_runner_log_path()
+    try:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s [kilo-mcp queue-runner] %(levelname)s %(message)s"))
+        logger.addHandler(fh)
+    except OSError:
+        pass
+
+    logger.info("Queue runner started (pid=%s)", os.getpid())
+    try:
+        while True:
+            summary = run_queue_once()
+            if summary["started"]:
+                logger.info(
+                    "Queue runner started %d task(s): %s (running=%d, queued_remaining=%d)",
+                    len(summary["started"]),
+                    ", ".join(summary["started"]),
+                    summary["running"],
+                    summary["queued_remaining"],
+                )
+            if summary["queued_remaining"] == 0:
+                logger.info("No queued tasks remain; queue runner exiting.")
+                break
+            time.sleep(poll_interval)
+    finally:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fd.close()
+    return 0
+
+
+
 def _find_task_record_by_pid(pid: int | str) -> Optional[dict]:
     """Find the task record matching a given PID if known."""
     if not os.path.isdir(TASKS_DIR):
@@ -3586,6 +4018,17 @@ async def kilo_task_result(
         return f"Unknown task_id '{task_id}'. (Records live in {TASKS_DIR})"
     record = _reconcile_task_if_orphaned(task_id, record)
     status = record.get("status")
+    if status == "queued":
+        _ensure_queue_runner_started()
+        q_name = record.get("queue") or "default"
+        pos = _get_queue_position(task_id, q_name) or 1
+        eff_cap, q_cap, g_cap = _get_effective_queue_cap(q_name)
+        return (
+            f"Task {task_id} is queued in queue '{q_name}' (position {pos}, "
+            f"cap {eff_cap}, queued at {record.get('queued_at')}, "
+            f"workspace {record.get('working_directory')}). "
+            "Use kilo_task_wait to await completion or kilo_task_status for queue state."
+        )
     if status == "running":
         if _is_task_lingering_in_grace(record):
             return (
@@ -3637,7 +4080,8 @@ async def kilo_task_wait(
     """Wait until a background kilo_implement task reaches a terminal state
     (completed, failed, cancelled, error) or `timeout_seconds` elapses, polling
     cheaply every 2 seconds and reconciling orphaned processes from their log files via
-    _reconcile_task_if_orphaned.
+    _reconcile_task_if_orphaned. Also waits through `queued -> running -> terminal`
+    for queued tasks, restarting the detached queue runner if it has died.
 
     Accepts `timeout_seconds` up to at least 3600s (or more) for long runs and
     returns as soon as the task ends. When terminal, returns the kilo_task_result
@@ -3658,11 +4102,22 @@ async def kilo_task_wait(
             return f"Unknown task_id '{task_id}'. (Records live in {TASKS_DIR})"
         record = _reconcile_task_if_orphaned(task_id, record)
         status = record.get("status")
-        if status in _TERMINAL_TASK_STATES or status != "running":
+        if status == "queued":
+            _ensure_queue_runner_started()
+        if status in _TERMINAL_TASK_STATES or status not in ("running", "queued"):
             return await kilo_task_result(task_id=task_id, include_trace=include_trace)
 
         elapsed = time.monotonic() - started
         if elapsed >= effective_timeout:
+            if status == "queued":
+                q_name = record.get("queue") or "default"
+                pos = _get_queue_position(task_id, q_name) or 1
+                return (
+                    f"Task {task_id} is still queued in queue '{q_name}' (position {pos}) "
+                    f"after waiting {int(round(elapsed))}s "
+                    f"(timeout_seconds={effective_timeout}s; queued at {record.get('queued_at')}, "
+                    f"workspace {record.get('working_directory')})."
+                )
             progress = await kilo_task_progress(task_id=task_id)
             return (
                 f"Task {task_id} is still running after waiting {int(round(elapsed))}s "
@@ -3789,6 +4244,28 @@ async def kilo_task_cancel(
     if record is None:
         return f"Unknown task_id '{task_id}'. (Records live in {TASKS_DIR})"
     status = record.get("status")
+    if status == "queued":
+        q_name = record.get("queue") or "default"
+        note = f"Cancelled while queued in '{q_name}' (never started)."
+        if reason:
+            note += f" Reason: {reason}"
+        isolated_branch = record.get("isolated_branch")
+        wt_path = record.get("working_directory")
+        wt_note = ""
+        if isolated_branch and wt_path:
+            wt_note = (
+                f" Worktree kept at {wt_path} (branch '{isolated_branch}') — "
+                "remove it with `git worktree remove` when no longer needed."
+            )
+            note += wt_note
+        prompt_file = record.get("prompt_file")
+        if prompt_file and os.path.exists(prompt_file):
+            try:
+                os.remove(prompt_file)
+            except OSError:
+                pass
+        _write_task_record(task_id, {"status": "cancelled", "result": note})
+        return f"Task {task_id} (queued in '{q_name}') marked cancelled and will not be started.{wt_note}"
     if status != "running":
         return f"Task {task_id} already ended (status: {status}); nothing to cancel."
 
@@ -5147,6 +5624,77 @@ def _read_session_summary(session_id: str) -> Optional[dict]:
     }
 
 
+def _format_queues_summary(filter_queue: Optional[str] = None) -> str:
+    """Build a markdown summary of queues with queued/running/finished counts
+    and the queued task IDs in FIFO order."""
+    queue_stats: dict[str, dict[str, Any]] = {}
+
+    if os.path.isdir(_queues_dir()):
+        try:
+            for fname in os.listdir(_queues_dir()):
+                if fname.endswith(".json"):
+                    try:
+                        with open(os.path.join(_queues_dir(), fname), "r", encoding="utf-8") as f:
+                            qdata = json.load(f)
+                        qname = qdata.get("name") or fname[:-5]
+                        queue_stats.setdefault(qname, {"queued": [], "running": 0, "finished": 0})
+                    except (OSError, ValueError):
+                        pass
+        except OSError:
+            pass
+
+    if os.path.isdir(TASKS_DIR):
+        try:
+            filenames = os.listdir(TASKS_DIR)
+        except OSError:
+            filenames = []
+        for filename in filenames:
+            if not filename.endswith(".json"):
+                continue
+            tid = filename[:-len(".json")]
+            rec = _read_task_record(tid)
+            if not rec:
+                continue
+            qname = rec.get("queue")
+            if not qname:
+                continue
+            bucket = queue_stats.setdefault(qname, {"queued": [], "running": 0, "finished": 0})
+            st = rec.get("status")
+            if st == "queued":
+                bucket["queued"].append((rec.get("queued_at") or "", tid))
+            elif st == "running":
+                if _is_pid_alive(rec.get("pid")):
+                    bucket["running"] += 1
+                else:
+                    bucket["finished"] += 1
+            else:
+                bucket["finished"] += 1
+
+    if filter_queue is not None:
+        if filter_queue not in queue_stats:
+            queue_stats = {filter_queue: {"queued": [], "running": 0, "finished": 0}}
+        else:
+            queue_stats = {filter_queue: queue_stats[filter_queue]}
+
+    if not queue_stats:
+        return ""
+
+    lines = ["# Queues"]
+    for qname in sorted(queue_stats.keys()):
+        b = queue_stats[qname]
+        b["queued"].sort(key=lambda item: (item[0], item[1]))
+        queued_ids = [tid for _, tid in b["queued"]]
+        eff_cap, q_cap, g_cap = _get_effective_queue_cap(qname)
+        cap_str = f"cap: {eff_cap}" + (f" (queue: {q_cap}, global: {g_cap})" if q_cap is not None else f" (global: {g_cap})")
+        ids_str = ", ".join(queued_ids) if queued_ids else "none"
+        lines.append(
+            f"- **{qname}** ({cap_str}): "
+            f"queued={len(queued_ids)}, running={b['running']}, finished={b['finished']} "
+            f"| queued_task_ids: [{ids_str}]"
+        )
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def kilo_task_status(
     working_directory: Annotated[
@@ -5154,22 +5702,59 @@ async def kilo_task_status(
         Field(description="Only report tasks running in this workspace. "
               "Leave empty to report every running `kilo run` process."),
     ] = None,
+    task_id: Annotated[
+        Optional[str],
+        Field(description="Optional task_id to check status, queue name, and queue position for a single task."),
+    ] = None,
+    queue: Annotated[
+        Optional[str],
+        Field(description="Optional queue name to inspect queued/running/finished counts and queued task IDs in order."),
+    ] = None,
 ) -> str:
-    """Diagnose the state of running `kilo run` tasks (e.g. delegations
-    launched via kilo_implement, from this or any other session, including
-    ones with no known task_id — e.g. legacy foreground runs, or runs started
-    outside this MCP server).
+    """Diagnose the state of running `kilo run` tasks and/or batch queues.
 
-    This is the coarse, OS-level check: elapsed vs CPU time, network activity
-    (is it talking to the model?), the matching Kilo session's last update,
-    and a verdict: WORKING / STARTING / LIKELY STUCK. For a task_id you
-    launched yourself via kilo_implement, prefer kilo_task_progress instead —
-    it reads Kilo's actual plan/todo list and commentary, not just a heuristic,
-    and kilo_task_cancel can then stop it precisely by its recorded PID.
+    When called with `task_id`, reports that task's status (for a queued task:
+    status `queued`, queue name, and 1-based FIFO position in queue).
+    When called with `queue` (or with no `task_id`), lists queues with
+    queued/running/finished counts and the queued task IDs in FIFO order, in
+    addition to the OS-level check of running `kilo run` processes (elapsed vs
+    CPU time, network activity, matching Kilo session update, and verdict:
+    WORKING / STARTING / LIKELY STUCK). Also restarts the detached queue runner
+    if queued tasks exist and no runner is currently active.
     """
     env = os.environ.copy()
     here = os.getcwd()
     _reconcile_all_tasks()
+    _ensure_queue_runner_started()
+
+    if task_id is not None:
+        tid = str(task_id).strip()
+        rec = _read_task_record(tid)
+        if rec is None:
+            return f"Unknown task_id '{tid}'. (Records live in {TASKS_DIR})"
+        rec = _reconcile_task_if_orphaned(tid, rec)
+        st = rec.get("status", "unknown")
+        q_name = rec.get("queue")
+        if st == "queued":
+            pos = _get_queue_position(tid, q_name) or 1
+            eff_cap, q_cap, g_cap = _get_effective_queue_cap(q_name or "default")
+            return (
+                f"Task {tid}: status=queued, queue={q_name or 'default'}, position={pos}, "
+                f"cap={eff_cap} (queued_at={rec.get('queued_at')}, "
+                f"working_directory={rec.get('working_directory')})"
+            )
+        extra_q = f", queue={q_name}" if q_name else ""
+        pid_str = f", pid={rec.get('pid')}" if rec.get("pid") else ""
+        return (
+            f"Task {tid}: status={st}{extra_q}{pid_str} "
+            f"(working_directory={rec.get('working_directory')})"
+        )
+
+    queue_filter = str(queue).strip() if (queue is not None and str(queue).strip()) else None
+    queue_summary = _format_queues_summary(filter_queue=queue_filter)
+    if queue_filter is not None and working_directory is None:
+        return queue_summary
+
     rc, out, _ = await _run_kilo(["pgrep", "-fl", "kilo run"], cwd=here, env=env)
     procs = []
     for line in (out or "").splitlines():
@@ -5180,6 +5765,8 @@ async def kilo_task_status(
     if not procs:
         recent = _recent_kilo_sessions(3)
         lines = ["No `kilo run` process is currently running (all tasks finished or none started)."]
+        if queue_summary:
+            lines.append("\n" + queue_summary)
         if recent:
             lines.append("\nMost recent Kilo sessions (finished work):")
             for wt, title, ts in recent:
@@ -5225,8 +5812,12 @@ async def kilo_task_status(
             f"- command: {cmdline[:160]}"
         )
     if not report:
-        return f"No `kilo run` process found for workspace {working_directory}."
-    return "# Running Kilo tasks\n\n" + "\n\n".join(report)
+        msg = f"No `kilo run` process found for workspace {working_directory}."
+        return (msg + "\n\n" + queue_summary) if queue_summary else msg
+    out_str = "# Running Kilo tasks\n\n" + "\n\n".join(report)
+    if queue_summary:
+        out_str += "\n\n" + queue_summary
+    return out_str
 
 
 # Helper: unexport write/execution tools when running in --rag-only mode
@@ -6250,6 +6841,9 @@ def configure_models_interactive():
 
 def main() -> None:
     """Console-script entry point."""
+    if "--queue-runner" in sys.argv:
+        run_queue_runner_daemon()
+        return
     if "--install-skills" in sys.argv:
         install_skills()
         return
