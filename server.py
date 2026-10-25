@@ -1589,8 +1589,13 @@ block and get the full report back in this same call.
 
 How to use it well:
 1. (Optional) kilo_rag_search to locate the relevant files.
-2. Write a precise spec in `task_instructions`; pass the key files as
-   `focus_files`; add `execution_hints` and `skills_to_load` as needed.
+2. Write a precise spec in `task_instructions` or pass an existing Markdown file
+   via `brief_file` (when both are given, `task_instructions` is appended under
+   `## Additional instructions` without modifying `brief_file` on disk); pass the
+   key files as `focus_files`; add `execution_hints`, `skills_to_load`, and
+   optionally `log_dir` (to also save `<task_id>.log` in the project; relative
+   `brief_file`/`log_dir` paths resolve against the original `working_directory`
+   even with `isolation='worktree'`).
    When the task instructions enumerate items (a numbered or bulleted list of
    deliverables), Kilo is instructed to include one line per item ("done" or
    "not done: why") in the Final Report, in the same order.
@@ -1717,15 +1722,18 @@ def _build_kilo_run_argv(
 @mcp.tool(description=_IMPLEMENT_DESCRIPTION)
 async def kilo_implement(
     task_instructions: Annotated[
-        str,
+        Optional[str],
         Field(
             description="Detailed, self-contained Markdown specification of the "
-            "work to perform. YOU are the architect: state goals, constraints, "
+            "work to perform. Required unless `brief_file` is provided; when both "
+            "`brief_file` and `task_instructions` are non-empty, `task_instructions` "
+            "is appended after the brief file's content under a `## Additional instructions` "
+            "heading. YOU are the architect: state goals, constraints, "
             "acceptance criteria and edge cases explicitly — Kilo executes what "
             "is written and does not share your conversation context. Long specs "
             "are fine; they are passed via a temp-file bridge, not the shell."
         ),
-    ],
+    ] = None,
     working_directory: Annotated[
         Optional[str],
         Field(
@@ -1883,6 +1891,33 @@ async def kilo_implement(
             "or 'commit' (allow Kilo to commit `*.proposed` files alongside other changes as before)."
         ),
     ] = "untracked",
+    brief_file: Annotated[
+        Optional[str],
+        Field(
+            description="Path (absolute, or relative to `working_directory`) of a "
+            "Markdown file used as the task specification. When given, its content "
+            "is the spec (if `task_instructions` is also non-empty, it is appended "
+            "after the file content under a `## Additional instructions` heading). "
+            "Contract sections (executor contract, Final Report requirements, "
+            "proposed-files rules) are added to the prompt at run time as usual; "
+            "the brief file itself is never modified. With `isolation='worktree'`, "
+            "relative paths resolve against the original `working_directory` (the "
+            "main checkout), not the new worktree, so the brief lives in the "
+            "requester's tree."
+        ),
+    ] = None,
+    log_dir: Annotated[
+        Optional[str],
+        Field(
+            description="Directory (absolute, or relative to `working_directory`; "
+            "created if missing) where the run log is ALSO written as `<task_id>.log` "
+            "(tee: the canonical log under the kilo-mcp data dir stays where it is, "
+            "so kilo_task_result/progress/wait keep working unchanged). With "
+            "`isolation='worktree'`, relative paths resolve against the original "
+            "`working_directory` (the main checkout), not the new worktree, so the "
+            "log lands in the requester's tree."
+        ),
+    ] = None,
 ) -> str:
     """Delegate a code implementation task to Kilo. See the tool description
     (built from _IMPLEMENT_DESCRIPTION + DELEGATION_POLICY) for full guidance."""
@@ -1891,7 +1926,50 @@ async def kilo_implement(
     orig_cwd = working_directory if working_directory else os.getcwd()
     if not os.path.exists(orig_cwd):
         return f"Error: Working directory {orig_cwd} does not exist."
+    orig_cwd_abs = os.path.abspath(orig_cwd)
     cwd = orig_cwd
+
+    brief_abs: Optional[str] = None
+    brief_content: Optional[str] = None
+    if brief_file is not None:
+        if not str(brief_file).strip():
+            return "Error: brief_file path cannot be empty."
+        brief_abs = os.path.abspath(
+            brief_file if os.path.isabs(brief_file) else os.path.join(orig_cwd_abs, brief_file)
+        )
+        if not os.path.exists(brief_abs):
+            return f"Error: brief_file '{brief_abs}' does not exist."
+        if not os.path.isfile(brief_abs):
+            return f"Error: brief_file '{brief_abs}' is not a file."
+        try:
+            with open(brief_abs, "r", encoding="utf-8") as bf:
+                brief_content = bf.read()
+        except OSError as e:
+            return f"Error: cannot read brief_file '{brief_abs}': {e}"
+
+    raw_instructions = task_instructions or ""
+    if brief_content is not None:
+        if raw_instructions.strip():
+            effective_instructions = f"{brief_content.rstrip()}\n\n## Additional instructions\n{raw_instructions}"
+        else:
+            effective_instructions = brief_content
+    else:
+        effective_instructions = raw_instructions
+
+    if not effective_instructions or not effective_instructions.strip():
+        return "Error: task_instructions (or brief_file with non-empty content) is required."
+
+    log_dir_abs: Optional[str] = None
+    if log_dir is not None:
+        if not str(log_dir).strip():
+            return "Error: log_dir path cannot be empty."
+        log_dir_abs = os.path.abspath(
+            log_dir if os.path.isabs(log_dir) else os.path.join(orig_cwd_abs, log_dir)
+        )
+        try:
+            os.makedirs(log_dir_abs, exist_ok=True)
+        except OSError as e:
+            return f"Error: cannot create log_dir '{log_dir_abs}': {e}"
 
     resolved = resolve_kilo_model(working_directory=orig_cwd, model=model)
     if _is_banned_model(resolved.model):
@@ -1972,7 +2050,7 @@ async def kilo_implement(
                 base_commit_for_task = _git_rev_parse(target_worktree, base_branch_for_task)
 
     preflight = estimate_initial_context_tokens(
-        task_instructions=task_instructions,
+        task_instructions=effective_instructions,
         working_directory=cwd,
         focus_files=focus_files,
         execution_hints=execution_hints,
@@ -2032,10 +2110,10 @@ async def kilo_implement(
         agent_manager_worktree_id = prior_rec.get("agent_manager_worktree_id") if prior_rec else None
     else:
         collision_warning = _collision_warning(cwd, exclude_run_id=run_id)
-    collision_warning = _protected_paths_warning(task_instructions, focus_files) + collision_warning
+    collision_warning = _protected_paths_warning(effective_instructions, focus_files) + collision_warning
 
     full_content = _assemble_task_prompt(
-        task_instructions=task_instructions,
+        task_instructions=effective_instructions,
         focus_files=focus_files,
         execution_hints=execution_hints,
         skills_to_load=skills_to_load,
@@ -2062,6 +2140,8 @@ async def kilo_implement(
             base_branch=base_branch_for_task,
             base_commit=base_commit_for_task,
             proposed_files=proposed_files,
+            brief_file=brief_abs,
+            log_dir=log_dir_abs,
         )
         return warnings_prefix + collision_warning + result
 
@@ -2127,6 +2207,10 @@ async def kilo_implement(
         bg_rec["base_branch"] = base_branch_for_task
     if base_commit_for_task:
         bg_rec["base_commit"] = base_commit_for_task
+    if brief_abs:
+        bg_rec["brief_file"] = brief_abs
+    if log_dir_abs:
+        bg_rec["log_dir"] = log_dir_abs
     _write_task_record(run_id, bg_rec)
     if server_session_id:
         _agent_manager_note_session(cwd, server_session_id, agent_manager_worktree_id)
@@ -2160,6 +2244,8 @@ async def kilo_implement(
         "remove it (git worktree remove) once you've reviewed the result.\n"
         if isolated_branch else ""
     )
+    brief_note = f"- Brief: {brief_abs}\n" if brief_abs else ""
+    log_copy_note = f"- Log copy: {os.path.join(log_dir_abs, f'{run_id}.log')}\n" if log_dir_abs else ""
     model_note = f"- Model: {model} ({model_source})\n"
     return (
         warnings_prefix +
@@ -2168,6 +2254,8 @@ async def kilo_implement(
         f"{model_note}"
         f"{session_note}"
         f"{isolation_note}"
+        f"{brief_note}"
+        f"{log_copy_note}"
         f"- Live progress (plan/todo list, commentary, cost): kilo_task_progress "
         f"with task_id '{run_id}'\n"
         f"- Quick OS-level heuristic: kilo_task_status (workspace {cwd})\n"
@@ -2789,6 +2877,27 @@ def _collision_warning(cwd: str, exclude_run_id: str) -> str:
     )
 
 
+def _sync_log_to_log_dir(task_id: str, record: dict) -> Optional[str]:
+    """If `record` has `log_dir`, copy canonical `log_path` to `<log_dir>/<task_id>.log`
+    (creating `log_dir` if missing). Returns the absolute destination path when `log_dir`
+    is set, or None otherwise."""
+    log_dir = record.get("log_dir")
+    if not log_dir:
+        return None
+    base_dir = record.get("working_directory") or os.getcwd()
+    log_dir_abs = os.path.abspath(log_dir if os.path.isabs(log_dir) else os.path.join(base_dir, log_dir))
+    dest_path = os.path.join(log_dir_abs, f"{task_id}.log")
+    log_path = record.get("log_path")
+    if log_path and os.path.exists(log_path):
+        try:
+            os.makedirs(log_dir_abs, exist_ok=True)
+            if os.path.realpath(log_path) != os.path.realpath(dest_path):
+                shutil.copyfile(log_path, dest_path)
+        except OSError:
+            pass
+    return dest_path
+
+
 async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              agent: str, model: str, env: dict,
                              focus_files: Optional[list],
@@ -2800,7 +2909,9 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              model_source: Optional[str] = None,
                              base_branch: Optional[str] = None,
                              base_commit: Optional[str] = None,
-                             proposed_files: str = "untracked") -> str:
+                             proposed_files: str = "untracked",
+                             brief_file: Optional[str] = None,
+                             log_dir: Optional[str] = None) -> str:
     """Run one Kilo implementation task end-to-end: temp-file spec bridge,
     subprocess, Final-Report parsing, metrics. Used by the synchronous
     (background=False) path of kilo_implement only — the background path
@@ -2866,6 +2977,11 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             task_rec["base_branch"] = base_branch
         if base_commit:
             task_rec["base_commit"] = base_commit
+        if brief_file:
+            task_rec["brief_file"] = brief_file
+        if log_dir:
+            task_rec["log_dir"] = log_dir
+        log_copy_path = _sync_log_to_log_dir(run_id, task_rec)
         _write_task_record(run_id, task_rec)
 
         base_moved_note = _check_base_moved(
@@ -2879,12 +2995,18 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         if include_trace:
             note_str = f"\n\nNote: {base_moved_note}" if base_moved_note else ""
             prop_str = f"\n{proposed_note}" if proposed_note else ""
+            extra_meta = ""
+            if brief_file:
+                extra_meta += f"\n- Brief: {brief_file}"
+            if log_copy_path:
+                extra_meta += f"\n- Log copy: {log_copy_path}"
             result_text = (
                 f"Kilo Execution Finished. (run_id: {run_id} — use it with kilo_log_issue "
                 f"if your review finds defects; session_id: {session_id or 'unknown'} — pass "
                 f"it as continue_session_id on a follow-up kilo_implement call to steer this "
                 f"same session){note_str}\n\n"
                 f"- Model: {model}{source_str}"
+                f"{extra_meta}"
                 f"{prop_str}\n"
                 f"Exit Code: {returncode}\n\n"
                 f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
@@ -2902,7 +3024,11 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             if isolated_branch:
                 lines.append(f"- Branch: {isolated_branch}")
                 lines.append(f"- Worktree: {cwd}")
+            if brief_file:
+                lines.append(f"- Brief: {brief_file}")
             lines.append(f"- Log file: {log_path}")
+            if log_copy_path:
+                lines.append(f"- Log copy: {log_copy_path}")
             if base_moved_note:
                 lines.append(f"- Note: {base_moved_note}")
             if proposed_note:
@@ -3228,11 +3354,25 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
     if not proposed_note and proposed_files_mode != "commit" and working_directory:
         proposed_note = _check_proposed_files(working_directory)
 
+    brief_file = record.get("brief_file")
+    log_dir = record.get("log_dir")
+    log_copy_path = None
+    if log_dir:
+        base_dir = working_directory or os.getcwd()
+        log_dir_abs = os.path.abspath(log_dir if os.path.isabs(log_dir) else os.path.join(base_dir, log_dir))
+        log_copy_path = os.path.join(log_dir_abs, f"{task_id}.log")
+
     if include_trace:
         trace_body = log_content or "(no log content captured)"
         note_str = f"\n\nNote: {base_moved_note}" if base_moved_note else ""
         prop_str = f"\n\n{proposed_note}" if proposed_note else ""
-        return f"{header}{note_str}{prop_str}\n\nLOG:\n{trace_body}"
+        extra_lines = []
+        if brief_file:
+            extra_lines.append(f"- Brief: {brief_file}")
+        if log_copy_path:
+            extra_lines.append(f"- Log copy: {log_copy_path}")
+        extra_str = ("\n\n" + "\n".join(extra_lines)) if extra_lines else ""
+        return f"{header}{note_str}{prop_str}{extra_str}\n\nLOG:\n{trace_body}"
 
     lines = [header, ""]
     lines.append(f"- Status: {status}")
@@ -3249,8 +3389,12 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
         lines.append(f"- Branch: {isolated_branch}")
         if working_directory:
             lines.append(f"- Worktree: {working_directory}")
+    if brief_file:
+        lines.append(f"- Brief: {brief_file}")
     if log_path:
         lines.append(f"- Log file: {log_path}")
+    if log_copy_path:
+        lines.append(f"- Log copy: {log_copy_path}")
     if base_moved_note:
         lines.append(f"- Note: {base_moved_note}")
     if proposed_note:
@@ -3366,6 +3510,7 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     temp_record = dict(record)
     temp_record.update(updates)
     temp_record["task_id"] = task_id
+    _sync_log_to_log_dir(task_id, temp_record)
     proposed_files_mode = record.get("proposed_files", "untracked")
     if proposed_files_mode != "commit" and cwd:
         prop_note = _check_proposed_files(cwd)
@@ -3455,12 +3600,14 @@ async def kilo_task_result(
             "kilo_task_status for a quick heuristic."
         )
     if status == "cancelled":
+        _sync_log_to_log_dir(task_id, record)
         return (
             f"Task {task_id} was cancelled. "
             + record.get("result", "(no further detail recorded)")
         )
     if not record.get("task_id"):
         record["task_id"] = task_id
+    _sync_log_to_log_dir(task_id, record)
     return _format_task_result(record, include_trace=include_trace)
 
 
@@ -3652,6 +3799,7 @@ async def kilo_task_cancel(
 
     pid = record.get("pid")
     if not pid:
+        _sync_log_to_log_dir(task_id, record)
         _write_task_record(task_id, {"status": "cancelled", "result": f"Cancelled: {reason}" if reason else "Cancelled."})
         return (
             f"Task {task_id} has no recorded process id yet — it may have just "
@@ -3660,6 +3808,7 @@ async def kilo_task_cancel(
 
     note = f"Cancelled by architect. Reason: {reason}" if reason else "Cancelled by architect (no reason given)."
     if not _is_pid_alive(pid):
+        _sync_log_to_log_dir(task_id, record)
         _write_task_record(task_id, {"status": "cancelled", "result": f"{note} (process had already exited.)"})
         return f"Task {task_id}: process {pid} was already gone; marked cancelled."
 
@@ -3674,6 +3823,7 @@ async def kilo_task_cancel(
         else:
             os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
+        _sync_log_to_log_dir(task_id, record)
         _write_task_record(task_id, {"status": "cancelled", "result": f"{note} (process had already exited.)"})
         return f"Task {task_id}: process {pid} was already gone; marked cancelled."
     await asyncio.sleep(_CANCEL_GRACE_S)
@@ -3700,6 +3850,7 @@ async def kilo_task_cancel(
             os.remove(prompt_file)
         except OSError:
             pass
+    _sync_log_to_log_dir(task_id, record)
     _write_task_record(task_id, {"status": "cancelled", "result": note})
     return (
         f"Task {task_id} (pid {pid}) terminated{' (had to force-kill)' if forced else ''}. "

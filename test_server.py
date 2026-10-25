@@ -4061,4 +4061,185 @@ def test_context_size_preflight_config_keys_and_env(tmp_path, monkeypatch):
     assert cfg["kilo"]["max_context_tokens_refuse"] == 90000
 
 
+# ==============================================================================
+# T033. brief_file and log_dir parameters on kilo_implement
+# ==============================================================================
+
+
+def test_kilo_implement_brief_file_only_and_unchanged(tmp_path, monkeypatch, fake_data_dir):
+    """brief_file is used as the task spec (without requiring task_instructions),
+    contract sections are appended to the temp prompt, and brief_file on disk is unchanged."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    brief_path = tmp_path / "specs" / "task-brief.md"
+    brief_path.parent.mkdir(parents=True)
+    original_brief = "# Feature Brief\n\nImplement the widget parser.\n"
+    brief_path.write_text(original_brief, encoding="utf-8")
+
+    captured_prompts = []
+
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        m = re.search(r"The file (/\S+) contains", cmd[-1])
+        assert m
+        with open(m.group(1), encoding="utf-8") as f:
+            captured_prompts.append(f.read())
+        return (0, "Outcome: success\n- **Files changed**:\n- parser.py\n", "")
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    res = asyncio.run(server.kilo_implement(
+        brief_file="specs/task-brief.md",
+        working_directory=str(tmp_path),
+        background=False,
+    ))
+
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+    assert "## Task Instructions\n# Feature Brief\n\nImplement the widget parser." in prompt
+    assert "## Additional instructions" not in prompt
+    assert "## Protected files (never edit)" in prompt
+    assert "## Final Report (mandatory)" in prompt
+    assert brief_path.read_text(encoding="utf-8") == original_brief
+    assert f"- Brief: {brief_path.resolve()}" in res
+
+
+def test_kilo_implement_brief_file_and_task_instructions_concatenated(tmp_path, monkeypatch, fake_data_dir):
+    """When both brief_file and task_instructions are given, task_instructions is
+    appended under '## Additional instructions' while brief_file on disk is untouched."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    brief_path = tmp_path / "brief.md"
+    original_brief = "Primary specification from brief file."
+    brief_path.write_text(original_brief, encoding="utf-8")
+
+    captured_prompts = []
+
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        m = re.search(r"The file (/\S+) contains", cmd[-1])
+        assert m
+        with open(m.group(1), encoding="utf-8") as f:
+            captured_prompts.append(f.read())
+        return (0, "Outcome: success\n- **Files changed**:\n- a.py\n", "")
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Pay extra attention to edge cases.",
+        brief_file=str(brief_path),
+        working_directory=str(tmp_path),
+        background=False,
+    ))
+
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+    expected_block = (
+        "## Task Instructions\n"
+        "Primary specification from brief file.\n\n"
+        "## Additional instructions\n"
+        "Pay extra attention to edge cases."
+    )
+    assert expected_block in prompt
+    assert brief_path.read_text(encoding="utf-8") == original_brief
+    assert f"- Brief: {brief_path.resolve()}" in res
+
+
+def test_kilo_implement_missing_brief_or_both_empty_errors(tmp_path, monkeypatch, fake_data_dir, mock_spawn_kilo_background, mock_run_kilo_custom):
+    """Missing brief_file or empty brief_file + task_instructions returns a clear error
+    and starts no process."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    res_missing = asyncio.run(server.kilo_implement(
+        brief_file="nonexistent-brief.md",
+        working_directory=str(tmp_path),
+        background=True,
+    ))
+    assert res_missing.startswith("Error:")
+    assert "nonexistent-brief.md" in res_missing
+    assert len(mock_spawn_kilo_background.calls) == 0
+    assert len(mock_run_kilo_custom.calls) == 0
+
+    res_empty = asyncio.run(server.kilo_implement(
+        working_directory=str(tmp_path),
+        background=True,
+    ))
+    assert res_empty.startswith("Error:")
+    assert len(mock_spawn_kilo_background.calls) == 0
+
+
+def test_kilo_implement_log_dir_receives_log_at_terminal_state(tmp_path, monkeypatch, fake_data_dir, mock_spawn_kilo_background):
+    """log_dir receives <task_id>.log when a background task reaches a terminal state
+    (including reconciled orphan runs), while the canonical log stays in TASKS_DIR,
+    and both immediate launch and final result name Brief and Log copy paths."""
+    tasks_dir = tmp_path / "tasks"
+    monkeypatch.setattr(server, "TASKS_DIR", str(tasks_dir))
+    expected_log_text = "Outcome: success\n- **Files changed**:\n- logged.py\n"
+    mock_spawn_kilo_background.log_content = expected_log_text
+
+    brief_path = tmp_path / "docs" / "spec.md"
+    brief_path.parent.mkdir(parents=True)
+    brief_path.write_text("Spec content for log_dir test", encoding="utf-8")
+
+    launch = asyncio.run(server.kilo_implement(
+        brief_file="docs/spec.md",
+        log_dir="logs/kilo-runs",
+        working_directory=str(tmp_path),
+        background=True,
+    ))
+    assert "task_id:" in launch
+    task_id = launch.split("task_id: ")[1].split(")")[0]
+
+    expected_log_copy = (tmp_path / "logs" / "kilo-runs" / f"{task_id}.log").resolve()
+    assert f"- Brief: {brief_path.resolve()}" in launch
+    assert f"- Log copy: {expected_log_copy}" in launch
+
+    # Reconciles orphan run on kilo_task_result and copies canonical log to log_dir
+    res = asyncio.run(server.kilo_task_result(task_id=task_id))
+    assert "Kilo Execution Finished" in res
+    assert f"- Brief: {brief_path.resolve()}" in res
+    assert f"- Log copy: {expected_log_copy}" in res
+
+    canonical_log = tasks_dir / f"{task_id}.log"
+    assert canonical_log.is_file()
+    assert expected_log_copy.is_file()
+    assert expected_log_copy.read_text(encoding="utf-8") == expected_log_text
+
+
+def test_kilo_implement_worktree_resolves_brief_and_log_dir_against_original_cwd(tmp_path, monkeypatch, fake_data_dir, mock_run_kilo_custom):
+    """With isolation='worktree', relative brief_file and log_dir paths resolve against
+    the original working_directory (main checkout), not the newly created worktree."""
+    tasks_dir = tmp_path / "tasks"
+    monkeypatch.setattr(server, "TASKS_DIR", str(tasks_dir))
+    main_repo = tmp_path / "main_repo"
+    main_repo.mkdir()
+    brief_rel = os.path.join("tasks", "T033-brief.md")
+    brief_in_main = main_repo / "tasks" / "T033-brief.md"
+    brief_in_main.parent.mkdir(parents=True)
+    brief_in_main.write_text("Spec living in main checkout.", encoding="utf-8")
+
+    res = asyncio.run(server.kilo_implement(
+        brief_file=brief_rel,
+        log_dir="tasks/logs",
+        working_directory=str(main_repo),
+        isolation="worktree",
+        worktree_branch="feat-brief-log",
+        background=False,
+    ))
+
+    # Worktree was created and Kilo ran inside the worktree
+    assert len(mock_run_kilo_custom.calls) == 2
+    kilo_call = mock_run_kilo_custom.calls[1]
+    assert kilo_call["cwd"] == os.path.join(str(main_repo), ".kilo", "worktrees", "feat-brief-log")
+
+    m_run = re.search(r"run_id:\s*([a-f0-9]+)", res)
+    assert m_run
+    run_id = m_run.group(1)
+
+    expected_brief_abs = brief_in_main.resolve()
+    expected_log_copy_abs = (main_repo / "tasks" / "logs" / f"{run_id}.log").resolve()
+
+    assert f"- Brief: {expected_brief_abs}" in res
+    assert f"- Log copy: {expected_log_copy_abs}" in res
+    assert expected_log_copy_abs.is_file()
+    assert "Outcome: success" in expected_log_copy_abs.read_text(encoding="utf-8")
+
+
+
 
