@@ -2019,6 +2019,11 @@ async def kilo_implement(
     if not effective_instructions or not effective_instructions.strip():
         return "Error: task_instructions (or brief_file with non-empty content) is required."
 
+    extracted_task_ref, extracted_task_files = _extract_task_ref_from_text(
+        f"{brief_abs or ''}\n{worktree_branch or ''}\n{effective_instructions}",
+        focus_files=focus_files,
+    )
+
     log_dir_abs: Optional[str] = None
     if log_dir is not None:
         if not str(log_dir).strip():
@@ -2262,6 +2267,12 @@ async def kilo_implement(
         bg_rec["brief_file"] = brief_abs
     if log_dir_abs:
         bg_rec["log_dir"] = log_dir_abs
+    if extracted_task_ref:
+        bg_rec["task_ref"] = extracted_task_ref
+    if extracted_task_files:
+        bg_rec["task_files"] = extracted_task_files
+    if focus_files:
+        bg_rec["focus_files"] = list(focus_files)
 
     session_note = (
         f"- Continuing session: {continue_session_id}\n"
@@ -2851,6 +2862,408 @@ def _check_base_moved(
     return None
 
 
+def _format_age_short(seconds: Optional[float]) -> Optional[str]:
+    """Format an age in seconds as a compact string (e.g. '45s ago', '12m ago', '2h ago')."""
+    if seconds is None:
+        return None
+    sec = max(0, int(round(seconds)))
+    return f"{sec}s ago"
+
+
+def _extract_task_ref_from_text(
+    text: str,
+    focus_files: Optional[list[str]] = None,
+) -> tuple[Optional[str], list[str]]:
+    """Best-effort extract task ID (e.g. T037, 49.5, 17.1) and candidate task file paths
+    from brief/instructions/branch/focus_files."""
+    candidate_files: list[str] = []
+    task_id: Optional[str] = None
+
+    if focus_files:
+        for f in focus_files:
+            clean = str(f).strip().strip("`'\"")
+            if clean.endswith(".md") and ("tasks/" in clean or re.search(r"\bT\d{3,4}\b|\b\d{1,3}\.\d{1,3}\b", clean)):
+                candidate_files.append(clean)
+
+    if text:
+        for m in re.finditer(r"([\w./-]*tasks/[\w./-]+\.md)", text):
+            p = m.group(1).strip()
+            if p not in candidate_files:
+                candidate_files.append(p)
+
+        # Look for explicit task ID mentions: T### or NN.T
+        m_tid = re.search(r"\b(T\d{3,4})\b", text)
+        if m_tid:
+            task_id = m_tid.group(1)
+        else:
+            m_num = re.search(r"(?:task[s/_ -]*|#\s*|\b)(\d{1,2}\.\d{1,2})\b", text, re.IGNORECASE)
+            if m_num:
+                task_id = m_num.group(1)
+
+    if not task_id:
+        for cf in candidate_files:
+            base = os.path.basename(cf)
+            m_tid = re.search(r"\b(T\d{3,4})\b", base)
+            if m_tid:
+                task_id = m_tid.group(1)
+                break
+            m_num = re.search(r"\b(\d{1,2}\.\d{1,2})\b", base)
+            if m_num:
+                task_id = m_num.group(1)
+                break
+
+    return task_id, candidate_files
+
+
+def _parse_task_state_from_markdown(content: str, task_id: Optional[str] = None) -> Optional[str]:
+    """Parse `- state: <val>` or `**Status:** <val>` from a task file or plan.md content."""
+    if not content:
+        return None
+    if task_id:
+        # 1. Check if this is an initiative plan.md with `### <task_id> - ...` block
+        block_pat = re.compile(
+            rf"^###\s+{re.escape(task_id)}\b[^\n]*\n(.*?)(?=^###\s+|\Z)",
+            re.MULTILINE | re.DOTALL,
+        )
+        m_block = block_pat.search(content)
+        if m_block:
+            block_body = m_block.group(1)
+            m_st = re.search(r"\*\*Status:\*\*\s*`?([^`\n·]+)`?", block_body)
+            if m_st:
+                return m_st.group(1).strip()
+            m_state = re.search(r"^\s*-\s*state:\s*(.+)$", block_body, re.MULTILINE)
+            if m_state:
+                return m_state.group(1).strip().strip("`")
+
+        # 2. Check if this is an emergent task file matching `- id: <task_id>`
+        if re.search(rf"^\s*-\s*id:\s*{re.escape(task_id)}\b", content, re.MULTILINE):
+            m_state = re.search(r"^\s*-\s*state:\s*(.+)$", content, re.MULTILINE)
+            if m_state:
+                return m_state.group(1).strip().strip("`")
+
+    # Fallback: first `- state:` or `**Status:**` in the file
+    m_state = re.search(r"^\s*-\s*state:\s*(.+)$", content, re.MULTILINE)
+    if m_state:
+        return m_state.group(1).strip().strip("`")
+    m_st = re.search(r"\*\*Status:\*\*\s*`?([^`\n·]+)`?", content)
+    if m_st:
+        return m_st.group(1).strip()
+    return None
+
+
+def _is_worktree_record(record: Optional[dict], cwd: Optional[str] = None) -> bool:
+    """Return True if the task record or directory represents a git worktree run
+    (or a git repository with a recorded base_commit/base_branch/isolated_branch)."""
+    target_cwd = cwd or (record.get("working_directory") if record else None)
+    if not target_cwd or not os.path.isdir(target_cwd):
+        return False
+    if record and (record.get("isolated_branch") or record.get("base_commit") or record.get("base_branch")):
+        # Verify it's a valid git repo/worktree
+        if os.path.exists(os.path.join(target_cwd, ".git")):
+            return True
+    norm_slash = target_cwd.replace("\\", "/")
+    if "/.kilo/worktrees/" in norm_slash or "/.kilo-worktrees/" in norm_slash:
+        if os.path.exists(os.path.join(target_cwd, ".git")):
+            return True
+    return _is_git_worktree(target_cwd)
+
+
+def _inspect_worktree_state(
+    cwd: Optional[str],
+    record: Optional[dict] = None,
+) -> Optional[dict[str, Any]]:
+    """Inspect git state of a worktree run:
+    - `commits_ahead`: int count of commits ahead of recorded `base_commit` (or `base_branch` / merge-base)
+    - `dirty_files`: list of dirty file paths from `git status --porcelain`
+    - `dirty_files_count`: total number of dirty files
+    - `dirty_files_sample`: first 10 dirty file paths
+    - `last_commit_epoch`: float epoch timestamp of HEAD commit (if any)
+    - `last_commit_age_s`: float seconds since HEAD commit
+    - `last_commit_age`: formatted age string (e.g. '45s ago', or 'none' if no new commit)
+    - `new_commit_epoch`: float epoch timestamp of the latest commit ahead of base (None if commits_ahead == 0)
+    - `task_state`: best-effort task state (`- state:` / `**Status:**`) read from changed/named task files on the branch
+    - `branch`: current branch name
+    Returns None if `cwd` is not a worktree run or git inspection is unavailable.
+    """
+    if not _is_worktree_record(record, cwd=cwd):
+        return None
+    target_cwd = cwd or (record.get("working_directory") if record else None)
+    if not target_cwd or not os.path.isdir(target_cwd):
+        return None
+
+    rec = record or {}
+    branch = rec.get("isolated_branch") or _current_branch(target_cwd) or "HEAD"
+    base_commit = rec.get("base_commit")
+    base_branch = rec.get("base_branch")
+
+    if not base_commit and not base_branch:
+        meta = _read_worktree_git_metadata(target_cwd)
+        if meta:
+            base_commit = meta.get("baseCommit")
+            base_branch = meta.get("parentBranch")
+
+    if not base_commit and not base_branch and os.path.isdir(TASKS_DIR):
+        real_target = os.path.realpath(target_cwd)
+        try:
+            for fname in os.listdir(TASKS_DIR):
+                if fname.endswith(".json"):
+                    other = _read_task_record(fname[:-5])
+                    if other and other.get("working_directory") and os.path.realpath(other["working_directory"]) == real_target:
+                        base_commit = other.get("base_commit") or base_commit
+                        base_branch = other.get("base_branch") or base_branch
+                        if base_commit or base_branch:
+                            break
+        except OSError:
+            pass
+
+    base_ref = base_commit
+    if not base_ref and base_branch:
+        chk = subprocess.run(
+            ["git", "rev-parse", "--verify", base_branch],
+            cwd=target_cwd, capture_output=True, text=True, timeout=5,
+        )
+        if chk.returncode == 0:
+            mb = subprocess.run(
+                ["git", "merge-base", "HEAD", base_branch],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+            base_ref = mb.stdout.strip() if (mb.returncode == 0 and mb.stdout.strip()) else base_branch
+
+    if not base_ref:
+        for cand in ("main", "master", "development", "develop"):
+            chk = subprocess.run(
+                ["git", "rev-parse", "--verify", cand],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+            if chk.returncode == 0:
+                mb = subprocess.run(
+                    ["git", "merge-base", "HEAD", cand],
+                    cwd=target_cwd, capture_output=True, text=True, timeout=5,
+                )
+                base_ref = mb.stdout.strip() if (mb.returncode == 0 and mb.stdout.strip()) else cand
+                break
+
+    commits_ahead = 0
+    if base_ref:
+        try:
+            res_ahead = subprocess.run(
+                ["git", "rev-list", "--count", f"{base_ref}..HEAD"],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+            if res_ahead.returncode == 0 and res_ahead.stdout.strip():
+                commits_ahead = int(res_ahead.stdout.strip())
+        except Exception:
+            commits_ahead = 0
+
+    dirty_files: list[str] = []
+    try:
+        res_st = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=target_cwd, capture_output=True, text=True, timeout=5,
+        )
+        if res_st.returncode == 0:
+            for raw_line in res_st.stdout.splitlines():
+                if len(raw_line) < 4:
+                    continue
+                path_part = raw_line[3:].strip()
+                if " -> " in path_part:
+                    path_part = path_part.split(" -> ", 1)[1].strip()
+                path_part = path_part.strip('"')
+                if path_part:
+                    dirty_files.append(path_part)
+    except Exception:
+        pass
+
+    last_commit_epoch: Optional[float] = None
+    last_commit_age_s: Optional[float] = None
+    try:
+        res_ct = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "HEAD"],
+            cwd=target_cwd, capture_output=True, text=True, timeout=5,
+        )
+        if res_ct.returncode == 0 and res_ct.stdout.strip():
+            last_commit_epoch = float(res_ct.stdout.strip())
+            last_commit_age_s = max(0.0, time.time() - last_commit_epoch)
+    except Exception:
+        pass
+
+    new_commit_epoch: Optional[float] = last_commit_epoch if commits_ahead > 0 else None
+    last_commit_age_str = _format_age_short(last_commit_age_s) if last_commit_age_s is not None else "unknown"
+
+    # Best-effort: inspect task state (`- state:` / `**Status:**`) on the branch
+    task_state: Optional[str] = None
+    task_id = rec.get("task_ref")
+    candidate_paths: list[str] = list(rec.get("task_files") or [])
+
+    if not task_id or not candidate_paths:
+        text_blobs: list[str] = []
+        if rec.get("brief_file"):
+            text_blobs.append(str(rec["brief_file"]))
+            if os.path.isfile(rec["brief_file"]):
+                try:
+                    with open(rec["brief_file"], "r", encoding="utf-8", errors="replace") as bf:
+                        text_blobs.append(bf.read(8000))
+                except OSError:
+                    pass
+        if rec.get("prompt_file") and os.path.isfile(rec["prompt_file"]):
+            try:
+                with open(rec["prompt_file"], "r", encoding="utf-8", errors="replace") as pf:
+                    text_blobs.append(pf.read(8000))
+            except OSError:
+                pass
+        if branch:
+            text_blobs.append(str(branch))
+        log_p = rec.get("log_path")
+        if log_p and os.path.isfile(log_p):
+            try:
+                with open(log_p, "r", encoding="utf-8", errors="replace") as lf:
+                    text_blobs.append(lf.read(4000))
+            except OSError:
+                pass
+        inferred_tid, inferred_files = _extract_task_ref_from_text(
+            "\n".join(text_blobs),
+            focus_files=rec.get("focus_files"),
+        )
+        if not task_id:
+            task_id = inferred_tid
+        for f in inferred_files:
+            if f not in candidate_paths:
+                candidate_paths.append(f)
+
+    # Also check files changed in commits ahead of base_ref and dirty files
+    changed_md_files: list[str] = []
+    if base_ref and commits_ahead > 0:
+        try:
+            res_diff = subprocess.run(
+                ["git", "diff", "--name-only", f"{base_ref}..HEAD"],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+            if res_diff.returncode == 0:
+                for ln in res_diff.stdout.splitlines():
+                    p = ln.strip()
+                    if p.endswith(".md") and p not in changed_md_files:
+                        changed_md_files.append(p)
+        except Exception:
+            pass
+    for df in dirty_files:
+        if df.endswith(".md") and df not in changed_md_files:
+            changed_md_files.append(df)
+
+    # Prioritize changed markdown files in tasks/ or matching task_id
+    ordered_search_files: list[str] = []
+    for p in changed_md_files + candidate_paths:
+        if p not in ordered_search_files:
+            ordered_search_files.append(p)
+
+    for rel_p in ordered_search_files:
+        clean_rel = rel_p.lstrip("./")
+        abs_p = rel_p if os.path.isabs(rel_p) else os.path.normpath(os.path.join(target_cwd, clean_rel))
+        content = None
+        if os.path.isfile(abs_p):
+            try:
+                with open(abs_p, "r", encoding="utf-8", errors="replace") as tf:
+                    content = tf.read()
+            except OSError:
+                content = None
+        if content is None and not os.path.isabs(rel_p):
+            try:
+                res_show = subprocess.run(
+                    ["git", "show", f"HEAD:{clean_rel}"],
+                    cwd=target_cwd, capture_output=True, text=True, timeout=5,
+                )
+                if res_show.returncode == 0:
+                    content = res_show.stdout
+            except Exception:
+                pass
+        if content:
+            # Only parse from task-like files (under tasks/, plan.md, or matching task_id)
+            is_task_file = (
+                "tasks/" in rel_p.replace("\\", "/")
+                or os.path.basename(rel_p) == "plan.md"
+                or (task_id and task_id in os.path.basename(rel_p))
+                or (task_id and re.search(rf"^\s*-\s*id:\s*{re.escape(task_id)}\b|^###\s+{re.escape(task_id)}\b", content, re.MULTILINE))
+            )
+            if is_task_file:
+                parsed_st = _parse_task_state_from_markdown(content, task_id=task_id)
+                if parsed_st:
+                    task_state = f"{parsed_st} ({task_id})" if task_id else parsed_st
+                    break
+
+    return {
+        "branch": branch,
+        "commits_ahead": commits_ahead,
+        "dirty_files": dirty_files,
+        "dirty_files_count": len(dirty_files),
+        "dirty_files_sample": dirty_files[:10],
+        "last_commit_epoch": last_commit_epoch,
+        "last_commit_age_s": last_commit_age_s,
+        "last_commit_age": last_commit_age_str,
+        "new_commit_epoch": new_commit_epoch,
+        "task_state": task_state,
+        "task_id": task_id,
+    }
+
+
+def _format_dirty_files_value(wt_state: dict[str, Any]) -> str:
+    """Format dirty_files count + first 10 paths."""
+    cnt = wt_state.get("dirty_files_count", 0)
+    sample = wt_state.get("dirty_files_sample") or []
+    if cnt == 0 or not sample:
+        return "0"
+    paths_str = ", ".join(sample)
+    if cnt > len(sample):
+        paths_str += f" (+{cnt - len(sample)} more)"
+    return f"{cnt} ({paths_str})"
+
+
+def _format_worktree_state_lines(wt_state: Optional[dict[str, Any]], cwd: Optional[str] = None, status: Optional[str] = None) -> list[str]:
+    """Format multi-line bullet points for worktree git state."""
+    if not wt_state:
+        return []
+    out = [
+        f"- commits_ahead: {wt_state['commits_ahead']}",
+        f"- dirty_files: {_format_dirty_files_value(wt_state)}",
+        f"- last_commit_age: {wt_state['last_commit_age']}",
+    ]
+    if wt_state.get("task_state"):
+        out.append(f"- task_state: {wt_state['task_state']}")
+    if status == "failed_with_uncommitted_work" and cwd:
+        out.append(f"- Hint: run git status in {cwd}")
+    return out
+
+
+def _format_worktree_state_inline(wt_state: Optional[dict[str, Any]], cwd: Optional[str] = None, status: Optional[str] = None) -> str:
+    """Format compact single-line summary of worktree git state for kilo_task_status(task_id=...)."""
+    if not wt_state:
+        return ""
+    parts = [
+        f"commits_ahead={wt_state['commits_ahead']}",
+        f"dirty_files={_format_dirty_files_value(wt_state)}",
+        f"last_commit_age={wt_state['last_commit_age']}",
+    ]
+    if wt_state.get("task_state"):
+        parts.append(f"task_state={wt_state['task_state']}")
+    if status == "failed_with_uncommitted_work" and cwd:
+        parts.append(f'hint="run git status in {cwd}"')
+    return ", " + ", ".join(parts)
+
+
+def _has_uncommitted_work_without_new_commit(
+    wt_state: Optional[dict[str, Any]],
+    record: Optional[dict] = None,
+) -> bool:
+    """Return True if the worktree has dirty files and no new commit after the last activity
+    (or no commits ahead of base at all)."""
+    if not wt_state or wt_state.get("dirty_files_count", 0) <= 0:
+        return False
+    if wt_state.get("commits_ahead", 0) <= 0:
+        return True
+    # There is at least one commit ahead of base, but dirty files remain after the commit.
+    # Any uncommitted modification in the working tree after the last commit means the run
+    # left uncommitted work behind after its last commit.
+    return True
+
+
 # Files Kilo's ConfigProtection always asks about (packages/opencode/src/kilocode/
 # permission/config-paths.ts): an unattended `kilo run` auto-rejects the ask and
 # ends the run.
@@ -3094,6 +3507,20 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         report = _parse_final_report(stdout)
         final_status = "completed" if (returncode == 0 and report.get("outcome") in ("success", "partial")) else "failed"
 
+        wt_state = _inspect_worktree_state(
+            cwd,
+            {
+                "working_directory": cwd,
+                "isolated_branch": isolated_branch,
+                "base_branch": base_branch,
+                "base_commit": base_commit,
+                "brief_file": brief_file,
+                "focus_files": focus_files,
+            },
+        )
+        if _has_uncommitted_work_without_new_commit(wt_state):
+            final_status = "failed_with_uncommitted_work"
+
         proposed_note = _check_proposed_files(cwd) if proposed_files != "commit" else None
 
         task_rec = {
@@ -3120,6 +3547,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             task_rec["brief_file"] = brief_file
         if log_dir:
             task_rec["log_dir"] = log_dir
+        if focus_files:
+            task_rec["focus_files"] = list(focus_files)
         log_copy_path = _sync_log_to_log_dir(run_id, task_rec)
         _write_task_record(run_id, task_rec)
 
@@ -3139,11 +3568,14 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                 extra_meta += f"\n- Brief: {brief_file}"
             if log_copy_path:
                 extra_meta += f"\n- Log copy: {log_copy_path}"
+            for wl in _format_worktree_state_lines(wt_state, cwd=cwd, status=final_status):
+                extra_meta += f"\n{wl}"
             result_text = (
                 f"Kilo Execution Finished. (run_id: {run_id} — use it with kilo_log_issue "
                 f"if your review finds defects; session_id: {session_id or 'unknown'} — pass "
                 f"it as continue_session_id on a follow-up kilo_implement call to steer this "
                 f"same session){note_str}\n\n"
+                f"- Status: {final_status}\n"
                 f"- Model: {model}{source_str}"
                 f"{extra_meta}"
                 f"{prop_str}\n"
@@ -3168,6 +3600,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             lines.append(f"- Log file: {log_path}")
             if log_copy_path:
                 lines.append(f"- Log copy: {log_copy_path}")
+            lines.extend(_format_worktree_state_lines(wt_state, cwd=cwd, status=final_status))
             if base_moved_note:
                 lines.append(f"- Note: {base_moved_note}")
             if proposed_note:
@@ -3284,22 +3717,17 @@ def _is_task_output_finished(log_content: str) -> tuple[bool, Optional[dict]]:
         return False, None
 
     # Check (1): Final Report parsed from output
-    report = _parse_final_report(log_content)
-    if report.get("outcome") in ("success", "partial", "failed"):
-        m = re.search(r"Outcome[^\n]{0,60}?\b(success|partial|failed)\b([^\n]*)", log_content, re.IGNORECASE)
-        is_template = False
-        if m:
-            line_rest = m.group(2)
-            if re.search(r"\|\s*(partial|failed)", line_rest, re.IGNORECASE):
-                outcomes = list(re.finditer(r"Outcome[^\n]{0,60}?\b(success|partial|failed)\b([^\n]*)", log_content, re.IGNORECASE))
-                real_outcomes = [o for o in outcomes if not re.search(r"\|\s*(partial|failed)", o.group(2), re.IGNORECASE)]
-                if not real_outcomes:
-                    is_template = True
-        if not is_template:
-            return True, report
+    final_report_text = _extract_final_report(log_content)
+    if final_report_text:
+        # Ensure the process isn't actively executing a step AFTER an early/mid-stream Final Report
+        if not re.search(r"Still working on step|Running step:", final_report_text):
+            report = _parse_final_report(final_report_text)
+            if report.get("outcome") in ("success", "partial", "failed"):
+                return True, report
 
     # Check (2): JSON stream idle/finished events
     if _has_json_idle_or_finished_event(log_content):
+        report = _parse_final_report(log_content)
         return True, report
 
     return False, None
@@ -3320,8 +3748,6 @@ def _get_time_since_last_output(record: dict) -> Optional[float]:
 def _is_task_lingering_in_grace(record: dict) -> bool:
     """True if a task's process is alive, output indicates it is finished,
     and no new output has been produced, but the grace period has not yet expired."""
-    if record.get("status") != "running":
-        return False
     pid = record.get("pid")
     if not pid or not _is_pid_alive(pid):
         return False
@@ -3402,7 +3828,7 @@ def _reap_lingering_process(pid: int, sigkill_timeout_s: Optional[float] = None)
 
 
 def _reconcile_all_tasks() -> None:
-    """Reconcile every task currently marked running in TASKS_DIR."""
+    """Reconcile every task currently marked running (or with a lingering process) in TASKS_DIR."""
     if not os.path.isdir(TASKS_DIR):
         return
     try:
@@ -3413,7 +3839,7 @@ def _reconcile_all_tasks() -> None:
         if filename.endswith(".json"):
             task_id = filename[:-len(".json")]
             rec = _read_task_record(task_id)
-            if rec and rec.get("status") == "running":
+            if rec and (rec.get("status") == "running" or rec.get("lingering")):
                 _reconcile_task_if_orphaned(task_id, rec)
 
 
@@ -3768,6 +4194,11 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
             f"Kilo Execution Finished ({note} — "
             f"task_id: {task_id}, session_id: {session_id or 'unknown'})."
         )
+    elif note and "process lingering" in note:
+        header = (
+            f"Kilo Execution Finished ({note} — "
+            f"task_id: {task_id}, session_id: {session_id or 'unknown'})."
+        )
     else:
         header = (
             f"Kilo Execution Finished. Result read from the run log "
@@ -3780,6 +4211,9 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
         base_commit=record.get("base_commit"),
         branch=isolated_branch,
     )
+
+    wt_state = _inspect_worktree_state(working_directory, record)
+    wt_lines = _format_worktree_state_lines(wt_state, cwd=working_directory, status=status)
 
     proposed_files_mode = record.get("proposed_files", "untracked")
     proposed_note = record.get("proposed_note")
@@ -3803,6 +4237,7 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
             extra_lines.append(f"- Brief: {brief_file}")
         if log_copy_path:
             extra_lines.append(f"- Log copy: {log_copy_path}")
+        extra_lines.extend(wt_lines)
         extra_str = ("\n\n" + "\n".join(extra_lines)) if extra_lines else ""
         return f"{header}{note_str}{prop_str}{extra_str}\n\nLOG:\n{trace_body}"
 
@@ -3827,6 +4262,7 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
         lines.append(f"- Log file: {log_path}")
     if log_copy_path:
         lines.append(f"- Log copy: {log_copy_path}")
+    lines.extend(wt_lines)
     if base_moved_note:
         lines.append(f"- Note: {base_moved_note}")
     if proposed_note:
@@ -3857,50 +4293,63 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
 
 
 def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
-    """If `record` says status=='running':
-    1. If the PID is dead, reconcile as completed/failed from log file.
-    2. If the PID is alive but the task has finished (Final Report parsed or
-       JSON idle event) and has produced no output for the grace period
-       (default 60s), reap the lingering process (SIGTERM pg, SIGKILL after 5s)
-       and record status 'completed' with note 'reaped lingering process after completion'.
-    3. If still genuinely working or in grace window, return record unmodified.
+    """Reconcile a task record against OS process liveness, log output, and worktree state:
+    1. If the record was already reconciled while its process was lingering (`lingering=True`),
+       check if the process has exited or exceeded the grace period (default 60s) with no new
+       output; if so, reap the process and update `note` to 'reaped lingering process after completion'.
+    2. If `record` says status=='running':
+       - If a Final Report (or JSON idle event) has been written to the log OR the process has
+         exited, reconcile the record immediately to `completed`, `failed`, or
+         `failed_with_uncommitted_work` (never waiting many minutes for a grace period when the
+         Final Report is already present).
+       - If the process is still alive when the Final Report is detected, reap it immediately if
+         the grace period has already elapsed; otherwise mark `lingering=True` so it is reaped as
+         soon as the short grace period expires with no further output.
 
-    Returns the (possibly updated) record; also persists the update via
-    _write_task_record so future calls short-circuit on status != 'running'."""
-    if record.get("status") != "running":
+    Returns the (possibly updated) record; also persists the update via _write_task_record."""
+    status = record.get("status")
+    pid = record.get("pid")
+
+    if status != "running":
+        if record.get("lingering") and pid:
+            pid_alive = _is_pid_alive(pid)
+            if not pid_alive or record.get("result"):
+                updates = {
+                    "lingering": False,
+                    "note": "Result read from the run log (the Kilo process has exited)." if not pid_alive else record.get("note", "Result read from the run log (the Kilo process has exited)."),
+                }
+                if not pid_alive:
+                    temp_rec = dict(record)
+                    temp_rec.update(updates)
+                    temp_rec["task_id"] = task_id
+                    updates["result"] = _format_task_result(temp_rec, include_trace=False)
+                    _write_task_record(task_id, updates)
+                    record = dict(record)
+                    record.update(updates)
+                    return record
+
+            time_since_output = _get_time_since_last_output(record)
+            grace = _get_linger_grace()
+            if time_since_output is None or time_since_output >= grace:
+                logger.info(
+                    "Task %s (pid %s) lingering process exceeded grace %.1fs (idle %.1fs); reaping process group",
+                    task_id, pid, grace, time_since_output or 0.0,
+                )
+                _reap_lingering_process(pid, sigkill_timeout_s=5.0)
+                updates = {
+                    "lingering": False,
+                    "note": "reaped lingering process after completion",
+                }
+                temp_rec = dict(record)
+                temp_rec.update(updates)
+                temp_rec["task_id"] = task_id
+                updates["result"] = _format_task_result(temp_rec, include_trace=False)
+                _write_task_record(task_id, updates)
+                record = dict(record)
+                record.update(updates)
         return record
 
-    pid = record.get("pid")
     pid_alive = _is_pid_alive(pid)
-
-    reaped = False
-    if pid_alive:
-        # Process is alive. Only reap if finished and idle beyond grace period.
-        time_since_output = _get_time_since_last_output(record)
-        grace = _get_linger_grace()
-        if time_since_output is not None and time_since_output < grace:
-            return record
-
-        log_path = record.get("log_path")
-        log_content = ""
-        if log_path and os.path.exists(log_path):
-            try:
-                with open(log_path, "r", errors="replace") as f:
-                    log_content = f.read()
-            except OSError:
-                pass
-
-        is_finished, report = _is_task_output_finished(log_content)
-        if not is_finished:
-            return record
-
-        # Both (a) finished output and (b) grace period exceeded: reap lingering process
-        logger.info(
-            "Task %s (pid %s) finished output and remained idle for %.1fs (grace %.1fs); reaping process group",
-            task_id, pid, time_since_output, grace
-        )
-        _reap_lingering_process(pid, sigkill_timeout_s=5.0)
-        reaped = True
 
     log_path = record.get("log_path")
     log_content = ""
@@ -3912,6 +4361,31 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
             pass
 
     is_finished, report = _is_task_output_finished(log_content)
+    has_final_report = bool(report and report.get("outcome") in ("success", "partial", "failed"))
+
+    reaped = False
+    still_lingering = False
+
+    if pid_alive:
+        if not is_finished:
+            return record
+
+        time_since_output = _get_time_since_last_output(record)
+        grace = _get_linger_grace()
+        if time_since_output is None or time_since_output >= grace:
+            logger.info(
+                "Task %s (pid %s) finished output and remained idle for %.1fs (grace %.1fs); reaping process group",
+                task_id, pid, time_since_output or 0.0, grace,
+            )
+            _reap_lingering_process(pid, sigkill_timeout_s=5.0)
+            reaped = True
+        elif has_final_report:
+            # Final Report is present: reconcile immediately even if process lingers in grace window
+            still_lingering = True
+        else:
+            # JSON idle event only: wait for grace period to confirm no further output
+            return record
+
     if report is None:
         report = _parse_final_report(log_content) if log_content else {"outcome": "unknown", "files_changed": []}
 
@@ -3924,21 +4398,37 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     if exit_code is None:
         exit_code = record.get("exit_code")
     if exit_code is None:
-        exit_code = 0 if (report.get("outcome") in ("success", "partial") or reaped) else 1
+        exit_code = 0 if (report.get("outcome") in ("success", "partial") or reaped or still_lingering) else 1
 
-    if reaped:
-        final_status = "completed"
-        note = "reaped lingering process after completion"
+    wt_state = _inspect_worktree_state(cwd, record)
+    uncommitted_work = _has_uncommitted_work_without_new_commit(wt_state, record)
+
+    if uncommitted_work:
+        final_status = "failed_with_uncommitted_work"
+    elif reaped:
+        final_status = "completed" if report.get("outcome") in ("success", "partial", None) else "failed"
     else:
         final_status = "completed" if report.get("outcome") in ("success", "partial") else "failed"
+
+    if reaped:
+        note = "reaped lingering process after completion"
+    elif still_lingering:
+        note = "Result read from the run log (Final Report written; process lingering in grace period)."
+    else:
         note = "Result read from the run log (the Kilo process has exited)."
 
-    updates = {
+    ended_at = datetime.now(timezone.utc).isoformat()
+    updates: dict[str, Any] = {
         "status": final_status,
+        "ended": True,
+        "ended_at": ended_at,
+        "lingering": still_lingering,
         "session_id": session_id,
         "exit_code": exit_code,
         "note": note,
     }
+    if uncommitted_work and cwd:
+        updates["hint"] = f"run git status in {cwd}"
     temp_record = dict(record)
     temp_record.update(updates)
     temp_record["task_id"] = task_id
@@ -3957,7 +4447,7 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
         costs = _estimate_costs(spec_chars=0, result_chars=len(result_text), code_chars=measure["code_chars"])
         _append_jsonl(METRICS_FILE, {
             "run_id": task_id,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": ended_at,
             "tool": "kilo_implement",
             "working_directory": cwd,
             "agent": record.get("agent"),
@@ -3967,16 +4457,17 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
             "files_changed": report.get("files_changed") or [],
             **measure,
             **costs,
-            "recovered_after_restart": not reaped,
+            "recovered_after_restart": not (reaped or still_lingering),
             "reaped_lingering": reaped,
         })
 
-    prompt_file = record.get("prompt_file")
-    if prompt_file and os.path.exists(prompt_file):
-        try:
-            os.remove(prompt_file)
-        except OSError:
-            pass
+    if not still_lingering:
+        prompt_file = record.get("prompt_file")
+        if prompt_file and os.path.exists(prompt_file):
+            try:
+                os.remove(prompt_file)
+            except OSError:
+                pass
 
     _write_task_record(task_id, updates)
     if session_id:
@@ -4054,7 +4545,7 @@ async def kilo_task_result(
     return _format_task_result(record, include_trace=include_trace)
 
 
-_TERMINAL_TASK_STATES = ("completed", "failed", "cancelled", "error")
+_TERMINAL_TASK_STATES = ("completed", "failed", "failed_with_uncommitted_work", "cancelled", "error")
 
 
 @mcp.tool()
@@ -4078,9 +4569,9 @@ async def kilo_task_wait(
     ] = False,
 ) -> str:
     """Wait until a background kilo_implement task reaches a terminal state
-    (completed, failed, cancelled, error) or `timeout_seconds` elapses, polling
-    cheaply every 2 seconds and reconciling orphaned processes from their log files via
-    _reconcile_task_if_orphaned. Also waits through `queued -> running -> terminal`
+    (completed, failed, failed_with_uncommitted_work, cancelled, error) or `timeout_seconds`
+    elapses, polling cheaply every 2 seconds and reconciling orphaned processes from their
+    log files via _reconcile_task_if_orphaned. Also waits through `queued -> running -> terminal`
     for queued tasks, restarting the detached queue runner if it has died.
 
     Accepts `timeout_seconds` up to at least 3600s (or more) for long runs and
@@ -4104,19 +4595,26 @@ async def kilo_task_wait(
         status = record.get("status")
         if status == "queued":
             _ensure_queue_runner_started()
-        if status in _TERMINAL_TASK_STATES or status not in ("running", "queued"):
+        if (status in _TERMINAL_TASK_STATES or status not in ("running", "queued")) and (
+            not record.get("lingering") or _get_linger_grace() >= 10.0
+        ):
             return await kilo_task_result(task_id=task_id, include_trace=include_trace)
 
         elapsed = time.monotonic() - started
         if elapsed >= effective_timeout:
+            if status in _TERMINAL_TASK_STATES or status not in ("running", "queued"):
+                return await kilo_task_result(task_id=task_id, include_trace=include_trace)
             if status == "queued":
                 q_name = record.get("queue") or "default"
                 pos = _get_queue_position(task_id, q_name) or 1
+                wt_state = _inspect_worktree_state(record.get("working_directory"), record)
+                wt_lines = _format_worktree_state_lines(wt_state, cwd=record.get("working_directory"), status=status)
+                wt_block = ("\n" + "\n".join(wt_lines)) if wt_lines else ""
                 return (
                     f"Task {task_id} is still queued in queue '{q_name}' (position {pos}) "
                     f"after waiting {int(round(elapsed))}s "
                     f"(timeout_seconds={effective_timeout}s; queued at {record.get('queued_at')}, "
-                    f"workspace {record.get('working_directory')})."
+                    f"workspace {record.get('working_directory')}).{wt_block}"
                 )
             progress = await kilo_task_progress(task_id=task_id)
             return (
@@ -4162,14 +4660,24 @@ async def kilo_task_progress(
         return f"Unknown task_id '{task_id}'. (Records live in {TASKS_DIR})"
     record = _reconcile_task_if_orphaned(task_id, record)
     status = record.get("status")
+    cwd = record.get("working_directory")
+    wt_state = _inspect_worktree_state(cwd, record)
+    wt_lines = _format_worktree_state_lines(wt_state, cwd=cwd, status=status)
+    wt_block = ("\n" + "\n".join(wt_lines)) if wt_lines else ""
+
     if status != "running":
+        if record.get("lingering") and _is_task_lingering_in_grace(record):
+            return (
+                f"Task {task_id} already ended (status: {status}); "
+                f"finished; process lingering (grace period). "
+                f"Use kilo_task_result for the final report.{wt_block}"
+            )
         return (
             f"Task {task_id} already ended (status: {status}). "
-            "Use kilo_task_result for the final report."
+            f"Use kilo_task_result for the final report.{wt_block}"
         )
     if _is_task_lingering_in_grace(record):
-        return f"Task {task_id}: finished; process lingering (grace period). Use kilo_task_result for the final report."
-    cwd = record.get("working_directory")
+        return f"Task {task_id}: finished; process lingering (grace period). Use kilo_task_result for the final report.{wt_block}"
     session_id = record.get("session_id")
     if not session_id and cwd:
         session_id = _find_session_for_task(cwd, record.get("started", ""), task_id)
@@ -4181,7 +4689,7 @@ async def kilo_task_progress(
             f"Task {task_id} is running but no matching Kilo session was found "
             "yet in the session database — it may have just started. Try again "
             "shortly, or use kilo_task_status for an OS-level heuristic in the "
-            "meantime."
+            f"meantime.{wt_block}"
         )
 
     lines = [f"# Live progress — task {task_id} (session {session_id})"]
@@ -4194,6 +4702,7 @@ async def kilo_task_progress(
             f"{summary['tokens_input']}/{summary['tokens_output']}"
         )
         lines.append(f"- last activity: {int(age_s)}s ago")
+    lines.extend(wt_lines)
 
     todos = _read_todos(session_id)
     lines.append("\n## Plan / todo list")
@@ -5735,19 +6244,23 @@ async def kilo_task_status(
         rec = _reconcile_task_if_orphaned(tid, rec)
         st = rec.get("status", "unknown")
         q_name = rec.get("queue")
+        cwd_rec = rec.get("working_directory")
+        wt_state = _inspect_worktree_state(cwd_rec, rec)
+        wt_inline = _format_worktree_state_inline(wt_state, cwd=cwd_rec, status=st)
         if st == "queued":
             pos = _get_queue_position(tid, q_name) or 1
             eff_cap, q_cap, g_cap = _get_effective_queue_cap(q_name or "default")
             return (
-                f"Task {tid}: status=queued, queue={q_name or 'default'}, position={pos}, "
-                f"cap={eff_cap} (queued_at={rec.get('queued_at')}, "
-                f"working_directory={rec.get('working_directory')})"
+                f"Task {tid}: status=queued, ended=false, queue={q_name or 'default'}, position={pos}, "
+                f"cap={eff_cap}{wt_inline} (queued_at={rec.get('queued_at')}, "
+                f"working_directory={cwd_rec})"
             )
+        ended_bool = "false" if st in ("running", "queued") else "true"
         extra_q = f", queue={q_name}" if q_name else ""
         pid_str = f", pid={rec.get('pid')}" if rec.get("pid") else ""
         return (
-            f"Task {tid}: status={st}{extra_q}{pid_str} "
-            f"(working_directory={rec.get('working_directory')})"
+            f"Task {tid}: status={st}, ended={ended_bool}{extra_q}{pid_str}{wt_inline} "
+            f"(working_directory={cwd_rec})"
         )
 
     queue_filter = str(queue).strip() if (queue is not None and str(queue).strip()) else None
@@ -5804,11 +6317,18 @@ async def kilo_task_status(
             verdict = "FINISHED; PROCESS LINGERING (GRACE PERIOD)"
         else:
             verdict = _assess_kilo_task(elapsed, cpu, has_network, session_age)
+        wt_state = _inspect_worktree_state(proc_cwd if proc_cwd != "?" else None, matching_rec)
+        wt_lines = _format_worktree_state_lines(
+            wt_state,
+            cwd=proc_cwd if proc_cwd != "?" else None,
+            status=matching_rec.get("status") if matching_rec else None,
+        )
+        wt_suffix = ("\n" + "\n".join(wt_lines)) if wt_lines else ""
         report.append(
             f"## PID {pid} — {proc_cwd}\n"
             f"- elapsed: {int(elapsed)}s | cpu: {int(cpu)}s | network: {'yes' if has_network else 'no'}"
             f" | session activity: {f'{int(session_age)}s ago' if session_age is not None else 'none for this run'}\n"
-            f"- verdict: **{verdict}**\n"
+            f"- verdict: **{verdict}**{wt_suffix}\n"
             f"- command: {cmdline[:160]}"
         )
     if not report:

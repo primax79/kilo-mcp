@@ -2979,7 +2979,7 @@ def test_kilo_task_wait_accepts_long_timeout_and_returns_on_completion(tmp_path,
 
     task_id = "long_wait_ok"
     log_path = tasks_dir / f"{task_id}.log"
-    log_path.write_text("## Final Report\n- **Outcome**: success\n- **Files changed**: - done.py\n")
+    log_path.write_text("Working on task...\n")
 
     server._write_task_record(task_id, {
         "status": "running",
@@ -2993,6 +2993,7 @@ def test_kilo_task_wait_accepts_long_timeout_and_returns_on_completion(tmp_path,
 
     async def fake_sleep(seconds):
         sleep_calls.append(seconds)
+        log_path.write_text("## Final Report\n- **Outcome**: success\n- **Files changed**: - done.py\n")
         server._write_task_record(task_id, {
             "status": "completed",
             "exit_code": 0,
@@ -4505,6 +4506,307 @@ def test_queue_runner_single_instance_flock(tmp_path, monkeypatch, fake_data_dir
     finally:
         fd1.close()
     assert server._is_queue_runner_locked(lock_path=lock_file) is False
+
+
+# ==============================================================================
+# T037: Worktree state in status tools; reliable ended; failed_with_uncommitted_work
+# ==============================================================================
+
+
+def _create_test_worktree(repo_dir: str, branch_name: str, wt_name: str = "wt") -> tuple[str, str]:
+    """Create a linked git worktree under `<repo_dir>/.kilo/worktrees/<wt_name>` and return (wt_path, base_commit)."""
+    base_commit = subprocess.run(
+        ["git", "-C", repo_dir, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    wt_path = os.path.join(repo_dir, ".kilo", "worktrees", wt_name)
+    os.makedirs(os.path.dirname(wt_path), exist_ok=True)
+    subprocess.run(
+        ["git", "-C", repo_dir, "worktree", "add", "-b", branch_name, wt_path],
+        check=True, capture_output=True,
+    )
+    server._ensure_worktrees_excluded(repo_dir)
+    return wt_path, base_commit
+
+
+def test_t037_lingering_process_with_final_report_ended_immediately_and_reaped_after_grace(tmp_path, fake_data_dir, monkeypatch):
+    """When a run writes a Final Report to its log, it is immediately reconciled as ended
+    (status='completed', ended=True) even while the process lingers inside a long grace period,
+    so kilo_task_status, kilo_task_wait, and kilo_task_result do not stay 'running' for minutes;
+    once the short grace period expires with no further output, the lingering process is reaped."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo")
+    wt_path, base_commit = _create_test_worktree(repo, "task/T037-linger", "task-T037-linger")
+
+    # Commit 1 file in the worktree so it is clean and 1 commit ahead
+    with open(os.path.join(wt_path, "feature.py"), "w") as f:
+        f.write("print('done')\n")
+    subprocess.run(["git", "-C", wt_path, "add", "feature.py"], check=True)
+    subprocess.run(["git", "-C", wt_path, "commit", "-m", "feat: add feature"], check=True)
+
+    # Spawn a real lingering process (mimicking `kilo run` that wrote Final Report and hung)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub_kilo = bin_dir / "kilo"
+    stub_kilo.write_text(f"""#!{sys.executable}
+import time
+while True:
+    time.sleep(1)
+""")
+    stub_kilo.chmod(0o755)
+    proc = subprocess.Popen([str(stub_kilo), "run", "--agent", "code"], start_new_session=True)
+
+    try:
+        task_id = "linger_fast_end"
+        log_path = tmp_path / "tasks" / f"{task_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "Working...\n"
+            "## Final Report\n"
+            "- **Outcome**: success — completed work\n"
+            "- **Files changed**:\n"
+            "  - feature.py\n"
+            "- **Verification**: pytest passed\n"
+            "- **Issues**: none\n"
+        )
+
+        # Set a large grace period (60s): reconciliation must NOT wait 60s to mark the task ended!
+        monkeypatch.setattr(server, "KILO_LINGER_GRACE", 60.0)
+        server._write_task_record(task_id, {
+            "status": "running",
+            "started": "2026-10-27T15:00:00+00:00",
+            "working_directory": wt_path,
+            "isolated_branch": "task/T037-linger",
+            "base_branch": "main",
+            "base_commit": base_commit,
+            "pid": proc.pid,
+            "log_path": str(log_path),
+        })
+
+        # 1. kilo_task_status(task_id=...) reconciles immediately to completed + ended=true
+        st_out = asyncio.run(server.kilo_task_status(task_id=task_id))
+        assert "status=completed" in st_out
+        assert "ended=true" in st_out
+        assert "commits_ahead=1" in st_out
+        assert "dirty_files=0" in st_out
+        assert "last_commit_age=" in st_out
+
+        rec = server._read_task_record(task_id)
+        assert rec["status"] == "completed"
+        assert rec["ended"] is True
+        assert rec["lingering"] is True
+
+        # 2. kilo_task_wait returns immediately without waiting for the 60s grace period
+        t0 = time.monotonic()
+        wait_out = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=30))
+        elapsed_wait = time.monotonic() - t0
+        assert elapsed_wait < 2.0
+        assert "- Status: completed" in wait_out
+        assert "- commits_ahead: 1" in wait_out
+        assert "- dirty_files: 0" in wait_out
+        assert "- last_commit_age:" in wait_out
+
+        # 3. Once the grace period elapses with no further output, _reconcile_all_tasks reaps the process
+        monkeypatch.setattr(server, "KILO_LINGER_GRACE", 0.05)
+        time.sleep(0.1)
+        server._reconcile_all_tasks()
+        assert not server._is_pid_alive(proc.pid)
+        rec_after = server._read_task_record(task_id)
+        assert rec_after["lingering"] is False
+        assert rec_after["note"] == "reaped lingering process after completion"
+    finally:
+        try:
+            os.kill(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_t037_exit_with_dirty_files_reports_failed_with_uncommitted_work(tmp_path, fake_data_dir, monkeypatch):
+    """A run whose process exited (or lingers after a Final Report) with dirty files and no new
+    commit after the last activity is reported as `failed_with_uncommitted_work` with the one-line
+    hint `run git status in <worktree>`."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_dirty")
+    wt_path, base_commit = _create_test_worktree(repo, "task/49.5-commit-based-status", "task-49.5")
+
+    # Create uncommitted modifications and untracked files in worktree (0 commits ahead of base)
+    with open(os.path.join(wt_path, "README.md"), "w") as f:
+        f.write("Modified but not committed\n")
+    for i in range(12):
+        with open(os.path.join(wt_path, f"uncommitted_{i:02d}.ts"), "w") as f:
+            f.write(f"export const x{i} = {i};\n")
+
+    task_id = "dirty_exit_49_5"
+    log_path = tmp_path / "tasks" / f"{task_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("Running tests... all 597 tests passed.\n$ git status -s\n")
+
+    server._write_task_record(task_id, {
+        "status": "running",
+        "started": "2026-10-27T12:57:37+00:00",
+        "working_directory": wt_path,
+        "isolated_branch": "task/49.5-commit-based-status",
+        "base_branch": "main",
+        "base_commit": base_commit,
+        "pid": 9999999,  # dead PID
+        "log_path": str(log_path),
+    })
+
+    # Check kilo_task_status(task_id=...)
+    st_out = asyncio.run(server.kilo_task_status(task_id=task_id))
+    assert "status=failed_with_uncommitted_work" in st_out
+    assert "ended=true" in st_out
+    assert "commits_ahead=0" in st_out
+    assert "dirty_files=13 (" in st_out
+    assert "+3 more)" in st_out  # 13 dirty files -> first 10 paths shown + (+3 more)
+    assert f'hint="run git status in {wt_path}"' in st_out
+
+    # Check kilo_task_wait / kilo_task_result
+    wait_out = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=5))
+    assert "- Status: failed_with_uncommitted_work" in wait_out
+    assert "- commits_ahead: 0" in wait_out
+    assert "- dirty_files: 13 (" in wait_out
+    assert f"- Hint: run git status in {wt_path}" in wait_out
+
+    # Check kilo_task_progress on the ended task also shows the status and worktree fields
+    prog_out = asyncio.run(server.kilo_task_progress(task_id=task_id))
+    assert "failed_with_uncommitted_work" in prog_out
+    assert "- commits_ahead: 0" in prog_out
+    assert f"- Hint: run git status in {wt_path}" in prog_out
+
+
+def test_t037_lingering_with_final_report_and_dirty_files_reports_failed_with_uncommitted_work(tmp_path, fake_data_dir, monkeypatch):
+    """Even if the run wrote a Final Report claiming Outcome: success and its process lingers,
+    if the worktree still has dirty uncommitted files, it reconciles to failed_with_uncommitted_work."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_linger_dirty")
+    wt_path, base_commit = _create_test_worktree(repo, "task/T037-linger-dirty", "task-T037-linger-dirty")
+
+    with open(os.path.join(wt_path, "forgotten.py"), "w") as f:
+        f.write("x = 42\n")
+
+    task_id = "linger_dirty_1"
+    log_path = tmp_path / "tasks" / f"{task_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "## Final Report\n"
+        "- **Outcome**: success\n"
+        "- **Files changed**:\n"
+        "  - forgotten.py\n"
+    )
+
+    monkeypatch.setattr(server, "KILO_LINGER_GRACE", 60.0)
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: True)
+
+    server._write_task_record(task_id, {
+        "status": "running",
+        "started": "2026-10-27T15:10:00+00:00",
+        "working_directory": wt_path,
+        "isolated_branch": "task/T037-linger-dirty",
+        "base_branch": "main",
+        "base_commit": base_commit,
+        "pid": 54321,
+        "log_path": str(log_path),
+    })
+
+    rec = server._reconcile_task_if_orphaned(task_id, server._read_task_record(task_id))
+    assert rec["status"] == "failed_with_uncommitted_work"
+    assert rec["ended"] is True
+    assert rec["hint"] == f"run git status in {wt_path}"
+
+    res_out = asyncio.run(server.kilo_task_result(task_id=task_id))
+    assert "- Status: failed_with_uncommitted_work" in res_out
+    assert "- dirty_files: 1 (forgotten.py)" in res_out
+    assert f"- Hint: run git status in {wt_path}" in res_out
+
+
+def test_t037_worktree_state_commits_ahead_task_state_and_live_progress_timeout(tmp_path, fake_data_dir, monkeypatch, live_kilo_pid):
+    """For worktree runs, kilo_task_status, kilo_task_progress (even without a kilo.db session),
+    and kilo_task_wait (both on timeout and at completion) report commits_ahead, dirty_files,
+    last_commit_age, and best-effort task_state from the branch."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(server, "KILO_SESSION_DB", str(tmp_path / "nonexistent.db"))
+    repo = _init_git_repo(tmp_path / "repo_wt_state")
+    wt_path, base_commit = _create_test_worktree(repo, "task/T072-config-show", "task-T072-config-show")
+
+    # Create a task file on the branch with `- state: delivered` and commit 2 commits ahead of base
+    task_rel = "tasks/engine/T072-config-show.md"
+    task_abs = os.path.join(wt_path, task_rel)
+    os.makedirs(os.path.dirname(task_abs), exist_ok=True)
+    with open(task_abs, "w") as f:
+        f.write("# T072 config show\n\n- id: T072\n- state: delivered\n")
+    subprocess.run(["git", "-C", wt_path, "add", task_rel], check=True)
+    subprocess.run(["git", "-C", wt_path, "commit", "-m", "feat(T072): step 1"], check=True)
+
+    with open(os.path.join(wt_path, "impl.py"), "w") as f:
+        f.write("def show(): pass\n")
+    subprocess.run(["git", "-C", wt_path, "add", "impl.py"], check=True)
+    subprocess.run(["git", "-C", wt_path, "commit", "-m", "feat(T072): step 2"], check=True)
+
+    # Also leave 1 dirty file while still running
+    with open(os.path.join(wt_path, "wip.py"), "w") as f:
+        f.write("# work in progress\n")
+
+    task_id = "wt_state_t072"
+    log_path = tmp_path / "tasks" / f"{task_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("Working on T072...\n")
+
+    server._write_task_record(task_id, {
+        "status": "running",
+        "started": "2026-10-27T15:20:00+00:00",
+        "working_directory": wt_path,
+        "isolated_branch": "task/T072-config-show",
+        "base_branch": "main",
+        "base_commit": base_commit,
+        "focus_files": [task_rel],
+        "pid": live_kilo_pid,
+        "log_path": str(log_path),
+    })
+
+    # 1. kilo_task_status(task_id=...) while running
+    st_running = asyncio.run(server.kilo_task_status(task_id=task_id))
+    assert "status=running, ended=false" in st_running
+    assert "commits_ahead=2" in st_running
+    assert "dirty_files=1 (wip.py)" in st_running
+    assert "last_commit_age=" in st_running
+    assert "task_state=delivered (T072)" in st_running
+
+    # 2. kilo_task_progress while running (no kilo.db session yet -> still includes worktree state!)
+    prog_running = asyncio.run(server.kilo_task_progress(task_id=task_id))
+    assert "- commits_ahead: 2" in prog_running
+    assert "- dirty_files: 1 (wip.py)" in prog_running
+    assert "- last_commit_age:" in prog_running
+    assert "- task_state: delivered (T072)" in prog_running
+
+    # 3. kilo_task_wait on timeout (timeout_seconds=0) includes worktree state via progress
+    wait_timeout = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=0))
+    assert "still running after waiting" in wait_timeout
+    assert "- commits_ahead: 2" in wait_timeout
+    assert "- dirty_files: 1 (wip.py)" in wait_timeout
+    assert "- last_commit_age:" in wait_timeout
+    assert "- task_state: delivered (T072)" in wait_timeout
+
+    # 4. Now commit wip.py and write Final Report -> kilo_task_wait at the end
+    subprocess.run(["git", "-C", wt_path, "add", "wip.py"], check=True)
+    subprocess.run(["git", "-C", wt_path, "commit", "-m", "feat(T072): finish wip"], check=True)
+    log_path.write_text(
+        "Working on T072...\n"
+        "## Final Report\n"
+        "- **Outcome**: success\n"
+        "- **Files changed**:\n"
+        "  - impl.py\n"
+        "  - wip.py\n"
+    )
+    monkeypatch.setattr(server, "KILO_LINGER_GRACE", 60.0)
+    wait_end = asyncio.run(server.kilo_task_wait(task_id=task_id, timeout_seconds=5))
+    assert "Kilo Execution Finished" in wait_end
+    assert "- Status: completed" in wait_end
+    assert "- commits_ahead: 3" in wait_end
+    assert "- dirty_files: 0" in wait_end
+    assert "- last_commit_age:" in wait_end
+    assert "- task_state: delivered (T072)" in wait_end
+
 
 
 
