@@ -296,7 +296,8 @@ def test_kilo_implement(tmp_path, fake_data_dir, mock_run_kilo_custom):
     cmd = call["cmd"]
     assert cmd[0:5] == ["kilo", "run", "--agent", "code", "--model"]
     assert cmd[5] == "google/gemini-3.5-flash-preview"
-    wrapper = cmd[6]
+    assert "--title" in cmd
+    wrapper = cmd[-1]
     assert "contains your full task specification" in wrapper
     
     # Extract the temp file path from the wrapper
@@ -5090,6 +5091,230 @@ def test_t038_refresh_base_conflict_abort_vs_resolve_and_rebase_refused(tmp_path
     with open(os.path.join(wt_path, "README.md")) as f:
         readme_text = f.read()
     assert "<<<<<<<" in readme_text and ">>>>>>>" in readme_text
+
+
+# ==============================================================================
+# T039: duration_s for background runs; readable session titles
+# ==============================================================================
+
+def test_title_derivation_isolated_and_non_isolated():
+    # Isolated run: uses worktree branch as label
+    t1 = server._derive_task_title("t1", "# Build new API\nLine 2", isolated_branch="task/17.5-use-case-stage")
+    assert t1 == "task/17.5-use-case-stage — Build new API"
+
+    # Non-isolated run: uses task id as label
+    t2 = server._derive_task_title("run_456", "# Build new API\nLine 2", isolated_branch=None)
+    assert t2 == "run_456 — Build new API"
+
+    # Plain text spec without heading
+    t3 = server._derive_task_title("run_789", "Quick one-line task", isolated_branch=None)
+    assert t3 == "run_789 — Quick one-line task"
+
+    # Long text without heading (capped at 60 chars)
+    t4 = server._derive_task_title("run_long", "X" * 100, isolated_branch=None)
+    assert t4 == f"run_long — {'X' * 60}"
+
+    # Generic preamble skipped in favor of actual heading
+    t5 = server._derive_task_title("run_preamble", "## Task Instructions\n# Actual Title\nDetails", isolated_branch=None)
+    assert t5 == "run_preamble — Actual Title"
+
+    # Empty spec fallback
+    t6 = server._derive_task_title("run_empty", "", isolated_branch=None)
+    assert t6 == "run_empty — unspecified task"
+
+
+def test_build_kilo_run_argv_includes_title():
+    cmd = server._build_kilo_run_argv("/path/to/spec.md", title="feat/1 — Add thing")
+    assert "--title" in cmd
+    idx = cmd.index("--title")
+    assert cmd[idx + 1] == "feat/1 — Add thing"
+
+
+def test_duration_recorded_background_completion(tmp_path, fake_data_dir, mock_spawn_kilo_background, monkeypatch):
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    mock_spawn_kilo_background.log_content = "Outcome: success\n- **Files changed**:\n- x.py\n"
+
+    launch = asyncio.run(server.kilo_implement(
+        task_instructions="# Feature ABC\nDo it", working_directory=str(tmp_path),
+        background=True,
+    ))
+    task_id = launch.split("task_id: ")[1].split(")")[0]
+
+    # Check task record has title immediately
+    rec_init = server._read_task_record(task_id)
+    assert rec_init["title"] == f"{task_id} — Feature ABC"
+
+    res = asyncio.run(server.kilo_task_result(task_id=task_id))
+    assert "Kilo Execution Finished" in res
+
+    # Read metrics
+    with open(server.METRICS_FILE) as f:
+        lines = [json.loads(l) for l in f if l.strip()]
+    task_metrics = [m for m in lines if m.get("run_id") == task_id]
+    assert len(task_metrics) == 1
+    m = task_metrics[0]
+    assert "duration_s" in m
+    assert isinstance(m["duration_s"], float)
+    assert m["duration_s"] >= 0.0
+
+    # Task record on disk also records duration_s
+    rec = server._read_task_record(task_id)
+    assert "duration_s" in rec
+    assert isinstance(rec["duration_s"], float)
+
+
+def test_duration_recorded_orphan_reconciliation(tmp_path, fake_data_dir, monkeypatch):
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    os.makedirs(str(tmp_path / "tasks"), exist_ok=True)
+
+    proc = subprocess.Popen(["sleep", "0"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    started_dt = datetime.now(server.timezone.utc)
+    started_iso = started_dt.isoformat()
+    # Event timestamp 15 seconds after start
+    event_timestamp_ms = int((started_dt.timestamp() + 15.0) * 1000)
+
+    log_path = str(tmp_path / "tasks" / "orphan_dur.log")
+    with open(log_path, "w") as f:
+        f.write(
+            "data: {\"type\": \"session.idle\", \"timestamp\": " + str(event_timestamp_ms) + "}\n"
+            "Outcome: success\nFiles changed:\n- recovered.py\n"
+        )
+
+    server._write_task_record("orphan_dur", {
+        "status": "running",
+        "started": started_iso,
+        "working_directory": str(tmp_path),
+        "agent": "code",
+        "model": "google/gemini-3.5-flash",
+        "pid": dead_pid,
+        "log_path": log_path,
+        "title": "orphan_dur — Recover test",
+    })
+
+    res = asyncio.run(server.kilo_task_result(task_id="orphan_dur"))
+    assert "Kilo Execution Finished" in res
+
+    with open(server.METRICS_FILE) as f:
+        lines = [json.loads(l) for l in f if l.strip()]
+    task_metrics = [m for m in lines if m.get("run_id") == "orphan_dur"]
+    assert len(task_metrics) == 1
+    m = task_metrics[0]
+    assert "duration_s" in m
+    assert isinstance(m["duration_s"], float)
+    assert abs(m["duration_s"] - 15.0) < 0.5
+
+
+def test_duration_recorded_cancel(tmp_path, fake_data_dir, monkeypatch):
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    os.makedirs(str(tmp_path / "tasks"), exist_ok=True)
+
+    started_dt = datetime.fromtimestamp(time.time() - 8.0, tz=server.timezone.utc)
+    server._write_task_record("t_cancel", {
+        "status": "running",
+        "started": started_dt.isoformat(),
+        "working_directory": str(tmp_path),
+        "agent": "code",
+        "model": "google/gemini-3.5-flash",
+        "title": "t_cancel — Long running job",
+    })
+
+    res = asyncio.run(server.kilo_task_cancel(task_id="t_cancel", reason="testing cancel duration"))
+    assert "cancelled" in res.lower()
+
+    rec = server._read_task_record("t_cancel")
+    assert rec["status"] == "cancelled"
+    assert "duration_s" in rec
+    assert rec["duration_s"] >= 7.5
+
+    with open(server.METRICS_FILE) as f:
+        lines = [json.loads(l) for l in f if l.strip()]
+    task_metrics = [m for m in lines if m.get("run_id") == "t_cancel"]
+    assert len(task_metrics) == 1
+    m = task_metrics[0]
+    assert m["outcome"] == "cancelled"
+    assert m["duration_s"] >= 7.5
+    assert isinstance(m["duration_s"], float)
+
+
+def test_metrics_no_double_count(tmp_path, fake_data_dir, monkeypatch):
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    os.makedirs(str(tmp_path / "tasks"), exist_ok=True)
+
+    proc = subprocess.Popen(["sleep", "0"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    log_path = str(tmp_path / "tasks" / "orphan_double.log")
+    with open(log_path, "w") as f:
+        f.write("Outcome: success\nFiles changed:\n- a.py\n")
+
+    server._write_task_record("orphan_double", {
+        "status": "running",
+        "started": datetime.now(server.timezone.utc).isoformat(),
+        "working_directory": str(tmp_path),
+        "pid": dead_pid,
+        "log_path": log_path,
+        "title": "orphan_double — Test double count",
+    })
+
+    # First reconciliation
+    r1 = server._read_task_record("orphan_double")
+    server._reconcile_task_if_orphaned("orphan_double", r1)
+
+    # Second reconciliation
+    r2 = server._read_task_record("orphan_double")
+    server._reconcile_task_if_orphaned("orphan_double", r2)
+
+    # Cancellation call on already ended task
+    asyncio.run(server.kilo_task_cancel(task_id="orphan_double"))
+
+    # Assert exactly 1 metrics record exists
+    with open(server.METRICS_FILE) as f:
+        lines = [json.loads(l) for l in f if l.strip()]
+    task_metrics = [m for m in lines if m.get("run_id") == "orphan_double"]
+    assert len(task_metrics) == 1
+
+
+def test_kilo_task_progress_shows_title(tmp_path, monkeypatch, live_kilo_pid):
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    db_path = tmp_path / "kilo.db"
+    started = "2026-07-14T10:00:00+00:00"
+    started_ms = int(datetime.fromisoformat(started).timestamp() * 1000)
+    now_ms = int(time.time() * 1000)
+
+    _make_fake_kilo_db(
+        str(db_path), worktree=str(tmp_path), session_id="ses_title",
+        time_created_ms=started_ms + 500, time_updated_ms=now_ms,
+        todos=[("step 1", "in_progress", "high")],
+    )
+    monkeypatch.setattr(server, "KILO_SESSION_DB", str(db_path))
+
+    server._write_task_record("t_prog", {
+        "status": "running",
+        "working_directory": str(tmp_path),
+        "started": started,
+        "pid": live_kilo_pid,
+        "title": "feat/my-feature — Implement Feature Title",
+    })
+
+    prog = asyncio.run(server.kilo_task_progress(task_id="t_prog"))
+    assert "feat/my-feature — Implement Feature Title" in prog
+
+
+def test_kilo_task_status_shows_title(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    server._write_task_record("t_stat", {
+        "status": "running",
+        "working_directory": str(tmp_path),
+        "title": "task/branch-z — Status Title Check",
+    })
+
+    st = asyncio.run(server.kilo_task_status(task_id="t_stat"))
+    assert "title='task/branch-z — Status Title Check'" in st
+
 
 
 

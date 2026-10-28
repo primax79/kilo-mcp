@@ -970,6 +970,7 @@ _DEFAULT_DATA_DIR = DATA_DIR
 METRICS_FILE = os.path.join(DATA_DIR, "metrics.jsonl")
 ISSUES_FILE = os.path.join(DATA_DIR, "issues.jsonl")
 DECISIONS_FILE = os.path.join(DATA_DIR, "decisions.jsonl")
+KILO_SESSION_DB = os.path.expanduser("~/.local/share/kilo/kilo.db")
 
 
 def _decisions_file_path() -> str:
@@ -1132,6 +1133,188 @@ def _append_jsonl(path: str, record: dict) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         pass  # metrics must never break the actual run
+
+
+_FINALIZED_RUNS: set[tuple[str, str]] = set()
+
+
+def _parse_iso_timestamp(ts: Optional[str]) -> Optional[float]:
+    """Parse an ISO 8601 timestamp string into epoch seconds (float)."""
+    if not ts:
+        return None
+    try:
+        raw = ts.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        return datetime.fromisoformat(raw).timestamp()
+    except Exception:
+        return None
+
+
+def _has_metrics_record(task_id: str, record: Optional[dict] = None) -> bool:
+    """Check if task_id has already been recorded in METRICS_FILE (idempotency guard)."""
+    if record and record.get("metrics_recorded"):
+        return True
+    key = (os.path.abspath(METRICS_FILE), task_id)
+    if key in _FINALIZED_RUNS:
+        return True
+    if os.path.exists(METRICS_FILE):
+        try:
+            with open(METRICS_FILE, "r", errors="replace") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        if data.get("run_id") == task_id:
+                            _FINALIZED_RUNS.add(key)
+                            return True
+                    except Exception:
+                        continue
+        except OSError:
+            pass
+    return False
+
+
+def _extract_last_event_time_from_log(log_content: str, log_path: Optional[str] = None) -> Optional[float]:
+    """Extract the timestamp of the last event from the log content or log file.
+
+    Checks JSON events (e.g. session.idle, session.finished, etc.), then ISO timestamps in text,
+    and falls back to the file modification time (mtime).
+    """
+    if log_content:
+        lines = [l.strip() for l in log_content.splitlines() if l.strip()]
+        for line in reversed(lines[-200:]):
+            candidate_line = line[5:].strip() if line.startswith("data:") else line
+            if candidate_line.startswith("{") and candidate_line.endswith("}"):
+                try:
+                    ev = json.loads(candidate_line)
+                    if isinstance(ev, dict):
+                        candidates = [ev]
+                        if isinstance(ev.get("properties"), dict):
+                            candidates.append(ev["properties"])
+                        if isinstance(ev.get("data"), dict):
+                            candidates.append(ev["data"])
+                        for d in candidates:
+                            for k in ("timestamp", "time", "ts", "time_updated", "created_at"):
+                                val = d.get(k)
+                                if isinstance(val, (int, float)):
+                                    if val > 1e11:
+                                        return float(val) / 1000.0
+                                    elif val > 1e8:
+                                        return float(val)
+                                elif isinstance(val, str):
+                                    parsed = _parse_iso_timestamp(val)
+                                    if parsed is not None:
+                                        return parsed
+                except Exception:
+                    pass
+            iso_m = re.search(r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\b", line)
+            if iso_m:
+                parsed = _parse_iso_timestamp(iso_m.group(1))
+                if parsed is not None:
+                    return parsed
+
+    if log_path and os.path.exists(log_path):
+        try:
+            return os.path.getmtime(log_path)
+        except OSError:
+            pass
+
+    return None
+
+
+def _extract_spec_summary(spec: Optional[str]) -> str:
+    """Extract first line of spec heading or first 60 chars."""
+    if not spec:
+        return "unspecified task"
+
+    lines = [l.strip() for l in spec.splitlines() if l.strip()]
+    if not lines:
+        return "unspecified task"
+
+    for line in lines:
+        if line.startswith("#"):
+            candidate = line.lstrip("#").strip()
+            if candidate.lower() in (
+                "task instructions",
+                "task specification",
+                "task spec",
+                "task specification from the orchestrating architect",
+            ):
+                continue
+            return candidate.splitlines()[0].strip()
+        else:
+            break
+
+    first_line = lines[0]
+    if first_line.startswith("#"):
+        return first_line.lstrip("#").strip().splitlines()[0].strip()
+    return first_line[:60].strip()
+
+
+def _derive_task_title(task_id: str, spec: Optional[str], isolated_branch: Optional[str] = None) -> str:
+    """Derive a readable title for a task session:
+    <label> — <first line of the spec heading or first 60 chars>,
+    where <label> is the worktree branch when isolated, else the task id."""
+    label = isolated_branch if isolated_branch else task_id
+    summary = _extract_spec_summary(spec)
+    return f"{label} — {summary}"
+
+
+def _update_session_title_in_db(session_id: str, title: str) -> bool:
+    """Update title for a specific session row in kilo.db."""
+    if not session_id or not title:
+        return False
+    if not os.path.exists(KILO_SESSION_DB):
+        return False
+    try:
+        con = sqlite3.connect(KILO_SESSION_DB, timeout=2)
+        try:
+            with con:
+                con.execute("UPDATE session SET title = ? WHERE id = ?", (title, session_id))
+            return True
+        finally:
+            con.close()
+    except Exception as e:
+        logger.debug("Failed to update session title in kilo.db: %s", e)
+        return False
+
+
+def _finalize_task_cancellation(task_id: str, record: dict, note: str, reason: Optional[str] = None) -> None:
+    """Finalize a cancelled task record and record metrics idempotently."""
+    ended_at = datetime.now(timezone.utc).isoformat()
+    started_iso = record.get("started") or record.get("queued_at")
+    start_time = _parse_iso_timestamp(started_iso)
+    duration_s = max(0.0, round(time.time() - start_time, 2)) if start_time is not None else 0.0
+
+    if not _has_metrics_record(task_id, record):
+        cwd = record.get("working_directory") or ""
+        measure = _measure_files(cwd, []) if cwd else {"files_measured": 0, "code_chars": 0, "code_lines": 0}
+        costs = _estimate_costs(spec_chars=0, result_chars=len(note), code_chars=0)
+        _append_jsonl(METRICS_FILE, {
+            "run_id": task_id,
+            "ts": ended_at,
+            "tool": "kilo_implement",
+            "working_directory": cwd,
+            "agent": record.get("agent"),
+            "model": record.get("model"),
+            "session_id": record.get("session_id"),
+            "duration_s": duration_s,
+            "exit_code": 1,
+            "outcome": "cancelled",
+            "files_changed": [],
+            **measure,
+            **costs,
+        })
+        _FINALIZED_RUNS.add((os.path.abspath(METRICS_FILE), task_id))
+
+    _write_task_record(task_id, {
+        "status": "cancelled",
+        "ended": True,
+        "ended_at": ended_at,
+        "duration_s": duration_s,
+        "metrics_recorded": True,
+        "result": note,
+    })
 
 
 def _parse_final_report(stdout: str) -> dict:
@@ -1743,6 +1926,7 @@ def _build_kilo_run_argv(
     agent: Optional[str] = "code",
     model: Optional[str] = None,
     session_id: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> list[str]:
     """Build the argument vector for `kilo run`.
 
@@ -1755,6 +1939,8 @@ def _build_kilo_run_argv(
     cmd.extend(["--agent", chosen_agent])
     if model:
         cmd.extend(["--model", model])
+    if title:
+        cmd.extend(["--title", title])
     cmd.append(
         f"The file {prompt_file} contains your full task specification from an "
         "orchestrating architect. Read it now, then execute it completely. Your "
@@ -2366,6 +2552,8 @@ async def kilo_implement(
     if model_warnings:
         warnings_prefix += "\n\n".join(model_warnings) + "\n\n"
 
+    task_title = _derive_task_title(run_id, effective_instructions, isolated_branch=isolated_branch)
+
     if not background:
         result = await _execute_implement(
             run_id, cwd, full_content, agent, model, env,
@@ -2381,6 +2569,7 @@ async def kilo_implement(
             log_dir=log_dir_abs,
             original_spec=original_spec_for_record,
             resumed_from=resumed_from_id,
+            title=task_title,
         )
         return warnings_prefix + collision_warning + result
 
@@ -2405,7 +2594,7 @@ async def kilo_implement(
         srv_url, srv_pass = _discover_active_kilo_server(cwd)
         if srv_url:
             created_sid = await _kilo_server_create_session(
-                srv_url, srv_pass, title=f"MCP Task {run_id}", directory=cwd
+                srv_url, srv_pass, title=task_title, directory=cwd
             )
             if created_sid:
                 server_session_id = created_sid
@@ -2415,9 +2604,11 @@ async def kilo_implement(
         agent=agent,
         model=model,
         session_id=server_session_id,
+        title=task_title,
     )
     log_path = os.path.join(TASKS_DIR, f"{run_id}.log")
     bg_rec = {
+        "title": task_title,
         "working_directory": cwd,
         "agent": agent,
         "model": model,
@@ -2489,10 +2680,12 @@ async def kilo_implement(
             f"{eff_cap} (queue cap: {q_cap}, global max_concurrent_runs: {g_cap})"
             if q_cap is not None else f"{eff_cap} (global max_concurrent_runs: {g_cap})"
         )
+        title_note = f"- Title: {task_title}\n" if task_title else ""
         return (
             warnings_prefix +
             collision_warning +
             f"Task queued in background. (task_id: {run_id})\n\n"
+            f"{title_note}"
             f"- Queue: {queue_name}\n"
             f"- Position in queue: {pos}\n"
             f"- Concurrency cap: {cap_detail}\n"
@@ -2528,6 +2721,8 @@ async def kilo_implement(
                     sid = _find_session_for_task(cwd, started_iso, run_id)
                     if sid:
                         _agent_manager_note_session(cwd, sid, agent_manager_worktree_id)
+                        if task_title:
+                            _update_session_title_in_db(sid, task_title)
                         rec = _read_task_record(run_id)
                         if rec and not rec.get("session_id"):
                             rec["session_id"] = sid
@@ -2537,10 +2732,12 @@ async def kilo_implement(
         except Exception:
             pass
 
+    title_note = f"- Title: {task_title}\n" if task_title else ""
     return (
         warnings_prefix +
         collision_warning +
         f"Task started in background. (task_id: {run_id})\n\n"
+        f"{title_note}"
         f"{model_note}"
         f"{session_note}"
         f"{isolation_note}"
@@ -2709,6 +2906,14 @@ def _start_task_from_record(task_id: str, record: dict, base_env: Optional[dict]
     agent = record.get("agent") or "code"
     model = record.get("model")
     session_id = record.get("session_id")
+    task_title = record.get("title")
+    if not task_title:
+        task_title = _derive_task_title(
+            task_id,
+            record.get("original_spec") or record.get("task_instructions"),
+            isolated_branch=record.get("isolated_branch"),
+        )
+        record["title"] = task_title
     cmd = record.get("cmd")
     if not cmd:
         if not prompt_file:
@@ -2718,6 +2923,7 @@ def _start_task_from_record(task_id: str, record: dict, base_env: Optional[dict]
             agent=agent,
             model=model,
             session_id=session_id,
+            title=task_title,
         )
     log_path = record.get("log_path") or os.path.join(TASKS_DIR, f"{task_id}.log")
     os.makedirs(os.path.dirname(log_path) or TASKS_DIR, exist_ok=True)
@@ -2734,11 +2940,13 @@ def _start_task_from_record(task_id: str, record: dict, base_env: Optional[dict]
         "pid": pid,
         "log_path": log_path,
         "cmd": cmd,
+        "title": task_title,
     }
     record.update(updates)
     _write_task_record(task_id, record)
     if session_id:
         _agent_manager_note_session(cwd, session_id, record.get("agent_manager_worktree_id"))
+        _update_session_title_in_db(session_id, task_title)
     return pid
 
 
@@ -3799,7 +4007,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              brief_file: Optional[str] = None,
                              log_dir: Optional[str] = None,
                              original_spec: Optional[str] = None,
-                             resumed_from: Optional[str] = None) -> str:
+                             resumed_from: Optional[str] = None,
+                             title: Optional[str] = None) -> str:
     """Run one Kilo implementation task end-to-end: temp-file spec bridge,
     subprocess, Final-Report parsing, metrics. Used by the synchronous
     (background=False) path of kilo_implement only — the background path
@@ -3807,6 +4016,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
     it isn't tied to this server call's own lifetime."""
     prompt_file = None
     started_wall = datetime.now(timezone.utc).isoformat()
+    task_title = title or _derive_task_title(run_id, full_content, isolated_branch=isolated_branch)
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(full_content)
@@ -3820,6 +4030,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             agent=agent,
             model=model,
             session_id=continue_session_id,
+            title=task_title,
         )
 
         started = time.monotonic()
@@ -3831,6 +4042,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         session_id = continue_session_id or _find_session_for_task(cwd, started_wall, run_id)
         if session_id:
             _agent_manager_note_session(cwd, session_id, agent_manager_worktree_id)
+            _update_session_title_in_db(session_id, task_title)
 
         os.makedirs(TASKS_DIR, exist_ok=True)
         log_path = os.path.join(TASKS_DIR, f"{run_id}.log")
@@ -3860,8 +4072,12 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         proposed_note = _check_proposed_files(cwd) if proposed_files != "commit" else None
 
         task_rec = {
+            "title": task_title,
             "status": final_status,
             "started": started_wall,
+            "ended": True,
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "duration_s": duration,
             "working_directory": cwd,
             "agent": agent,
             "model": model,
@@ -3978,24 +4194,28 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             result_chars=len(result_text),
             code_chars=measure["code_chars"],
         )
-        _append_jsonl(METRICS_FILE, {
-            "run_id": run_id,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "tool": "kilo_implement",
-            "working_directory": cwd,
-            "agent": agent,
-            "model": model,
-            "session_id": session_id,
-            "duration_s": duration,
-            "exit_code": returncode,
-            "outcome": report["outcome"],
-            "files_changed": report["files_changed"],
-            **measure,
-            **costs,
-            "focus_files": focus_files or [],
-            "skills_to_load": skills_to_load or [],
-            "spec_chars": len(full_content),
-        })
+        if not _has_metrics_record(run_id, task_rec):
+            _append_jsonl(METRICS_FILE, {
+                "run_id": run_id,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "tool": "kilo_implement",
+                "working_directory": cwd,
+                "agent": agent,
+                "model": model,
+                "session_id": session_id,
+                "duration_s": duration,
+                "exit_code": returncode,
+                "outcome": report["outcome"],
+                "files_changed": report["files_changed"],
+                **measure,
+                **costs,
+                "focus_files": focus_files or [],
+                "skills_to_load": skills_to_load or [],
+                "spec_chars": len(full_content),
+            })
+            _FINALIZED_RUNS.add((os.path.abspath(METRICS_FILE), run_id))
+            task_rec["metrics_recorded"] = True
+            _write_task_record(run_id, task_rec)
         return result_text
     except FileNotFoundError:
         return "Error: The 'kilo' executable was not found in the PATH."
@@ -4383,11 +4603,41 @@ def run_queue_once() -> dict[str, Any]:
             running_by_queue[q_name] = q_running + 1
         except Exception as e:
             logger.error("Queue runner failed to start task %s: %s", task_id, e)
+            ended_at = datetime.now(timezone.utc).isoformat()
+            start_time = _parse_iso_timestamp(fresh.get("queued_at"))
+            duration_s = max(0.0, round(time.time() - start_time, 2)) if start_time else 0.0
+            cwd = fresh.get("working_directory") or ""
+            note = f"Queue runner failed to spawn task: {e}"
+            res_str = f"Error launching queued task {task_id}: {e}"
+            if not _has_metrics_record(task_id, fresh):
+                costs = _estimate_costs(spec_chars=0, result_chars=len(res_str), code_chars=0)
+                _append_jsonl(METRICS_FILE, {
+                    "run_id": task_id,
+                    "ts": ended_at,
+                    "tool": "kilo_implement",
+                    "working_directory": cwd,
+                    "agent": fresh.get("agent"),
+                    "model": fresh.get("model"),
+                    "session_id": fresh.get("session_id"),
+                    "duration_s": duration_s,
+                    "exit_code": 1,
+                    "outcome": "failed",
+                    "files_changed": [],
+                    "files_measured": 0,
+                    "code_chars": 0,
+                    "code_lines": 0,
+                    **costs,
+                })
+                _FINALIZED_RUNS.add((os.path.abspath(METRICS_FILE), task_id))
             _write_task_record(task_id, {
                 "status": "failed",
+                "ended": True,
+                "ended_at": ended_at,
+                "duration_s": duration_s,
+                "metrics_recorded": True,
                 "exit_code": 1,
-                "note": f"Queue runner failed to spawn task: {e}",
-                "result": f"Error launching queued task {task_id}: {e}",
+                "note": note,
+                "result": res_str,
             })
 
     remaining = len(_list_queued_tasks_fifo())
@@ -4585,6 +4835,8 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
         return f"{header}{note_str}{prop_str}{extra_str}\n\nLOG:\n{trace_body}"
 
     lines = [header, ""]
+    if record.get("title"):
+        lines.append(f"- Title: {record.get('title')}")
     lines.append(f"- Status: {status}")
     if exit_code is not None:
         lines.append(f"- Exit Code: {exit_code}")
@@ -4760,11 +5012,26 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     else:
         note = "Result read from the run log (the Kilo process has exited)."
 
+    started_iso = record.get("started") or record.get("queued_at")
+    start_time = _parse_iso_timestamp(started_iso)
+
+    end_time = _extract_last_event_time_from_log(log_content, log_path)
+    if end_time is None:
+        end_time = time.time()
+    elif start_time is not None and end_time < start_time - 2.0:
+        end_time = time.time()
+
+    if start_time is not None:
+        duration_s = max(0.0, round(end_time - start_time, 2))
+    else:
+        duration_s = 0.0
+
     ended_at = datetime.now(timezone.utc).isoformat()
     updates: dict[str, Any] = {
         "status": final_status,
         "ended": True,
         "ended_at": ended_at,
+        "duration_s": duration_s,
         "lingering": still_lingering,
         "session_id": session_id,
         "exit_code": exit_code,
@@ -4785,17 +5052,19 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     result_text = _format_task_result(temp_record, include_trace=False)
     updates["result"] = result_text
 
-    if cwd:
-        measure = _measure_files(cwd, report.get("files_changed") or [])
+    if not _has_metrics_record(task_id, record):
+        measure = _measure_files(cwd, report.get("files_changed") or []) if cwd else {"files_measured": 0, "code_chars": 0, "code_lines": 0}
         costs = _estimate_costs(spec_chars=0, result_chars=len(result_text), code_chars=measure["code_chars"])
         _append_jsonl(METRICS_FILE, {
             "run_id": task_id,
             "ts": ended_at,
             "tool": "kilo_implement",
-            "working_directory": cwd,
+            "working_directory": cwd or "",
             "agent": record.get("agent"),
             "model": record.get("model"),
             "session_id": session_id,
+            "duration_s": duration_s,
+            "exit_code": exit_code,
             "outcome": report.get("outcome") or ("success" if reaped else "unknown"),
             "files_changed": report.get("files_changed") or [],
             **measure,
@@ -4803,6 +5072,8 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
             "recovered_after_restart": not (reaped or still_lingering),
             "reaped_lingering": reaped,
         })
+        _FINALIZED_RUNS.add((os.path.abspath(METRICS_FILE), task_id))
+        updates["metrics_recorded"] = True
 
     if not still_lingering:
         prompt_file = record.get("prompt_file")
@@ -4815,6 +5086,8 @@ def _reconcile_task_if_orphaned(task_id: str, record: dict) -> dict:
     _write_task_record(task_id, updates)
     if session_id:
         _agent_manager_note_session(cwd, session_id, record.get("agent_manager_worktree_id"))
+        if record.get("title"):
+            _update_session_title_in_db(session_id, record["title"])
     record = dict(record)
     record.update(updates)
     return record
@@ -5009,37 +5282,45 @@ async def kilo_task_progress(
     wt_block = ("\n" + "\n".join(wt_lines)) if wt_lines else ""
 
     if status != "running":
+        title_line = f"\n- Title: {record.get('title')}" if record.get("title") else ""
         if record.get("lingering") and _is_task_lingering_in_grace(record):
             return (
                 f"Task {task_id} already ended (status: {status}); "
                 f"finished; process lingering (grace period). "
-                f"Use kilo_task_result for the final report.{wt_block}"
+                f"Use kilo_task_result for the final report.{title_line}{wt_block}"
             )
         return (
             f"Task {task_id} already ended (status: {status}). "
-            f"Use kilo_task_result for the final report.{wt_block}"
+            f"Use kilo_task_result for the final report.{title_line}{wt_block}"
         )
     if _is_task_lingering_in_grace(record):
-        return f"Task {task_id}: finished; process lingering (grace period). Use kilo_task_result for the final report.{wt_block}"
+        title_line = f"\n- Title: {record.get('title')}" if record.get("title") else ""
+        return f"Task {task_id}: finished; process lingering (grace period). Use kilo_task_result for the final report.{title_line}{wt_block}"
     session_id = record.get("session_id")
     if not session_id and cwd:
         session_id = _find_session_for_task(cwd, record.get("started", ""), task_id)
         if session_id:
             _write_task_record(task_id, {"session_id": session_id})
             _agent_manager_note_session(cwd, session_id, record.get("agent_manager_worktree_id"))
+            if record.get("title"):
+                _update_session_title_in_db(session_id, record["title"])
     if not session_id:
+        title_line = f"\n- Title: {record.get('title')}" if record.get("title") else ""
         return (
             f"Task {task_id} is running but no matching Kilo session was found "
             "yet in the session database — it may have just started. Try again "
             "shortly, or use kilo_task_status for an OS-level heuristic in the "
-            f"meantime.{wt_block}"
+            f"meantime.{title_line}{wt_block}"
         )
 
     lines = [f"# Live progress — task {task_id} (session {session_id})"]
+    title = record.get("title")
     summary = _read_session_summary(session_id)
+    display_title = title or (summary.get("title") if summary else None)
+    if display_title:
+        lines.append(f"- title: {display_title}")
     if summary:
         age_s = time.time() - summary["time_updated"] / 1000
-        lines.append(f"- title: {summary['title']}")
         lines.append(
             f"- cost so far: ${summary['cost']:.4f} | tokens in/out: "
             f"{summary['tokens_input']}/{summary['tokens_output']}"
@@ -5116,7 +5397,7 @@ async def kilo_task_cancel(
                 os.remove(prompt_file)
             except OSError:
                 pass
-        _write_task_record(task_id, {"status": "cancelled", "result": note})
+        _finalize_task_cancellation(task_id, record, note, reason=reason)
         return f"Task {task_id} (queued in '{q_name}') marked cancelled and will not be started.{wt_note}"
     if status != "running":
         return f"Task {task_id} already ended (status: {status}); nothing to cancel."
@@ -5129,7 +5410,8 @@ async def kilo_task_cancel(
     pid = record.get("pid")
     if not pid:
         _sync_log_to_log_dir(task_id, record)
-        _write_task_record(task_id, {"status": "cancelled", "result": f"Cancelled: {reason}" if reason else "Cancelled."})
+        note_msg = f"Cancelled: {reason}" if reason else "Cancelled."
+        _finalize_task_cancellation(task_id, record, note_msg, reason=reason)
         return (
             f"Task {task_id} has no recorded process id yet — it may have just "
             "started. Marked as cancelled."
@@ -5138,7 +5420,8 @@ async def kilo_task_cancel(
     note = f"Cancelled by architect. Reason: {reason}" if reason else "Cancelled by architect (no reason given)."
     if not _is_pid_alive(pid):
         _sync_log_to_log_dir(task_id, record)
-        _write_task_record(task_id, {"status": "cancelled", "result": f"{note} (process had already exited.)"})
+        exited_note = f"{note} (process had already exited.)"
+        _finalize_task_cancellation(task_id, record, exited_note, reason=reason)
         return f"Task {task_id}: process {pid} was already gone; marked cancelled."
 
     server_pgrp = os.getpgrp()
@@ -5153,7 +5436,8 @@ async def kilo_task_cancel(
             os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         _sync_log_to_log_dir(task_id, record)
-        _write_task_record(task_id, {"status": "cancelled", "result": f"{note} (process had already exited.)"})
+        exited_note = f"{note} (process had already exited.)"
+        _finalize_task_cancellation(task_id, record, exited_note, reason=reason)
         return f"Task {task_id}: process {pid} was already gone; marked cancelled."
     await asyncio.sleep(_CANCEL_GRACE_S)
     forced = False
@@ -5180,7 +5464,7 @@ async def kilo_task_cancel(
         except OSError:
             pass
     _sync_log_to_log_dir(task_id, record)
-    _write_task_record(task_id, {"status": "cancelled", "result": note})
+    _finalize_task_cancellation(task_id, record, note, reason=reason)
     return (
         f"Task {task_id} (pid {pid}) terminated{' (had to force-kill)' if forced else ''}. "
         f"{note} Review kilo_workspace_status before re-delegating."
@@ -6590,19 +6874,20 @@ async def kilo_task_status(
         cwd_rec = rec.get("working_directory")
         wt_state = _inspect_worktree_state(cwd_rec, rec)
         wt_inline = _format_worktree_state_inline(wt_state, cwd=cwd_rec, status=st)
+        title_str = f", title='{rec.get('title')}'" if rec.get("title") else ""
         if st == "queued":
             pos = _get_queue_position(tid, q_name) or 1
             eff_cap, q_cap, g_cap = _get_effective_queue_cap(q_name or "default")
             return (
                 f"Task {tid}: status=queued, ended=false, queue={q_name or 'default'}, position={pos}, "
-                f"cap={eff_cap}{wt_inline} (queued_at={rec.get('queued_at')}, "
+                f"cap={eff_cap}{title_str}{wt_inline} (queued_at={rec.get('queued_at')}, "
                 f"working_directory={cwd_rec})"
             )
         ended_bool = "false" if st in ("running", "queued") else "true"
         extra_q = f", queue={q_name}" if q_name else ""
         pid_str = f", pid={rec.get('pid')}" if rec.get("pid") else ""
         return (
-            f"Task {tid}: status={st}, ended={ended_bool}{extra_q}{pid_str}{wt_inline} "
+            f"Task {tid}: status={st}, ended={ended_bool}{extra_q}{pid_str}{title_str}{wt_inline} "
             f"(working_directory={cwd_rec})"
         )
 
