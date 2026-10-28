@@ -5322,11 +5322,11 @@ def test_kilo_task_status_shows_title(tmp_path, monkeypatch):
 
 def test_external_paths_warning_detection(tmp_path):
     cwd = str(tmp_path)
-    spec = "Check ~/x, /abs/x, and ../outside for details."
+    spec = "Check ~/x, /tmp/abs/x, and ../outside for details."
     w = server._external_paths_warning(spec, None, working_directory=cwd)
     assert "EXTERNAL PATHS" in w
     assert '"~/x"' in w
-    assert '"/abs/x"' in w
+    assert '"/tmp/abs/x"' in w
     assert '"../outside"' in w
     assert "An unattended run cannot get permission to read them and will end." in w
     assert "Do those checks on the orchestrator side." in w
@@ -5366,16 +5366,16 @@ def test_external_paths_warning_focus_files(tmp_path):
 
 def test_external_paths_warning_max_10_capping(tmp_path):
     cwd = str(tmp_path)
-    # Generate 12 paths: /abs/path_00 to /abs/path_11
-    spec = " ".join(f"/abs/path_{i:02d}" for i in range(12))
+    # Generate 12 paths: /tmp/abs/path_00 to /tmp/abs/path_11
+    spec = " ".join(f"/tmp/abs/path_{i:02d}" for i in range(12))
     w = server._external_paths_warning(spec, None, working_directory=cwd)
     assert "EXTERNAL PATHS" in w
     assert "... (+2 more)" in w
     # exactly 10 paths shown before ellipsis
     for i in range(10):
-        assert f'"/abs/path_{i:02d}"' in w
-    assert '"/abs/path_10"' not in w
-    assert '"/abs/path_11"' not in w
+        assert f'"/tmp/abs/path_{i:02d}"' in w
+    assert '"/tmp/abs/path_10"' not in w
+    assert '"/tmp/abs/path_11"' not in w
 
 
 def test_external_paths_warning_worktree_and_main_repo(tmp_path):
@@ -5435,3 +5435,12 @@ def test_kilo_implement_warns_on_external_paths(tmp_path, fake_data_dir, monkeyp
 
 
 
+
+
+def test_external_paths_warning_ignores_url_routes(tmp_path):
+    """T040: `/api/fleet`-like routes are not filesystem paths; real absolute paths still warn."""
+    import server
+    warn = server._external_paths_warning("Call GET /api/fleet and POST /v1/tasks", None, str(tmp_path))
+    assert warn == ""
+    warn2 = server._external_paths_warning("Copy /Users/someone/.config into a temp dir", None, str(tmp_path))
+    assert "EXTERNAL PATHS" in warn2

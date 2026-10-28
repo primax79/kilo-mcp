@@ -3957,6 +3957,15 @@ def _is_path_inside_roots(cand: str, roots: list[str]) -> bool:
     return False
 
 
+def _looks_like_route(cand: str) -> bool:
+    """An absolute candidate whose first segment is not a real top-level directory (e.g. `/api/fleet`) is a URL
+    route or similar, not a filesystem path."""
+    if not cand.startswith("/"):
+        return False
+    first = cand.lstrip("/").split("/", 1)[0]
+    return not first or not os.path.isdir("/" + first)
+
+
 def _external_paths_warning(
     task_instructions: Optional[str],
     focus_files: Optional[list[str]],
@@ -3984,6 +3993,8 @@ def _external_paths_warning(
         text_no_urls = _URL_RE.sub(" ", task_instructions)
         for m in _CANDIDATE_PATH_RE.finditer(text_no_urls):
             cand = _clean_path_candidate(m.group(1))
+            if cand and _looks_like_route(cand):
+                continue
             if cand and not _is_path_inside_roots(cand, roots):
                 hits.append(cand)
 
