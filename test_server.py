@@ -5316,9 +5316,131 @@ def test_kilo_task_status_shows_title(tmp_path, monkeypatch):
     assert "title='task/branch-z — Status Title Check'" in st
 
 
+# ==============================================================================
+# T040: External paths preflight detection, warning, and prompt instructions
+# ==============================================================================
+
+def test_external_paths_warning_detection(tmp_path):
+    cwd = str(tmp_path)
+    spec = "Check ~/x, /tmp/abs/x, and ../outside for details."
+    w = server._external_paths_warning(spec, None, working_directory=cwd)
+    assert "EXTERNAL PATHS" in w
+    assert '"~/x"' in w
+    assert '"/tmp/abs/x"' in w
+    assert '"../outside"' in w
+    assert "An unattended run cannot get permission to read them and will end." in w
+    assert "Do those checks on the orchestrator side." in w
+
+
+def test_external_paths_warning_ignores_inside_and_urls(tmp_path):
+    cwd = str(tmp_path)
+    (tmp_path / "inside.py").write_text("# inside")
+    spec = (
+        f"Read {cwd}/inside.py and inside.py and ./inside.py and sub/dir/file.txt. "
+        "Also check https://example.com/foo/bar and http://localhost:8080/test and "
+        "file:///local/path/ignore."
+    )
+    w = server._external_paths_warning(spec, None, working_directory=cwd)
+    assert w == ""
+
+
+def test_external_paths_warning_relative_not_escaping(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (tmp_path / "file.txt").write_text("hello")
+    # ../file.txt from sub resolves to tmp_path/file.txt, which is inside tmp_path
+    w = server._external_paths_warning("Read ../file.txt", None, working_directory=str(sub), orig_cwd=str(tmp_path))
+    assert w == ""
+
+
+def test_external_paths_warning_focus_files(tmp_path):
+    cwd = str(tmp_path)
+    focus = ["~/notes.txt", "/etc/hosts", "../outside.py", "local.py"]
+    w = server._external_paths_warning(None, focus, working_directory=cwd)
+    assert "EXTERNAL PATHS" in w
+    assert '"~/notes.txt"' in w
+    assert '"/etc/hosts"' in w
+    assert '"../outside.py"' in w
+    assert '"local.py"' not in w
+
+
+def test_external_paths_warning_max_10_capping(tmp_path):
+    cwd = str(tmp_path)
+    # Generate 12 paths: /tmp/abs/path_00 to /tmp/abs/path_11
+    spec = " ".join(f"/tmp/abs/path_{i:02d}" for i in range(12))
+    w = server._external_paths_warning(spec, None, working_directory=cwd)
+    assert "EXTERNAL PATHS" in w
+    assert "... (+2 more)" in w
+    # exactly 10 paths shown before ellipsis
+    for i in range(10):
+        assert f'"/tmp/abs/path_{i:02d}"' in w
+    assert '"/tmp/abs/path_10"' not in w
+    assert '"/tmp/abs/path_11"' not in w
+
+
+def test_external_paths_warning_worktree_and_main_repo(tmp_path):
+    main_repo = tmp_path / "main"
+    main_repo.mkdir()
+    worktree = main_repo / ".kilo" / "worktrees" / "wt1"
+    worktree.mkdir(parents=True)
+
+    # Path inside main repo
+    spec_main = f"See {main_repo}/README.md"
+    assert server._external_paths_warning(spec_main, None, working_directory=str(worktree), orig_cwd=str(main_repo)) == ""
+
+    # Path inside worktree
+    spec_wt = f"See {worktree}/file.py"
+    assert server._external_paths_warning(spec_wt, None, working_directory=str(worktree), orig_cwd=str(main_repo)) == ""
+
+    # Path outside both
+    spec_ext = "See ~/.kilo/kilo.json and /var/log/syslog"
+    w = server._external_paths_warning(spec_ext, None, working_directory=str(worktree), orig_cwd=str(main_repo))
+    assert '"~/.kilo/kilo.json"' in w
+    assert '"/var/log/syslog"' in w
+
+
+def test_assemble_task_prompt_contains_external_paths_instruction():
+    prompt = server._assemble_task_prompt(
+        task_instructions="Do some work"
+    )
+    expected_instruction = (
+        "Do not read, list or copy any path outside the working directory: "
+        "the run cannot get permission and would end. If a deliverable needs it, "
+        "mark it 'not done: needs external path' in the Final Report and continue with the others."
+    )
+    assert expected_instruction in prompt
+
+
+def test_kilo_implement_warns_on_external_paths(tmp_path, fake_data_dir, monkeypatch):
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        return (0, "Outcome: success\n- **Files changed**:\n- a.py\n", "")
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Please check /var/log/syslog and ~/test_file",
+        working_directory=str(tmp_path),
+        background=False,
+    ))
+    assert "EXTERNAL PATHS" in res
+    assert '"/var/log/syslog"' in res
+    assert '"~/test_file"' in res
 
 
 
 
 
 
+
+
+
+
+def test_external_paths_warning_ignores_url_routes(tmp_path):
+    """T040: `/api/fleet`-like routes are not filesystem paths; real absolute paths still warn."""
+    import server
+    warn = server._external_paths_warning("Call GET /api/fleet and POST /v1/tasks", None, str(tmp_path))
+    assert warn == ""
+    warn2 = server._external_paths_warning("Copy /Users/someone/.config into a temp dir", None, str(tmp_path))
+    assert "EXTERNAL PATHS" in warn2
