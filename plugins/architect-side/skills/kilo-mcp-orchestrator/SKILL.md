@@ -305,10 +305,15 @@ session hands something over. Work that exists only in the conversation is
 lost at the end of the session or at compaction. Nobody else can pick it up,
 and it occupies your context while it waits.
 
-- **Capture first, then continue.** As soon as the work will not be finished
-  and verified in the current turn, write it down as a task in the repository's
-  `tasks/` tree, following the emergent-task rules of the `task-pipeline`
-  convention: a task file (a folder with its context and progress once it has
+- **Capture first, then continue — use-case-first.** As soon as the work will not be finished
+  and verified in the current turn, write it down in the repository's
+  `tasks/` tree, following the emergent-task and use-case-first rules of the `task-pipeline`
+  convention. When a user asks for a new feature or fix (skipping directly to tasks is
+  allowed for `chore`, `docs`, and `investigation`):
+  1. **Find related use cases:** run `ai-orch tasks use-cases search <text> [--actor A] [--json]` (matches text in title/description/scenario/criteria, actor, specs cited via `Source: tasks/specs/...`, and use cases linked to tasks touching the same `paths` or `sources`).
+  2. **Propose updates or draft missing use cases:** propose updates to related use cases, point out contradictions between the request and existing use cases (scenario, acceptance criteria, scope), and/or draft missing use cases with `approval: proposed` (`ai-orch tasks use-cases create ...`).
+  3. **Get approval:** get the use cases approved by the user/decider (`approval: approved`), filing a `Q###` blocking question (`questions.ask` or `ai-orch questions ask`) when the user is not in the conversation.
+  4. **Write specs and create linked tasks:** only then write or update specs and create the tasks (`ai-orch tasks new` or `ai-orch tasks child add`), linking each task with `--use-case UC###[,UC###]` or `--from-use-case UC### [--steps M-N]`: a task file (a folder with its context and progress once it has
   any), a unique id, a priority with a reason, and a one-line entry in the
   registry. Then go back to what you were doing.
   The reply cites the task by id and path; a "next steps" paragraph in the chat
