@@ -1634,17 +1634,31 @@ How to use it well:
 5. Act as reviewer: check `Exit Code` and review the Final Report and changed files;
    inspect the resulting changes.
 
-STEERING: if a run (background or foreground) drifts off-spec, don't just
+STEERING & RESUMING: if a run (background or foreground) drifts off-spec, don't just
 restart from scratch — read its `session_id` (in the result / progress
 report), optionally kilo_task_cancel the current run, then call
 kilo_implement again with `continue_session_id` set to that id and corrective
 `task_instructions`. Kilo resumes the SAME session with full memory of what
-it already built, rather than starting blind. If a task is still actively
-running on that session, kilo_implement refuses to spawn a second process —
-wait for it to complete with kilo_task_wait or stop it with kilo_task_cancel
-before continuing. When continuing a session in an isolated worktree, pass
-refresh_base='merge' or refresh_base='rebase' to update the worktree from the
-current tip of its base branch before resuming.
+it already built, rather than starting blind. If a run died mid-way (network
+error, cancel, crash, or `failed_with_uncommitted_work`), pass `resume_task_id`
+set to the previous task id: kilo_implement reuses its worktree and branch
+(refusing if the worktree is gone or another run is active on it), reuses its
+Kilo session when known (else starts a fresh session), prepends a generated
+preamble with `git status --short`, `git diff --stat`, commits since base, and
+resume instructions to the original spec stored in the task record (with
+optional `task_instructions` appended as corrections), and links
+`resumed_from: <old id>` on the new task record. If a task is still actively
+running on that session or worktree, kilo_implement refuses to spawn a second
+process — wait for it to complete with kilo_task_wait or stop it with
+kilo_task_cancel before continuing. When continuing or resuming in an isolated
+worktree, pass `refresh_base='merge'` or `refresh_base='rebase'` to update the
+worktree from the current tip of its base branch before resuming; when
+conflicts occur, `refresh_base_on_conflict='abort'` (default) aborts and returns
+the conflicting files, while `refresh_base_on_conflict='resolve'` (with
+`refresh_base='merge'` only; `rebase` + `resolve` is refused) leaves the
+conflicted merge in place and instructs Kilo in the prompt to resolve the
+conflicts preserving both sides' intent, run the tests, and complete the merge
+commit before continuing.
 
 Parallelism & Batch Queues: emitting several kilo_implement calls in one turn
 runs them concurrently (independent Kilo subprocesses). For large batches, pass
@@ -1853,6 +1867,20 @@ async def kilo_implement(
             "of what it already built. Leave empty for a fresh session."
         ),
     ] = None,
+    resume_task_id: Annotated[
+        Optional[str],
+        Field(
+            description="Task id of a previous interrupted, failed, or cancelled "
+            "run to resume in the same worktree and branch. Reuses its worktree "
+            "and branch (refuses with a clear error if the worktree is gone or "
+            "another run is active on it), reuses its Kilo session when known "
+            "(else starts a fresh session), and prepends a generated preamble "
+            "(current `git status --short`, `git diff --stat`, commits since base, "
+            "and fixed resume instructions) to the original spec stored in the "
+            "task record. Optional `task_instructions` are appended as corrections. "
+            "The new task record links `resumed_from: <old id>`."
+        ),
+    ] = None,
     isolation: Annotated[
         Optional[Literal["worktree"]],
         Field(
@@ -1905,13 +1933,26 @@ async def kilo_implement(
     refresh_base: Annotated[
         Literal["no", "merge", "rebase"],
         Field(
-            description="When continuing a session in a worktree (via continue_session_id), "
-            "optionally update the worktree from the current tip of the base branch before "
-            "resuming: 'no' (default, leave worktree as is), 'merge' (git merge <base_branch>), "
-            "or 'rebase' (git rebase <base_branch>). If conflicts occur, the merge/rebase is "
-            "aborted, leaving the worktree untouched, and an error listing conflicting files is returned."
+            description="When continuing a session or resuming a task in a worktree "
+            "(via continue_session_id or resume_task_id), optionally update the worktree "
+            "from the current tip of the base branch before resuming: 'no' (default, leave "
+            "worktree as is), 'merge' (git merge <base_branch>), or 'rebase' "
+            "(git rebase <base_branch>). Conflict behavior is controlled by "
+            "`refresh_base_on_conflict`."
         ),
     ] = "no",
+    refresh_base_on_conflict: Annotated[
+        Literal["abort", "resolve"],
+        Field(
+            description="How to handle conflicts when `refresh_base` ('merge' or 'rebase') "
+            "encounters conflicts: 'abort' (default, aborts the merge/rebase leaving the "
+            "worktree untouched and returns an error listing conflicting files) or 'resolve' "
+            "(supported with refresh_base='merge' only; leaves the conflicted merge in place "
+            "and adds the conflicting file list and instructions to the prompt so Kilo "
+            "resolves them preserving both sides' intent, runs tests, and completes the "
+            "merge commit before continuing; rebase + resolve is refused)."
+        ),
+    ] = "abort",
     proposed_files: Annotated[
         Literal["untracked", "commit"],
         Field(
@@ -1974,6 +2015,13 @@ async def kilo_implement(
     (built from _IMPLEMENT_DESCRIPTION + DELEGATION_POLICY) for full guidance."""
     if proposed_files not in ("untracked", "commit"):
         return f"Error: proposed_files must be 'untracked' or 'commit', got '{proposed_files}'."
+    if refresh_base_on_conflict not in ("abort", "resolve"):
+        return f"Error: refresh_base_on_conflict must be 'abort' or 'resolve', got '{refresh_base_on_conflict}'."
+    if refresh_base == "rebase" and refresh_base_on_conflict == "resolve":
+        return (
+            "Error: refresh_base_on_conflict='resolve' is only supported with refresh_base='merge' "
+            "(rebase + resolve is not allowed)."
+        )
     queue_name: Optional[str] = None
     if queue is not None:
         queue_name = str(queue).strip()
@@ -1983,7 +2031,70 @@ async def kilo_implement(
             return "Error: queue cannot be used with background=false (queued runs require background=true)."
     if queue_concurrency is not None and int(queue_concurrency) < 1:
         return "Error: queue_concurrency must be at least 1."
-    orig_cwd = working_directory if working_directory else os.getcwd()
+
+    resumed_from_id: Optional[str] = None
+    resume_rec: Optional[dict] = None
+    if resume_task_id is not None:
+        resumed_from_id = str(resume_task_id).strip()
+        if not resumed_from_id:
+            return "Error: resume_task_id cannot be empty."
+        if isolation == "worktree":
+            return (
+                f"Error: cannot combine resume_task_id='{resumed_from_id}' with isolation='worktree' "
+                "(resume_task_id reuses the previous task's existing worktree)."
+            )
+        resume_rec = _read_task_record(resumed_from_id)
+        if resume_rec is None:
+            return f"Error: Unknown resume_task_id '{resumed_from_id}'. (Records live in {TASKS_DIR})"
+        if resume_rec.get("status") == "running" and _is_pid_alive(resume_rec.get("pid")):
+            return (
+                f"Refusal: task '{resumed_from_id}' is still running (pid {resume_rec.get('pid')}). "
+                f"Wait for it with kilo_task_wait (task_id='{resumed_from_id}') or stop it with "
+                f"kilo_task_cancel (task_id='{resumed_from_id}') before resuming."
+            )
+        resume_rec = _reconcile_task_if_orphaned(resumed_from_id, resume_rec)
+        if resume_rec.get("status") == "completed":
+            return (
+                f"Refusal: task '{resumed_from_id}' already completed cleanly (status: completed); "
+                "use continue_session_id if you want to send follow-up instructions."
+            )
+        resume_wt = resume_rec.get("working_directory")
+        if not resume_wt or not os.path.isdir(resume_wt):
+            return (
+                f"Error: cannot resume task '{resumed_from_id}': worktree directory "
+                f"'{resume_wt or '<none>'}' does not exist or is gone."
+            )
+        active_on_wt = _find_running_tasks_for_cwd(resume_wt, exclude_run_id=resumed_from_id)
+        if active_on_wt:
+            other_tid, other_rec = active_on_wt[0]
+            return (
+                f"Refusal: cannot resume task '{resumed_from_id}' because another task ({other_tid}) "
+                f"is currently active on worktree '{resume_wt}'."
+            )
+        resume_session_id = continue_session_id or resume_rec.get("session_id")
+        if not resume_session_id:
+            resume_session_id = _find_session_for_task(
+                resume_wt, resume_rec.get("started", ""), resumed_from_id
+            )
+        if resume_session_id:
+            active_sess = _find_running_task_for_session(resume_session_id)
+            if active_sess and active_sess[0] != resumed_from_id:
+                return (
+                    f"Refusal: session '{resume_session_id}' already has a running task ({active_sess[0]})."
+                )
+            continue_session_id = resume_session_id
+
+        if not focus_files and resume_rec.get("focus_files"):
+            focus_files = list(resume_rec["focus_files"])
+        if execution_hints is None and resume_rec.get("execution_hints"):
+            execution_hints = resume_rec["execution_hints"]
+        if not skills_to_load and resume_rec.get("skills_to_load"):
+            skills_to_load = list(resume_rec["skills_to_load"])
+
+    if resume_rec is not None:
+        orig_cwd = resume_rec["working_directory"]
+    else:
+        orig_cwd = working_directory if working_directory else os.getcwd()
     if not os.path.exists(orig_cwd):
         return f"Error: Working directory {orig_cwd} does not exist."
     orig_cwd_abs = os.path.abspath(orig_cwd)
@@ -2008,13 +2119,48 @@ async def kilo_implement(
             return f"Error: cannot read brief_file '{brief_abs}': {e}"
 
     raw_instructions = task_instructions or ""
-    if brief_content is not None:
+    original_spec_for_record: Optional[str] = None
+    if resume_rec is not None:
+        stored_spec = (
+            resume_rec.get("original_spec")
+            or resume_rec.get("task_instructions")
+        )
+        if not stored_spec and resume_rec.get("brief_file") and os.path.isfile(resume_rec["brief_file"]):
+            try:
+                with open(resume_rec["brief_file"], "r", encoding="utf-8") as bf:
+                    stored_spec = bf.read()
+                if not brief_abs:
+                    brief_abs = resume_rec["brief_file"]
+            except OSError:
+                stored_spec = None
+        if not stored_spec and brief_content is not None:
+            stored_spec = brief_content
+        if not stored_spec:
+            stored_spec = ""
+        original_spec_for_record = stored_spec
+        if not brief_abs and resume_rec.get("brief_file"):
+            brief_abs = resume_rec.get("brief_file")
+        resume_preamble = _build_resume_preamble(
+            cwd,
+            base_commit=resume_rec.get("base_commit"),
+            base_branch=resume_rec.get("base_branch"),
+            record=resume_rec,
+        )
+        parts = [resume_preamble]
+        if stored_spec.strip():
+            parts.append(stored_spec.rstrip())
         if raw_instructions.strip():
-            effective_instructions = f"{brief_content.rstrip()}\n\n## Additional instructions\n{raw_instructions}"
-        else:
-            effective_instructions = brief_content
+            parts.append(f"## Corrections / Additional Instructions\n{raw_instructions}")
+        effective_instructions = "\n\n".join(parts)
     else:
-        effective_instructions = raw_instructions
+        if brief_content is not None:
+            if raw_instructions.strip():
+                effective_instructions = f"{brief_content.rstrip()}\n\n## Additional instructions\n{raw_instructions}"
+            else:
+                effective_instructions = brief_content
+        else:
+            effective_instructions = raw_instructions
+        original_spec_for_record = effective_instructions
 
     if not effective_instructions or not effective_instructions.strip():
         return "Error: task_instructions (or brief_file with non-empty content) is required."
@@ -2070,14 +2216,17 @@ async def kilo_implement(
                 f"kilo_task_cancel (task_id='{running_task_id}') before continuing the session."
             )
 
-    prior_rec = None
+    prior_rec = resume_rec
     target_worktree = None
     base_branch_for_task = None
     base_commit_for_task = None
 
-    if continue_session_id:
-        prior_rec = _find_task_record_by_session_id(continue_session_id)
-        if working_directory and _is_git_worktree(working_directory):
+    if resume_rec is not None or continue_session_id:
+        if prior_rec is None and continue_session_id:
+            prior_rec = _find_task_record_by_session_id(continue_session_id)
+        if resume_rec is not None:
+            target_worktree = resume_rec.get("working_directory")
+        elif working_directory and _is_git_worktree(working_directory):
             target_worktree = working_directory
         elif prior_rec and prior_rec.get("working_directory") and _is_git_worktree(prior_rec["working_directory"]):
             target_worktree = prior_rec["working_directory"]
@@ -2103,7 +2252,12 @@ async def kilo_implement(
                     base_commit_for_task = meta["baseCommit"]
 
             if refresh_base in ("merge", "rebase"):
-                ok, err_detail, conflicts = _refresh_worktree_base(target_worktree, base_branch_for_task, refresh_base)
+                ok, err_detail, conflicts = _refresh_worktree_base(
+                    target_worktree,
+                    base_branch_for_task,
+                    refresh_base,
+                    on_conflict=refresh_base_on_conflict,
+                )
                 if not ok:
                     if conflicts:
                         conflict_list = "\n".join(f"- {f}" for f in conflicts)
@@ -2112,6 +2266,24 @@ async def kilo_implement(
                             f"{conflict_list}"
                         )
                     return f"Error: git {refresh_base} {base_branch_for_task} failed:\n{err_detail}"
+                if conflicts and refresh_base_on_conflict == "resolve":
+                    conflict_inst = _build_conflict_resolution_instructions(conflicts, base_branch_for_task)
+                    if resume_rec is not None:
+                        # Rebuild effective_instructions so the resume preamble includes the newly conflicted status/diff
+                        resume_preamble = _build_resume_preamble(
+                            cwd,
+                            base_commit=base_commit_for_task,
+                            base_branch=base_branch_for_task,
+                            record=resume_rec,
+                        )
+                        parts = [resume_preamble, conflict_inst]
+                        if (original_spec_for_record or "").strip():
+                            parts.append(original_spec_for_record.rstrip())
+                        if raw_instructions.strip():
+                            parts.append(f"## Corrections / Additional Instructions\n{raw_instructions}")
+                        effective_instructions = "\n\n".join(parts)
+                    else:
+                        effective_instructions = f"{conflict_inst}\n\n{effective_instructions}"
                 base_commit_for_task = _git_rev_parse(target_worktree, base_branch_for_task)
 
     preflight = estimate_initial_context_tokens(
@@ -2207,6 +2379,8 @@ async def kilo_implement(
             proposed_files=proposed_files,
             brief_file=brief_abs,
             log_dir=log_dir_abs,
+            original_spec=original_spec_for_record,
+            resumed_from=resumed_from_id,
         )
         return warnings_prefix + collision_warning + result
 
@@ -2259,6 +2433,11 @@ async def kilo_implement(
         "session_id": server_session_id,
         "proposed_files": proposed_files,
     }
+    if original_spec_for_record is not None:
+        bg_rec["original_spec"] = original_spec_for_record
+        bg_rec["task_instructions"] = original_spec_for_record
+    if resumed_from_id:
+        bg_rec["resumed_from"] = resumed_from_id
     if base_branch_for_task:
         bg_rec["base_branch"] = base_branch_for_task
     if base_commit_for_task:
@@ -2273,6 +2452,10 @@ async def kilo_implement(
         bg_rec["task_files"] = extracted_task_files
     if focus_files:
         bg_rec["focus_files"] = list(focus_files)
+    if execution_hints is not None:
+        bg_rec["execution_hints"] = execution_hints
+    if skills_to_load:
+        bg_rec["skills_to_load"] = list(skills_to_load)
 
     session_note = (
         f"- Continuing session: {continue_session_id}\n"
@@ -2744,14 +2927,31 @@ def _git_rev_parse(cwd: str, ref: str) -> Optional[str]:
     return None
 
 
-def _refresh_worktree_base(wt_dir: str, base_branch: str, mode: str) -> tuple[bool, Optional[str], list[str]]:
+def _refresh_worktree_base(
+    wt_dir: str,
+    base_branch: str,
+    mode: str,
+    on_conflict: str = "abort",
+) -> tuple[bool, Optional[str], list[str]]:
     """Update a worktree from the current tip of base_branch via merge or rebase.
-    Returns (success, error_detail, conflicting_files). On conflict, aborts the operation
-    leaving the worktree untouched and lists the conflicting files."""
+    Returns (success, error_detail, conflicting_files).
+    On conflict:
+    - If `on_conflict == 'abort'` (default), aborts the operation leaving the worktree
+      untouched and returns (False, err_detail, conflicts).
+    - If `on_conflict == 'resolve'` (valid for mode == 'merge' only), leaves the conflicted
+      merge in place and returns (True, None, conflicts)."""
     if mode == "no":
         return True, None, []
     if mode not in ("merge", "rebase"):
         return False, f"Unknown refresh_base mode '{mode}'", []
+    if on_conflict not in ("abort", "resolve"):
+        return False, f"Unknown refresh_base_on_conflict mode '{on_conflict}'", []
+    if mode == "rebase" and on_conflict == "resolve":
+        return (
+            False,
+            "refresh_base_on_conflict='resolve' is only supported with refresh_base='merge' (rebase + resolve is not allowed).",
+            [],
+        )
     try:
         cmd = ["git", mode, base_branch]
         res = subprocess.run(cmd, cwd=wt_dir, capture_output=True, text=True, timeout=30)
@@ -2764,6 +2964,10 @@ def _refresh_worktree_base(wt_dir: str, base_branch: str, mode: str) -> tuple[bo
         )
         conflicts = [ln.strip() for ln in diff_res.stdout.splitlines() if ln.strip()]
 
+        if conflicts and on_conflict == "resolve" and mode == "merge":
+            # Leave the conflicted merge in place for Kilo to resolve
+            return True, None, conflicts
+
         # Abort the merge/rebase
         subprocess.run(["git", mode, "--abort"], cwd=wt_dir, capture_output=True, text=True, timeout=10)
 
@@ -2771,6 +2975,136 @@ def _refresh_worktree_base(wt_dir: str, base_branch: str, mode: str) -> tuple[bo
         return False, err_detail, conflicts
     except Exception as e:
         return False, str(e), []
+
+
+def _resolve_base_ref_for_worktree(
+    target_cwd: str,
+    base_commit: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    record: Optional[dict] = None,
+) -> Optional[str]:
+    """Resolve a git base commit/ref for comparing commits on a worktree branch."""
+    if not target_cwd or not os.path.isdir(target_cwd):
+        return None
+    rec = record or {}
+    b_commit = base_commit or rec.get("base_commit")
+    b_branch = base_branch or rec.get("base_branch")
+    if not b_commit and not b_branch:
+        meta = _read_worktree_git_metadata(target_cwd)
+        if meta:
+            b_commit = meta.get("baseCommit")
+            b_branch = meta.get("parentBranch")
+    if b_commit:
+        return b_commit
+    if b_branch:
+        chk = subprocess.run(
+            ["git", "rev-parse", "--verify", b_branch],
+            cwd=target_cwd, capture_output=True, text=True, timeout=5,
+        )
+        if chk.returncode == 0:
+            mb = subprocess.run(
+                ["git", "merge-base", "HEAD", b_branch],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+            return mb.stdout.strip() if (mb.returncode == 0 and mb.stdout.strip()) else b_branch
+    for cand in ("main", "master", "development", "develop"):
+        chk = subprocess.run(
+            ["git", "rev-parse", "--verify", cand],
+            cwd=target_cwd, capture_output=True, text=True, timeout=5,
+        )
+        if chk.returncode == 0:
+            mb = subprocess.run(
+                ["git", "merge-base", "HEAD", cand],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+            return mb.stdout.strip() if (mb.returncode == 0 and mb.stdout.strip()) else cand
+    return None
+
+
+_RESUME_FIXED_INSTRUCTIONS = (
+    "This run was interrupted. Inspect the uncommitted work, keep what is correct, "
+    "finish the remaining deliverables, commit, and write the Final Report."
+)
+
+
+def _build_resume_preamble(
+    target_cwd: str,
+    base_commit: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    record: Optional[dict] = None,
+) -> str:
+    """Build the generated preamble for resuming an interrupted run in `target_cwd`.
+    Includes current `git status --short`, `git diff --stat`, and the last commits
+    on the branch since the base, plus the fixed resume instructions."""
+    status_out = "(clean)"
+    try:
+        res_st = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=target_cwd, capture_output=True, text=True, timeout=5,
+        )
+        if res_st.returncode == 0 and res_st.stdout.strip():
+            status_out = res_st.stdout.rstrip()
+    except Exception:
+        pass
+
+    diff_stat_out = "(no uncommitted diff)"
+    try:
+        res_df = subprocess.run(
+            ["git", "diff", "HEAD", "--stat"],
+            cwd=target_cwd, capture_output=True, text=True, timeout=5,
+        )
+        if res_df.returncode != 0 or not res_df.stdout.strip():
+            res_df = subprocess.run(
+                ["git", "diff", "--stat"],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+        if res_df.returncode == 0 and res_df.stdout.strip():
+            diff_stat_out = res_df.stdout.rstrip()
+    except Exception:
+        pass
+
+    base_ref = _resolve_base_ref_for_worktree(
+        target_cwd, base_commit=base_commit, base_branch=base_branch, record=record
+    )
+    commits_out = "(no commits since base)"
+    try:
+        if base_ref:
+            res_log = subprocess.run(
+                ["git", "log", "--oneline", f"{base_ref}..HEAD"],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+            if res_log.returncode == 0 and res_log.stdout.strip():
+                commits_out = res_log.stdout.rstrip()
+        else:
+            res_log = subprocess.run(
+                ["git", "log", "--oneline", "-n", "5"],
+                cwd=target_cwd, capture_output=True, text=True, timeout=5,
+            )
+            if res_log.returncode == 0 and res_log.stdout.strip():
+                commits_out = res_log.stdout.rstrip()
+    except Exception:
+        pass
+
+    return (
+        "## Interrupted Run Context\n"
+        f"{_RESUME_FIXED_INSTRUCTIONS}\n\n"
+        f"### Current `git status --short`\n```\n{status_out}\n```\n\n"
+        f"### Current `git diff --stat`\n```\n{diff_stat_out}\n```\n\n"
+        f"### Commits on branch since base\n```\n{commits_out}\n```"
+    )
+
+
+def _build_conflict_resolution_instructions(conflicts: list[str], base_branch: str) -> str:
+    """Build prompt instructions when refresh_base='merge' with refresh_base_on_conflict='resolve'
+    encounters merge conflicts."""
+    conflict_list = "\n".join(f"- {f}" for f in conflicts)
+    return (
+        f"## Merge Conflicts to Resolve (from base branch `{base_branch}`)\n"
+        f"A `git merge {base_branch}` is currently in progress in this worktree with conflicts in the following files:\n"
+        f"{conflict_list}\n\n"
+        "Resolve the merge conflicts in these files preserving both sides' intent, "
+        "run the tests to verify everything passes, and complete the merge commit (`git add` the resolved files and `git commit --no-edit`) before continuing."
+    )
 
 
 def _check_base_moved(
@@ -3463,7 +3797,9 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              base_commit: Optional[str] = None,
                              proposed_files: str = "untracked",
                              brief_file: Optional[str] = None,
-                             log_dir: Optional[str] = None) -> str:
+                             log_dir: Optional[str] = None,
+                             original_spec: Optional[str] = None,
+                             resumed_from: Optional[str] = None) -> str:
     """Run one Kilo implementation task end-to-end: temp-file spec bridge,
     subprocess, Final-Report parsing, metrics. Used by the synchronous
     (background=False) path of kilo_implement only — the background path
@@ -3539,6 +3875,11 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         }
         if proposed_note:
             task_rec["proposed_note"] = proposed_note
+        if original_spec is not None:
+            task_rec["original_spec"] = original_spec
+            task_rec["task_instructions"] = original_spec
+        if resumed_from:
+            task_rec["resumed_from"] = resumed_from
         if base_branch:
             task_rec["base_branch"] = base_branch
         if base_commit:
@@ -3549,6 +3890,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             task_rec["log_dir"] = log_dir
         if focus_files:
             task_rec["focus_files"] = list(focus_files)
+        if skills_to_load:
+            task_rec["skills_to_load"] = list(skills_to_load)
         log_copy_path = _sync_log_to_log_dir(run_id, task_rec)
         _write_task_record(run_id, task_rec)
 

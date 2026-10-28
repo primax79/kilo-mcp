@@ -4808,6 +4808,291 @@ def test_t037_worktree_state_commits_ahead_task_state_and_live_progress_timeout(
     assert "- task_state: delivered (T072)" in wait_end
 
 
+# ==============================================================================
+# T038: resume_task_id and refresh_base_on_conflict ('abort' | 'resolve')
+# ==============================================================================
+
+
+def test_t038_resume_interrupted_run_with_dirty_work(tmp_path, fake_data_dir, monkeypatch):
+    """Resume an interrupted run with dirty work:
+    - reuses the same worktree and branch
+    - reuses the prior Kilo session id when known (and falls back to fresh session when unknown)
+    - prepends the generated preamble (git status --short, git diff --stat, commits since base,
+      and fixed instructions) to the original spec stored in the task record
+    - appends optional task_instructions as corrections
+    - sets resumed_from: <old id> on the new task record."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_resume")
+    wt_path, base_commit = _create_test_worktree(repo, "task/T038-resume", "task-T038-resume")
+
+    # 1. Initial background run persists original_spec in the task record
+    captured_prompts = []
+
+    def fake_spawn_bg(cmd, cwd, env, log_path):
+        m = re.search(r"The file (/\S+) contains", cmd[-1])
+        assert m
+        with open(m.group(1), encoding="utf-8") as f:
+            captured_prompts.append({"cmd": cmd, "cwd": cwd, "prompt": f.read()})
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("Partial work before crash...\n")
+        return 999998  # dead pid
+
+    monkeypatch.setattr(server, "_spawn_kilo_background", fake_spawn_bg)
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: False)
+
+    original_spec = "# Original Task Spec\n1. Implement part A\n2. Implement part B"
+    launch1 = asyncio.run(server.kilo_implement(
+        task_instructions=original_spec,
+        working_directory=wt_path,
+        focus_files=["README.md"],
+        background=True,
+    ))
+    old_id = launch1.split("task_id: ")[1].split(")")[0]
+    old_rec = server._read_task_record(old_id)
+    assert old_rec["original_spec"] == original_spec
+
+    # Simulate partial work in the worktree before interruption:
+    # - 1 commit on the branch since base
+    with open(os.path.join(wt_path, "part_a.py"), "w") as f:
+        f.write("def part_a():\n    return 1\n")
+    subprocess.run(["git", "-C", wt_path, "add", "part_a.py"], check=True)
+    subprocess.run(["git", "-C", wt_path, "commit", "-m", "feat: add part_a"], check=True)
+
+    # - uncommitted tracked modification + untracked file
+    with open(os.path.join(wt_path, "README.md"), "w") as f:
+        f.write("Modified readme line 1\nModified readme line 2\n")
+    with open(os.path.join(wt_path, "part_b_wip.py"), "w") as f:
+        f.write("def part_b(): pass\n")
+
+    # Record known session_id and base_commit on the interrupted task
+    server._write_task_record(old_id, {
+        "session_id": "ses_interrupted_1",
+        "isolated_branch": "task/T038-resume",
+        "base_branch": "main",
+        "base_commit": base_commit,
+    })
+
+    # 2. Resume the interrupted run with optional corrective task_instructions
+    captured_prompts.clear()
+    launch2 = asyncio.run(server.kilo_implement(
+        resume_task_id=old_id,
+        task_instructions="Also handle None in part_b.",
+        background=True,
+    ))
+    assert "Task started in background." in launch2
+    new_id = launch2.split("task_id: ")[1].split(")")[0]
+    assert new_id != old_id
+
+    assert len(captured_prompts) == 1
+    call = captured_prompts[0]
+    # Reused same worktree and session_id
+    assert os.path.realpath(call["cwd"]) == os.path.realpath(wt_path)
+    assert call["cmd"][0:4] == ["kilo", "run", "--session", "ses_interrupted_1"]
+
+    prompt = call["prompt"]
+    # Fixed resume instruction
+    assert (
+        "This run was interrupted. Inspect the uncommitted work, keep what is correct, "
+        "finish the remaining deliverables, commit, and write the Final Report."
+    ) in prompt
+    # git status --short output
+    assert "M README.md" in prompt
+    assert "?? part_b_wip.py" in prompt
+    # git diff --stat output
+    assert "README.md" in prompt and "insertion" in prompt
+    # commits since base
+    assert "feat: add part_a" in prompt
+    # original spec and corrective instructions
+    assert "# Original Task Spec\n1. Implement part A\n2. Implement part B" in prompt
+    assert "Also handle None in part_b." in prompt
+    assert prompt.index("This run was interrupted.") < prompt.index("# Original Task Spec") < prompt.index("Also handle None in part_b.")
+
+    # New task record links resumed_from and preserves original_spec
+    new_rec = server._read_task_record(new_id)
+    assert new_rec["resumed_from"] == old_id
+    assert new_rec["original_spec"] == original_spec
+    assert os.path.realpath(new_rec["working_directory"]) == os.path.realpath(wt_path)
+    assert new_rec["isolated_branch"] == "task/T038-resume"
+    assert new_rec["session_id"] == "ses_interrupted_1"
+
+    # 3. Also verify when session_id is NOT known: starts a fresh session (--session not in argv)
+    server._write_task_record(old_id, {"session_id": None, "status": "cancelled"})
+    monkeypatch.setattr(server, "_find_session_for_task", lambda cwd, started, run_id: None)
+    captured_prompts.clear()
+    launch3 = asyncio.run(server.kilo_implement(
+        resume_task_id=old_id,
+        background=True,
+    ))
+    assert "Task started in background." in launch3
+    assert "--session" not in captured_prompts[0]["cmd"]
+
+
+def test_t038_resume_refuses_when_worktree_missing_or_run_active(tmp_path, fake_data_dir, monkeypatch):
+    """resume_task_id refuses with a clear error when:
+    - the worktree directory is missing/gone
+    - the task being resumed is still running
+    - another run is currently active on the same worktree."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_refuse_resume")
+    wt_path, base_commit = _create_test_worktree(repo, "task/T038-refuse", "task-T038-refuse")
+
+    # 1. Task itself is still actively running
+    server._write_task_record("task_still_alive", {
+        "status": "running",
+        "working_directory": wt_path,
+        "original_spec": "Spec text",
+        "pid": 44444,
+    })
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: pid == 44444)
+
+    res_self_active = asyncio.run(server.kilo_implement(resume_task_id="task_still_alive"))
+    assert "Refusal" in res_self_active or "Error" in res_self_active
+    assert "task_still_alive" in res_self_active
+    assert "still running" in res_self_active
+
+    # 2. Task ended (failed), but another task is currently active on the same worktree
+    server._write_task_record("task_failed_1", {
+        "status": "failed",
+        "working_directory": wt_path,
+        "original_spec": "Spec text",
+        "pid": 11111,
+    })
+    server._write_task_record("other_active_on_wt", {
+        "status": "running",
+        "working_directory": wt_path,
+        "pid": 55555,
+    })
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: pid == 55555)
+
+    res_other_active = asyncio.run(server.kilo_implement(resume_task_id="task_failed_1"))
+    assert "Refusal" in res_other_active or "Error" in res_other_active
+    assert "other_active_on_wt" in res_other_active
+
+    # 3. Worktree directory is gone
+    missing_wt = str(tmp_path / "gone_worktree")
+    server._write_task_record("task_gone_wt", {
+        "status": "cancelled",
+        "working_directory": missing_wt,
+        "original_spec": "Spec text",
+    })
+    monkeypatch.setattr(server, "_is_pid_alive", lambda pid: False)
+
+    res_gone = asyncio.run(server.kilo_implement(resume_task_id="task_gone_wt"))
+    assert res_gone.startswith("Error:")
+    assert "does not exist" in res_gone or "gone" in res_gone
+
+
+def test_t038_refresh_base_conflict_abort_vs_resolve_and_rebase_refused(tmp_path, fake_data_dir, monkeypatch):
+    """refresh_base conflict handling:
+    - refresh_base_on_conflict='abort' (default): aborts merge and leaves worktree untouched
+    - refresh_base_on_conflict='resolve' with refresh_base='merge': leaves the conflicted merge in
+      place and adds the conflicted file list + resolution instructions to the prompt
+    - refresh_base='rebase' + refresh_base_on_conflict='resolve': refused with a clear message."""
+    monkeypatch.setattr(server, "TASKS_DIR", str(tmp_path / "tasks"))
+    repo = _init_git_repo(tmp_path / "repo_conflict_resolve")
+    base_branch = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    wt_path = os.path.join(repo, ".kilo", "worktrees", "feat-resolve-conflict")
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-b", "feat-resolve-conflict", wt_path],
+        check=True, capture_output=True,
+    )
+
+    # Create conflicting commits on base_branch and worktree branch
+    with open(os.path.join(repo, "README.md"), "w") as f:
+        f.write("Base branch conflicting change\n")
+    subprocess.run(["git", "-C", repo, "commit", "-am", "base conflict change"], check=True)
+
+    with open(os.path.join(wt_path, "README.md"), "w") as f:
+        f.write("Worktree branch conflicting change\n")
+    subprocess.run(["git", "-C", wt_path, "commit", "-am", "wt conflict change"], check=True)
+
+    session_id = "ses_conflict_t038"
+    server._write_task_record("task_conf_t038", {
+        "status": "failed",
+        "working_directory": wt_path,
+        "session_id": session_id,
+        "base_branch": base_branch,
+        "isolated_branch": "feat-resolve-conflict",
+        "original_spec": "Original feature specification.",
+    })
+
+    captured_prompts = []
+
+    async def fake_run_kilo(cmd, cwd, env, on_start=None):
+        m = re.search(r"The file (/\S+) contains", cmd[-1])
+        assert m
+        with open(m.group(1), encoding="utf-8") as f:
+            captured_prompts.append(f.read())
+        return (0, "## Final Report\n- **Outcome**: success\n- **Files changed**:\n- README.md\n", "")
+
+    monkeypatch.setattr(server, "_run_kilo", fake_run_kilo)
+
+    # 1. Rebase + resolve is refused immediately with a clear error message
+    res_rebase_resolve = asyncio.run(server.kilo_implement(
+        task_instructions="Continue",
+        working_directory=wt_path,
+        continue_session_id=session_id,
+        refresh_base="rebase",
+        refresh_base_on_conflict="resolve",
+        background=False,
+    ))
+    assert res_rebase_resolve.startswith("Error:")
+    assert "resolve" in res_rebase_resolve and "merge" in res_rebase_resolve
+    assert len(captured_prompts) == 0
+
+    # 2. Default refresh_base_on_conflict='abort' aborts the merge and leaves worktree clean
+    res_abort = asyncio.run(server.kilo_implement(
+        task_instructions="Continue with abort",
+        working_directory=wt_path,
+        continue_session_id=session_id,
+        refresh_base="merge",
+        refresh_base_on_conflict="abort",
+        background=False,
+    ))
+    assert res_abort.startswith("Error:")
+    assert "merge conflicts encountered" in res_abort
+    assert "- README.md" in res_abort
+    assert len(captured_prompts) == 0
+    st_after_abort = subprocess.run(
+        ["git", "-C", wt_path, "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    )
+    assert st_after_abort.stdout.strip() == ""
+
+    # 3. refresh_base='merge' with refresh_base_on_conflict='resolve':
+    #    leaves the conflicted merge in place and includes conflicted files + instructions in prompt
+    res_resolve = asyncio.run(server.kilo_implement(
+        task_instructions="Finish after resolving merge.",
+        working_directory=wt_path,
+        continue_session_id=session_id,
+        refresh_base="merge",
+        refresh_base_on_conflict="resolve",
+        background=False,
+    ))
+    assert not res_resolve.startswith("Error:")
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+    assert "- README.md" in prompt
+    assert "preserving both sides' intent" in prompt
+    assert "run the tests" in prompt
+    assert "complete the merge commit" in prompt
+
+    # Verify the merge stays conflicted in the worktree (UU README.md / MERGE_HEAD present)
+    diff_u = subprocess.run(
+        ["git", "-C", wt_path, "diff", "--name-only", "--diff-filter=U"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "README.md" in diff_u.stdout
+    with open(os.path.join(wt_path, "README.md")) as f:
+        readme_text = f.read()
+    assert "<<<<<<<" in readme_text and ">>>>>>>" in readme_text
+
+
+
 
 
 
