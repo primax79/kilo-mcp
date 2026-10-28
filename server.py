@@ -1046,6 +1046,11 @@ def _assemble_task_prompt(
         protected_section += (
             " Leave `*.proposed` files uncommitted: never `git add` them, and if the task asks for a commit, commit everything else."
         )
+    protected_section += (
+        "\n\nDo not read, list or copy any path outside the working directory: the run cannot get permission "
+        "and would end. If a deliverable needs it, mark it 'not done: needs external path' in the Final Report "
+        "and continue with the others."
+    )
     sections.append(protected_section)
     sections.append(
         "## Final Report (mandatory)\n"
@@ -1877,6 +1882,10 @@ no Final Report and no commit. The delegated prompt therefore tells Kilo to
 write the intended content to `<path>.proposed` instead; apply it yourself.
 Don't ask Kilo to edit those files directly.
 
+⚠️ EXTERNAL PATHS: Unattended runs cannot read outside the working directory unless
+the Kilo config allows `external_directory`; do real-world checks on such paths on
+the orchestrator side.
+
 Handling of `*.proposed` files is controlled by `proposed_files`:
 - `proposed_files='untracked'` (default): Kilo is instructed to leave `*.proposed`
   files uncommitted (never `git add` them, committing everything else). After the
@@ -1969,7 +1978,10 @@ async def kilo_implement(
         Field(
             description="Absolute path to the repository/workspace Kilo should "
             "run in and modify. Defaults to the server's current working "
-            "directory. Ensure it is under version control before delegating."
+            "directory. Ensure it is under version control before delegating. "
+            "Unattended runs cannot read outside the working directory unless the "
+            "Kilo config allows `external_directory`; do real-world checks on such "
+            "paths on the orchestrator side."
         ),
     ] = None,
     agent: Annotated[
@@ -2533,7 +2545,11 @@ async def kilo_implement(
         agent_manager_worktree_id = prior_rec.get("agent_manager_worktree_id") if prior_rec else None
     else:
         collision_warning = _collision_warning(cwd, exclude_run_id=run_id)
-    collision_warning = _protected_paths_warning(effective_instructions, focus_files) + collision_warning
+    collision_warning = (
+        _protected_paths_warning(effective_instructions, focus_files)
+        + _external_paths_warning(effective_instructions, focus_files, cwd, orig_cwd=orig_cwd_abs)
+        + collision_warning
+    )
 
     full_content = _assemble_task_prompt(
         task_instructions=effective_instructions,
@@ -3880,6 +3896,110 @@ def _protected_paths_warning(task_instructions: str, focus_files: Optional[list[
         f'files under .kilo/ or .kilocode/ in an unattended run (the approval ask is auto-rejected '
         f'and the run ends). It has been told to write `<path>.proposed` instead; '
         f'apply those files yourself after the run.\n\n'
+    )
+
+
+_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
+
+_CANDIDATE_PATH_RE = re.compile(
+    r"(?:^|[\s`\'\"<(=\[])("
+    r"~[^\s`\'\"<>()[\]]*|"
+    r"/[a-zA-Z0-9_.~-][^\s`\'\"<>()[\]]*|"
+    r"\.\.(?:/[^\s`\'\"<>()[\]]*)?"
+    r")"
+)
+
+
+def _clean_path_candidate(raw: str) -> str:
+    cand = raw
+    while cand and cand[-1] in ",;:!?\"'`>]":
+        cand = cand[:-1]
+    while cand and cand[-1] == ")" and "(" not in cand:
+        cand = cand[:-1]
+    while cand and cand[-1] == "]" and "[" not in cand:
+        cand = cand[:-1]
+    if cand.endswith(".") and not cand.endswith("/.") and not cand.endswith("/..") and cand not in (".", ".."):
+        cand = cand.rstrip(".")
+    return cand
+
+
+def _is_path_inside_roots(cand: str, roots: list[str]) -> bool:
+    """Check if candidate path resolves under any of the allowed roots."""
+    if not roots:
+        return False
+
+    working_dir_abs = os.path.abspath(roots[0])
+    if cand.startswith("~"):
+        resolved = os.path.abspath(os.path.expanduser(cand))
+    elif os.path.isabs(cand):
+        resolved = os.path.abspath(cand)
+    else:
+        resolved = os.path.abspath(os.path.join(working_dir_abs, cand))
+
+    resolved_real = os.path.realpath(resolved)
+
+    for root in roots:
+        root_abs = os.path.abspath(root)
+        root_real = os.path.realpath(root_abs)
+
+        try:
+            if os.path.commonpath([resolved, root_abs]) == root_abs:
+                return True
+        except (ValueError, Exception):
+            pass
+
+        try:
+            if os.path.commonpath([resolved_real, root_real]) == root_real:
+                return True
+        except (ValueError, Exception):
+            pass
+
+    return False
+
+
+def _external_paths_warning(
+    task_instructions: Optional[str],
+    focus_files: Optional[list[str]],
+    working_directory: str,
+    orig_cwd: Optional[str] = None,
+) -> str:
+    """Scan effective spec and focus_files for paths outside the run's working directory.
+
+    Warns if the spec mentions absolute paths, ~ paths, or relative escaping paths
+    that do not resolve under working_directory (or worktree).
+    """
+    roots = [working_directory]
+    if orig_cwd and orig_cwd != working_directory:
+        roots.append(orig_cwd)
+
+    hits: list[str] = []
+
+    if focus_files:
+        for f in focus_files:
+            clean_f = _clean_path_candidate(f.strip().strip("'\"`"))
+            if clean_f and not _is_path_inside_roots(clean_f, roots):
+                hits.append(clean_f)
+
+    if task_instructions:
+        text_no_urls = _URL_RE.sub(" ", task_instructions)
+        for m in _CANDIDATE_PATH_RE.finditer(text_no_urls):
+            cand = _clean_path_candidate(m.group(1))
+            if cand and not _is_path_inside_roots(cand, roots):
+                hits.append(cand)
+
+    if not hits:
+        return ""
+
+    unique_hits = sorted(set(hits))
+    if len(unique_hits) > 10:
+        quoted_hits = ", ".join(f'"{h}"' for h in unique_hits[:10]) + f", ... (+{len(unique_hits) - 10} more)"
+    else:
+        quoted_hits = ", ".join(f'"{h}"' for h in unique_hits)
+
+    return (
+        f'⚠️ EXTERNAL PATHS: the spec mentions paths outside the working directory ({quoted_hits}). '
+        f'An unattended run cannot get permission to read them and will end. '
+        f'Do those checks on the orchestrator side.\n\n'
     )
 
 
