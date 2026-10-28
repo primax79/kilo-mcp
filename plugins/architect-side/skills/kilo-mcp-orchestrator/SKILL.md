@@ -65,6 +65,13 @@ handful of lines, or that touches actual logic, goes back to Kilo via
 `kilo_implement(continue_session_id=..., task_instructions="<corrective instructions>")`, not a direct edit. When
 in doubt, delegate rather than fix it yourself.
 
+### Register as orchestrator & heartbeat
+
+When orchestrating in a workspace with the `ai-orch` CLI installed:
+- **Register the session:** Run `ai-orch sessions register --role orchestrator` upon starting or resuming an orchestrating session so the role is bound to this session.
+- **Heartbeat:** Interactive sessions (such as Claude Code) do not send heartbeats automatically. Send a heartbeat (`ai-orch sessions heartbeat <session_id>`) on each turn or during periodic checks.
+- **Liveness interpretation:** A "stale" status for an active interactive holder indicates elapsed idle time without a heartbeat turn, but does NOT mean the orchestrator is absent or dead. Do not treat a stale interactive orchestrator as absent without verifying.
+
 ### Precedence with Generic Skills
 
 This skill provides the concrete `kilo-mcp` tool bindings for orchestrating Kilo. When `orchestration-workflow` is also loaded, this skill specializes the tool calls (`kilo_implement`, `kilo_task_wait`, etc.), while `orchestration-workflow` governs the overarching architecture: task state transitions, verification modes, the Post-Verification Decision Table, and harness safety.
