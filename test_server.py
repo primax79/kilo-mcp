@@ -3,6 +3,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -53,6 +54,19 @@ def mock_run_kilo_custom(monkeypatch):
     return runner
 
 
+def _fake_kilo_cmd(sleep_s: int | float = 30) -> list[str]:
+    """Return command vector to launch a process whose ps output matches 'kilo run'.
+    Prefers bash -c 'exec -a ...' when bash is available (dash/POSIX sh does not support -a),
+    falling back to python os.execvp."""
+    if shutil.which("bash"):
+        return ["bash", "-c", f"exec -a 'kilo run' sleep {sleep_s}"]
+    return [
+        sys.executable,
+        "-c",
+        f"import os; os.execvp('sleep', ['kilo run', '{sleep_s}'])",
+    ]
+
+
 @pytest.fixture
 def mock_spawn_kilo_background(monkeypatch):
     """Replaces _spawn_kilo_background (the background-mode detached-process
@@ -74,7 +88,7 @@ def mock_spawn_kilo_background(monkeypatch):
             self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "log_path": log_path})
             with open(log_path, "w") as f:
                 f.write(self.log_content)
-            proc = subprocess.Popen(["sh", "-c", "exec -a 'kilo run' sleep 5" if self.alive else "exec -a 'kilo run' sleep 0"])
+            proc = subprocess.Popen(_fake_kilo_cmd(5 if self.alive else 0))
             if not self.alive:
                 proc.wait()
             self._procs.append(proc)
@@ -95,7 +109,7 @@ def mock_spawn_kilo_background(monkeypatch):
 @pytest.fixture
 def live_kilo_pid():
     """Provides the PID of a genuinely live process whose command line matches `kilo run`."""
-    proc = subprocess.Popen(["sh", "-c", "exec -a 'kilo run' sleep 30"])
+    proc = subprocess.Popen(_fake_kilo_cmd(30))
     yield proc.pid
     if proc.poll() is None:
         try:
@@ -103,6 +117,18 @@ def live_kilo_pid():
             proc.wait()
         except OSError:
             pass
+
+
+def test_fake_kilo_cmd_portability(monkeypatch):
+    """_fake_kilo_cmd creates commands whose argv[0] matches kilo run both with bash and python fallback."""
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/bin/bash" if cmd == "bash" else None)
+    cmd_bash = _fake_kilo_cmd(5)
+    assert "exec -a" in cmd_bash[2]
+
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    cmd_py = _fake_kilo_cmd(5)
+    assert cmd_py[0] == sys.executable
+    assert "os.execvp" in cmd_py[2]
 
 # ==============================================================================
 # 1. _cfg resolution order
@@ -1031,7 +1057,7 @@ def test_kilo_task_cancel_real_process(tmp_path, monkeypatch):
 
     async def scenario():
         proc = await asyncio.create_subprocess_exec(
-            "sh", "-c", "exec -a 'kilo run' sleep 30", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            *_fake_kilo_cmd(30), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         server._write_task_record("t4", {"status": "running", "pid": proc.pid})
         res = await server.kilo_task_cancel(task_id="t4", reason="going off spec")
@@ -5442,7 +5468,7 @@ def test_external_paths_warning_ignores_url_routes(tmp_path):
     import server
     warn = server._external_paths_warning("Call GET /api/fleet and POST /v1/tasks", None, str(tmp_path))
     assert warn == ""
-    warn2 = server._external_paths_warning("Copy /Users/someone/.config into a temp dir", None, str(tmp_path))
+    warn2 = server._external_paths_warning("Copy /etc/someone/.config into a temp dir", None, str(tmp_path))
     assert "EXTERNAL PATHS" in warn2
 
 
