@@ -202,6 +202,20 @@ uv run --no-project --with "mcp>=2" python server.py --install-skills
 
 Then, in a conversation, ask Claude to *"list the available Kilo models"* - a correct setup answers through the `kilo_list_models` tool. If the tools are missing, restart the client (stdio servers are spawned per session) and check that `kilo --version` and `uv --version` work in a fresh terminal.
 
+### Skills over MCP
+
+`kilo-mcp` implements the [MCP Skills extension (`io.modelcontextprotocol/skills`, SEP-2640)](https://github.com/modelcontextprotocol/ext-skills/blob/main/specification/beta/skills.mdx) and serves the five skills bundled under `plugins/*/skills/` directly over the MCP protocol:
+
+- `skill://kilo-mcp/kilo-mcp-orchestrator/SKILL.md`
+- `skill://kilo-mcp/kilo-mcp-conflict-resolver/SKILL.md`
+- `skill://kilo-mcp/kilo-mcp-metrics-analyst/SKILL.md`
+- `skill://kilo-mcp/kilo-mcp-executor-contract/SKILL.md`
+- `skill://kilo-mcp/kilo-mcp-rag-explorer/SKILL.md`
+
+Every file in each skill directory (`SKILL.md`, `references/*`, `scripts/*`, `index.json`) is exposed as a standard MCP resource under `skill://kilo-mcp/<name>/<relative-path>`, listed in `resources/list`, and readable via `resources/read`. The server advertises `capabilities.extensions["io.modelcontextprotocol/skills"] = {}` (`directoryRead` is excluded) and serves `skills/list` and `skills/get` with verbatim YAML `frontmatter` and a complete `resources` manifest carrying raw-byte `sha256:<hex>` digests and byte `size` values.
+
+Compatible hosts — such as VS Code with `"chat.agentHost.mcpSkills.enabled": true` — automatically discover and load these skills from the connected `kilo-mcp` server without requiring a separate local plugin or filesystem skill installation. Clients that do not implement the extension remain unaffected and see ordinary MCP tools, prompts, instructions, and resources. Skills are served from the bundled `plugins/` directory next to `server.py`, which is present both when running directly from a repository clone (`uv run server.py`) and in packaged wheel distributions (`tool.hatch.build.targets.wheel.only-include`), ensuring skill discovery functions across install modes.
+
 ---
 
 ## 🛠️ Exposed MCP Tools

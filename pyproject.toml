@@ -17,3 +17,6 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 kilo-mcp = "server:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["server.py", "plugins"]

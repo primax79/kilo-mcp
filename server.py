@@ -1,9 +1,15 @@
 from mcp.server.mcpserver import MCPServer as FastMCP
+from mcp.server.context import ServerRequestContext
+from mcp.server.extension import Extension, MethodBinding, ResourceBinding
+from mcp.server.mcpserver.resources import Resource
+from mcp.shared.exceptions import MCPError
+from mcp_types import INVALID_PARAMS, PaginatedRequestParams, RequestParams
 import asyncio
 import fcntl
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import pathlib
 import re
@@ -68,7 +74,418 @@ _IS_RAG_ONLY = (
 )
 
 _active_instructions = _SERVER_INSTRUCTIONS_RAG_ONLY if _IS_RAG_ONLY else _SERVER_INSTRUCTIONS
-mcp = FastMCP("KiloCode Server" if not _IS_RAG_ONLY else "KiloCode RAG Server", instructions=_active_instructions)
+
+# ---------------------------------------------------------------------------
+# MCP Skills extension (io.modelcontextprotocol/skills — SEP-2640)
+# ---------------------------------------------------------------------------
+MCP_SKILLS_EXTENSION_ID = "io.modelcontextprotocol/skills"
+MCP_SKILL_URI_PREFIX = "skill://kilo-mcp"
+MCP_SKILL_MAX_FILES = 512
+MCP_SKILL_MAX_TOTAL_BYTES = 16 * 1024 * 1024  # 16 MiB (16,777,216 bytes)
+MCP_SKILL_TTL_MS = 300000
+MCP_SKILL_CACHE_SCOPE: Literal["public", "private"] = "public"
+_SKILLS_PLUGINS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
+
+
+def _skill_file_mime_type(file_path: pathlib.Path) -> str:
+    """Return the appropriate MIME type for a file within a skill directory."""
+    if file_path.name == "SKILL.md":
+        return "text/markdown"
+    suffix = file_path.suffix.lower()
+    if suffix in (".md", ".markdown", ".mdx"):
+        return "text/markdown"
+    if suffix == ".json":
+        return "application/json"
+    if suffix in (".yaml", ".yml"):
+        return "application/yaml"
+    if suffix == ".toml":
+        return "application/toml"
+    if suffix == ".sh":
+        return "text/x-shellscript"
+    if suffix == ".py":
+        return "text/x-python"
+    if suffix == ".txt":
+        return "text/plain"
+    guessed, _ = mimetypes.guess_type(file_path.name)
+    return guessed or "application/octet-stream"
+
+
+def _parse_yaml_scalar(raw: str) -> Any:
+    """Parse a YAML scalar value without requiring PyYAML."""
+    val = raw.strip()
+    if not val:
+        return ""
+    if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+        try:
+            return json.loads(val)
+        except Exception:
+            return val[1:-1]
+    if val.startswith("'") and val.endswith("'") and len(val) >= 2:
+        return val[1:-1].replace("''", "'")
+    if val in ("true", "True"):
+        return True
+    if val in ("false", "False"):
+        return False
+    if val in ("null", "Null", "~"):
+        return None
+    if (val.startswith("[") and val.endswith("]")) or (val.startswith("{") and val.endswith("}")):
+        try:
+            return json.loads(val)
+        except Exception:
+            pass
+    if re.fullmatch(r"-?\d+", val):
+        return int(val)
+    if re.fullmatch(r"-?\d+\.\d+", val):
+        return float(val)
+    return val
+
+
+def _minimal_yaml_frontmatter_load(fm_text: str) -> dict[str, Any]:
+    """Fallback parser for SKILL.md YAML frontmatter when PyYAML is not installed.
+
+    Handles flat key/value scalars (quoted and unquoted strings, booleans,
+    numbers, inline JSON arrays/objects), block scalars (`|` / `>`), indented
+    lists (`- item`), and one-level nested mappings (`metadata:\n  k: v`).
+    """
+    result: dict[str, Any] = {}
+    lines = fm_text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent > 0 or ":" not in stripped:
+            i += 1
+            continue
+        key, _, raw_val = stripped.partition(":")
+        key = key.strip()
+        raw_val = raw_val.strip()
+        i += 1
+
+        if raw_val in ("|", "|-", ">", ">-"):
+            block_lines: list[str] = []
+            block_indent: Optional[int] = None
+            while i < len(lines):
+                bline = lines[i]
+                bstripped = bline.strip()
+                if not bstripped:
+                    block_lines.append("")
+                    i += 1
+                    continue
+                cur_indent = len(bline) - len(bline.lstrip(" "))
+                if cur_indent == 0:
+                    break
+                if block_indent is None:
+                    block_indent = cur_indent
+                block_lines.append(bline[block_indent:] if len(bline) >= block_indent else bstripped)
+                i += 1
+            sep = "\n" if raw_val.startswith("|") else " "
+            joined = sep.join(block_lines)
+            if not raw_val.endswith("-"):
+                joined = joined.rstrip("\n") + "\n"
+            else:
+                joined = joined.rstrip("\n")
+            result[key] = joined
+            continue
+
+        if raw_val == "":
+            # Peek at indented children (either list items or a nested mapping)
+            children_list: list[Any] = []
+            children_map: dict[str, Any] = {}
+            is_list: Optional[bool] = None
+            while i < len(lines):
+                cline = lines[i]
+                cstripped = cline.strip()
+                if not cstripped or cstripped.startswith("#"):
+                    i += 1
+                    continue
+                cindent = len(cline) - len(cline.lstrip(" "))
+                if cindent == 0:
+                    break
+                if cstripped.startswith("- "):
+                    is_list = True
+                    children_list.append(_parse_yaml_scalar(cstripped[2:]))
+                elif cstripped == "-":
+                    is_list = True
+                    children_list.append("")
+                elif ":" in cstripped and is_list is not True:
+                    is_list = False
+                    ck, _, cv = cstripped.partition(":")
+                    children_map[ck.strip()] = _parse_yaml_scalar(cv)
+                i += 1
+            if is_list is True:
+                result[key] = children_list
+            elif is_list is False:
+                result[key] = children_map
+            else:
+                result[key] = ""
+            continue
+
+        result[key] = _parse_yaml_scalar(raw_val)
+    return result
+
+
+def _parse_skill_frontmatter(text: str) -> dict[str, Any]:
+    """Extract and parse the YAML frontmatter from a SKILL.md document."""
+    m = re.match(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", text, re.DOTALL)
+    if not m:
+        raise ValueError("SKILL.md is missing leading YAML frontmatter delimited by '---'")
+    fm_body = m.group(1)
+    parsed: Any = None
+    try:
+        import yaml  # type: ignore[import-untyped]
+        parsed = yaml.safe_load(fm_body)
+    except ImportError:
+        parsed = _minimal_yaml_frontmatter_load(fm_body)
+    if not isinstance(parsed, dict):
+        raise ValueError("SKILL.md YAML frontmatter must parse to a mapping")
+    if not isinstance(parsed.get("name"), str) or not parsed["name"].strip():
+        raise ValueError("SKILL.md YAML frontmatter is missing required string field 'name'")
+    if not isinstance(parsed.get("description"), str) or not parsed["description"].strip():
+        raise ValueError("SKILL.md YAML frontmatter is missing required string field 'description'")
+    return parsed
+
+
+class _SkillFileResource(Resource):
+    """MCP Resource backed by a file inside a bundled skill directory.
+
+    Reads raw bytes and decodes as strict UTF-8 without BOM stripping or
+    newline translation so that `resources/read` returns exact byte-for-byte
+    content matching the `digest` and `size` advertised in the skill manifest.
+    """
+
+    path: pathlib.Path = Field(exclude=True)
+
+    async def read(self) -> str | bytes:
+        raw = self.path.read_bytes()
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw
+
+
+class _GetSkillRequestParams(RequestParams):
+    """Request parameters for `skills/get` (SEP-2640)."""
+
+    uri: str
+
+
+def _iter_skill_files(skill_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Return all files in `skill_dir`, with `SKILL.md` first and the rest sorted by relative POSIX path."""
+    files: list[pathlib.Path] = []
+    for root, dirs, filenames in os.walk(skill_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "__pycache__")
+        for fn in filenames:
+            if fn.startswith(".") or fn.endswith(".pyc"):
+                continue
+            full_path = pathlib.Path(root) / fn
+            if full_path.is_file():
+                files.append(full_path)
+    files.sort(key=lambda p: (0 if p == skill_dir / "SKILL.md" else 1, p.relative_to(skill_dir).as_posix()))
+    return files
+
+
+def _build_skill_entry(skill_dir: pathlib.Path) -> tuple[dict[str, Any], list[_SkillFileResource]]:
+    """Build the SEP-2640 `Skill` entry dict and `Resource` list for `skill_dir`.
+
+    Raises `ValueError` if `SKILL.md` is missing/invalid or if the skill
+    exceeds the SEP-2640 per-skill limits (512 files or 16 MiB total size).
+    """
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.is_file():
+        raise ValueError(f"Skill directory {skill_dir} does not contain SKILL.md")
+
+    raw_skill_md = skill_md.read_bytes()
+    frontmatter = _parse_skill_frontmatter(raw_skill_md.decode("utf-8"))
+    skill_name = frontmatter["name"]
+    if skill_name != skill_dir.name:
+        raise ValueError(
+            f"SKILL.md frontmatter name {skill_name!r} does not match directory name {skill_dir.name!r}"
+        )
+
+    files = _iter_skill_files(skill_dir)
+    if len(files) > MCP_SKILL_MAX_FILES:
+        raise ValueError(
+            f"Skill {skill_name!r} has {len(files)} files, exceeding the {MCP_SKILL_MAX_FILES}-file limit"
+        )
+
+    manifest_resources: list[dict[str, Any]] = []
+    mcp_resources: list[_SkillFileResource] = []
+    total_bytes = 0
+
+    for file_path in files:
+        rel_posix = file_path.relative_to(skill_dir).as_posix()
+        uri = f"{MCP_SKILL_URI_PREFIX}/{skill_name}/{rel_posix}"
+        raw = file_path.read_bytes()
+        size = len(raw)
+        total_bytes += size
+        if total_bytes > MCP_SKILL_MAX_TOTAL_BYTES:
+            raise ValueError(
+                f"Skill {skill_name!r} exceeds the {MCP_SKILL_MAX_TOTAL_BYTES}-byte total size limit"
+            )
+        digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+        manifest_resources.append({
+            "uri": uri,
+            "digest": digest,
+            "size": size,
+        })
+
+        if rel_posix == "SKILL.md":
+            res_name = skill_name
+            res_desc: Optional[str] = frontmatter["description"]
+            res_mime = "text/markdown"
+        else:
+            res_name = file_path.name
+            res_desc = None
+            res_mime = _skill_file_mime_type(file_path)
+
+        mcp_resources.append(
+            _SkillFileResource(
+                uri=uri,
+                name=res_name,
+                description=res_desc,
+                mime_type=res_mime,
+                path=file_path.resolve(),
+            )
+        )
+
+    entry = {
+        "uri": f"{MCP_SKILL_URI_PREFIX}/{skill_name}/SKILL.md",
+        "frontmatter": frontmatter,
+        "resources": manifest_resources,
+    }
+    return entry, mcp_resources
+
+
+def _discover_skills(
+    plugins_dir: Optional[str | pathlib.Path] = None,
+) -> tuple[list[dict[str, Any]], list[_SkillFileResource]]:
+    """Discover all skills under `plugins/*/skills/*` and return their entries and MCP resources."""
+    base = pathlib.Path(plugins_dir if plugins_dir is not None else _SKILLS_PLUGINS_DIR)
+    if not base.is_dir():
+        return [], []
+
+    skill_dirs = [
+        p.parent
+        for p in base.glob("*/skills/*/SKILL.md")
+        if p.is_file() and p.parent.is_dir()
+    ]
+    skill_dirs.sort(key=lambda d: (d.name, str(d)))
+
+    entries: list[dict[str, Any]] = []
+    all_resources: list[_SkillFileResource] = []
+    for sdir in skill_dirs:
+        try:
+            entry, res_list = _build_skill_entry(sdir)
+        except ValueError as exc:
+            logger.warning("Skipping invalid skill at %s: %s", sdir, exc)
+            continue
+        entries.append(entry)
+        all_resources.extend(res_list)
+    return entries, all_resources
+
+
+async def _handle_skills_list(
+    ctx: ServerRequestContext[Any, Any],
+    params: PaginatedRequestParams | None,
+) -> dict[str, Any]:
+    if params is not None and params.cursor is not None:
+        raise MCPError(code=INVALID_PARAMS, message=f"Invalid cursor: {params.cursor}")
+    skills, _ = _discover_skills()
+    return {
+        "resultType": "complete",
+        "skills": skills,
+        "ttlMs": MCP_SKILL_TTL_MS,
+        "cacheScope": MCP_SKILL_CACHE_SCOPE,
+    }
+
+
+async def _handle_skills_get(
+    ctx: ServerRequestContext[Any, Any],
+    params: _GetSkillRequestParams,
+) -> dict[str, Any]:
+    skills, _ = _discover_skills()
+    for skill in skills:
+        if skill["uri"] == params.uri:
+            return {
+                "resultType": "complete",
+                "skill": skill,
+                "ttlMs": MCP_SKILL_TTL_MS,
+                "cacheScope": MCP_SKILL_CACHE_SCOPE,
+            }
+    raise MCPError(
+        code=INVALID_PARAMS,
+        message=f"No skill is served at {params.uri}",
+    )
+
+
+class _KiloSkillsExtension(Extension):
+    """MCP Skills extension (`io.modelcontextprotocol/skills`, SEP-2640)."""
+
+    identifier = MCP_SKILLS_EXTENSION_ID
+
+    def settings(self) -> dict[str, Any]:
+        # directoryRead is intentionally excluded per T053 spec.
+        return {}
+
+    def resources(self) -> list[ResourceBinding]:
+        _, skill_resources = _discover_skills()
+        return [ResourceBinding(resource=r) for r in skill_resources]
+
+    def methods(self) -> list[MethodBinding]:
+        return [
+            MethodBinding(
+                method="skills/list",
+                params_type=PaginatedRequestParams,
+                handler=_handle_skills_list,
+            ),
+            MethodBinding(
+                method="skills/get",
+                params_type=_GetSkillRequestParams,
+                handler=_handle_skills_get,
+            ),
+        ]
+
+
+_skills_extension = _KiloSkillsExtension()
+
+mcp = FastMCP(
+    "KiloCode Server" if not _IS_RAG_ONLY else "KiloCode RAG Server",
+    instructions=_active_instructions,
+    extensions=[_skills_extension],
+)
+
+
+async def _preserve_initialize_extensions_middleware(
+    ctx: ServerRequestContext[Any, Any],
+    call_next: Any,
+) -> Any:
+    """Ensure `capabilities.extensions` is also preserved in legacy `initialize` responses.
+
+    The MCP SDK sieves legacy `initialize` results with `serialize_server_result`
+    against `_v2025_11_25.InitializeResult`, which drops `extensions` because
+    extensions are a modern protocol capability. This middleware restores the
+    extension advertisement on the legacy wire so handshake clients see it.
+    """
+    result = await call_next(ctx)
+    if ctx.method == "initialize" and isinstance(result, dict):
+        caps = result.get("capabilities")
+        if isinstance(caps, dict) and "extensions" not in caps:
+            result = {
+                **result,
+                "capabilities": {
+                    **caps,
+                    "extensions": {MCP_SKILLS_EXTENSION_ID: _skills_extension.settings()},
+                },
+            }
+    return result
+
+
+mcp.middleware.append(_preserve_initialize_extensions_middleware)
+
 
 # ---------------------------------------------------------------------------
 # Configuration

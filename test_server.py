@@ -5444,3 +5444,253 @@ def test_external_paths_warning_ignores_url_routes(tmp_path):
     assert warn == ""
     warn2 = server._external_paths_warning("Copy /Users/someone/.config into a temp dir", None, str(tmp_path))
     assert "EXTERNAL PATHS" in warn2
+
+
+# ==============================================================================
+# T053 — MCP Skills extension (io.modelcontextprotocol/skills, SEP-2640)
+# ==============================================================================
+
+EXPECTED_MCP_SKILLS = {
+    "kilo-mcp-conflict-resolver",
+    "kilo-mcp-executor-contract",
+    "kilo-mcp-metrics-analyst",
+    "kilo-mcp-orchestrator",
+    "kilo-mcp-rag-explorer",
+}
+
+
+def test_mcp_skills_server_constructed_with_extension():
+    """FastMCP server object is constructed with _KiloSkillsExtension via the public constructor parameter."""
+    assert hasattr(server.mcp, "_extensions")
+    assert server._skills_extension in server.mcp._extensions
+    assert any(
+        isinstance(ext, server._KiloSkillsExtension) and ext.identifier == server.MCP_SKILLS_EXTENSION_ID
+        for ext in server.mcp._extensions
+    )
+    caps = server.mcp._lowlevel_server.get_capabilities()
+    assert caps.extensions is not None
+    assert caps.extensions.get(server.MCP_SKILLS_EXTENSION_ID) == {}
+
+
+def test_mcp_skills_extension_declared_and_five_entries():
+    """kilo-mcp declares io.modelcontextprotocol/skills={} (no directoryRead)
+    and serves all 5 bundled skills with name matching the final skill-path segment."""
+    caps = server.mcp._lowlevel_server.get_capabilities()
+    assert caps.extensions is not None
+    assert caps.extensions.get("io.modelcontextprotocol/skills") == {}
+    assert "directoryRead" not in caps.extensions["io.modelcontextprotocol/skills"]
+    assert caps.resources is not None
+
+    res = asyncio.run(server._handle_skills_list(None, None))
+    assert res["resultType"] == "complete"
+    assert isinstance(res["ttlMs"], int) and res["ttlMs"] > 0
+    assert res["cacheScope"] in ("public", "private")
+
+    skills = res["skills"]
+    assert len(skills) == 5
+    names = set()
+    for entry in skills:
+        uri = entry["uri"]
+        assert uri.startswith("skill://kilo-mcp/")
+        assert uri.endswith("/SKILL.md")
+        skill_path = uri[len("skill://") : -len("/SKILL.md")]
+        last_segment = skill_path.rsplit("/", 1)[-1]
+        fm_name = entry["frontmatter"]["name"]
+        assert fm_name == last_segment
+        names.add(fm_name)
+
+    assert names == EXPECTED_MCP_SKILLS
+
+
+def test_mcp_skills_digest_size_and_completeness_match_disk():
+    """Every skill entry's `resources` array is complete (matches the files on
+    disk in plugins/*/skills/<name>/) and each item's sha256 digest and size
+    match the raw file bytes."""
+    import hashlib
+
+    res = asyncio.run(server._handle_skills_list(None, None))
+    skills_by_name = {entry["frontmatter"]["name"]: entry for entry in res["skills"]}
+    assert set(skills_by_name) == EXPECTED_MCP_SKILLS
+
+    plugins_root = pathlib.Path(server._SKILLS_PLUGINS_DIR)
+    for skill_md in sorted(plugins_root.glob("*/skills/*/SKILL.md")):
+        skill_dir = skill_md.parent
+        name = skill_dir.name
+        entry = skills_by_name[name]
+
+        disk_files = {
+            p.relative_to(skill_dir).as_posix(): p
+            for p in skill_dir.rglob("*")
+            if p.is_file() and not any(part.startswith(".") or part == "__pycache__" for part in p.relative_to(skill_dir).parts)
+        }
+
+        manifest = entry["resources"]
+        assert isinstance(manifest, list)
+        # First entry is SKILL.md itself
+        assert manifest[0]["uri"] == entry["uri"]
+
+        manifest_by_rel = {}
+        for item in manifest:
+            prefix = f"skill://kilo-mcp/{name}/"
+            assert item["uri"].startswith(prefix)
+            rel = item["uri"][len(prefix) :]
+            manifest_by_rel[rel] = item
+
+        # Complete: exact match with files on disk
+        assert set(manifest_by_rel.keys()) == set(disk_files.keys())
+
+        for rel, file_path in disk_files.items():
+            raw = file_path.read_bytes()
+            expected_digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+            m_item = manifest_by_rel[rel]
+            assert m_item["size"] == len(raw)
+            assert m_item["digest"] == expected_digest
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", m_item["digest"])
+
+
+def test_mcp_skills_frontmatter_matches_yaml():
+    """Each skill entry's `frontmatter` matches the verbatim YAML frontmatter in SKILL.md."""
+    res = asyncio.run(server._handle_skills_list(None, None))
+    skills_by_name = {entry["frontmatter"]["name"]: entry for entry in res["skills"]}
+
+    plugins_root = pathlib.Path(server._SKILLS_PLUGINS_DIR)
+    for skill_md in sorted(plugins_root.glob("*/skills/*/SKILL.md")):
+        text = skill_md.read_bytes().decode("utf-8")
+        m = re.match(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", text, re.DOTALL)
+        assert m is not None
+        expected_fm = server._minimal_yaml_frontmatter_load(m.group(1))
+        actual_fm = skills_by_name[skill_md.parent.name]["frontmatter"]
+        assert actual_fm == expected_fm
+        assert "name" in actual_fm and "description" in actual_fm
+
+
+def test_mcp_skills_get_known_and_unknown():
+    """skills/get returns the matching entry for known skill URIs and raises
+    MCPError(INVALID_PARAMS = -32602) on unknown URIs."""
+    from mcp.shared.exceptions import MCPError
+    from mcp_types import INVALID_PARAMS
+
+    list_res = asyncio.run(server._handle_skills_list(None, None))
+    for expected in list_res["skills"]:
+        get_res = asyncio.run(
+            server._handle_skills_get(None, server._GetSkillRequestParams(uri=expected["uri"]))
+        )
+        assert get_res["resultType"] == "complete"
+        assert get_res["ttlMs"] == server.MCP_SKILL_TTL_MS
+        assert get_res["cacheScope"] == server.MCP_SKILL_CACHE_SCOPE
+        assert get_res["skill"] == expected
+
+    for bad_uri in (
+        "skill://kilo-mcp/non-existent/SKILL.md",
+        "skill://kilo-mcp/kilo-mcp-orchestrator",
+        "skill://kilo-mcp/kilo-mcp-orchestrator/references/incidents.md",
+        "file:///etc/passwd",
+    ):
+        with pytest.raises(MCPError) as exc_info:
+            asyncio.run(server._handle_skills_get(None, server._GetSkillRequestParams(uri=bad_uri)))
+        assert exc_info.value.error.code == INVALID_PARAMS
+
+
+def test_mcp_skills_resources_list_and_read():
+    """All skill files are exposed in resources/list with appropriate mimeType
+    (text/markdown for SKILL.md) and readable via resources/read."""
+    listed = asyncio.run(server.mcp.list_resources())
+    by_uri = {str(r.uri): r for r in listed if str(r.uri).startswith("skill://kilo-mcp/")}
+
+    list_res = asyncio.run(server._handle_skills_list(None, None))
+    expected_uris = {
+        item["uri"]
+        for skill in list_res["skills"]
+        for item in skill["resources"]
+    }
+    assert set(by_uri.keys()) == expected_uris
+
+    for skill in list_res["skills"]:
+        skill_uri = skill["uri"]
+        skill_res = by_uri[skill_uri]
+        assert skill_res.mime_type == "text/markdown"
+        assert skill_res.name == skill["frontmatter"]["name"]
+        assert skill_res.description == skill["frontmatter"]["description"]
+
+        for item in skill["resources"]:
+            uri = item["uri"]
+            read_contents = list(asyncio.run(server.mcp.read_resource(uri)))
+            assert len(read_contents) == 1
+            content = read_contents[0].content
+            raw = content.encode("utf-8") if isinstance(content, str) else content
+            assert len(raw) == item["size"]
+
+
+def test_mcp_skills_limits_enforced(tmp_path):
+    """_build_skill_entry enforces the SEP-2640 limits of 512 files and 16 MiB per skill."""
+    # 1. Exceed 512 files limit
+    many_dir = tmp_path / "too-many-files"
+    many_dir.mkdir()
+    (many_dir / "SKILL.md").write_text("---\nname: too-many-files\ndescription: test\n---\nbody\n", encoding="utf-8")
+    for i in range(512):
+        (many_dir / f"f{i}.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="512-file limit"):
+        server._build_skill_entry(many_dir)
+
+    # 2. Exceed 16 MiB total size limit
+    big_dir = tmp_path / "too-big-skill"
+    big_dir.mkdir()
+    (big_dir / "SKILL.md").write_text("---\nname: too-big-skill\ndescription: test\n---\nbody\n", encoding="utf-8")
+    (big_dir / "huge.bin").write_bytes(b"a" * (16 * 1024 * 1024))
+    with pytest.raises(ValueError, match="total size limit"):
+        server._build_skill_entry(big_dir)
+
+
+def test_mcp_skills_stdio_client_end_to_end():
+    """End-to-end smoke test spawning server.py over stdio with a real MCP SDK
+    Client: verifies extension capability declaration, calls skills/list,
+    reads SKILL.md via resources/read, and verifies SHA-256 digest and size."""
+    import hashlib
+    from mcp import Client, StdioServerParameters
+    import mcp_types as types
+    from pydantic import TypeAdapter
+
+    async def scenario():
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[os.path.abspath(server.__file__)],
+        )
+        async with Client(params) as client:
+            caps = client.server_capabilities
+            assert caps.extensions is not None
+            assert caps.extensions.get("io.modelcontextprotocol/skills") == {}
+            assert caps.resources is not None
+
+            # Verify server/discover capability discovery advertises the extension
+            discover_res = await client.session.send_request(
+                types.Request(method="server/discover", params=types.RequestParams()),
+                TypeAdapter(dict),
+            )
+            disc_caps = discover_res.get("capabilities", {})
+            assert disc_caps.get("extensions", {}).get("io.modelcontextprotocol/skills") == {}
+
+            list_res = await client.session.send_request(
+                types.Request(method="skills/list", params=types.PaginatedRequestParams()),
+                TypeAdapter(dict),
+            )
+            assert list_res["resultType"] == "complete"
+            assert len(list_res["skills"]) == 5
+
+            target_skill = next(
+                s for s in list_res["skills"] if s["frontmatter"]["name"] == "kilo-mcp-orchestrator"
+            )
+            target_uri = target_skill["uri"]
+            assert target_uri == "skill://kilo-mcp/kilo-mcp-orchestrator/SKILL.md"
+
+            read_res = await client.read_resource(target_uri)
+            assert len(read_res.contents) == 1
+            first = read_res.contents[0]
+            assert first.mime_type == "text/markdown"
+            raw_bytes = first.text.encode("utf-8")
+
+            manifest_entry = next(r for r in target_skill["resources"] if r["uri"] == target_uri)
+            assert len(raw_bytes) == manifest_entry["size"]
+            actual_digest = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+            assert actual_digest == manifest_entry["digest"]
+
+    asyncio.run(scenario())
