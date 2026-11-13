@@ -214,7 +214,7 @@ Then, in a conversation, ask Claude to *"list the available Kilo models"* - a co
 
 Every file in each skill directory (`SKILL.md`, `references/*`, `scripts/*`, `index.json`) is exposed as a standard MCP resource under `skill://kilo-mcp/<name>/<relative-path>`, listed in `resources/list`, and readable via `resources/read`. The server advertises `capabilities.extensions["io.modelcontextprotocol/skills"] = {}` (`directoryRead` is excluded) and serves `skills/list` and `skills/get` with verbatim YAML `frontmatter` and a complete `resources` manifest carrying raw-byte `sha256:<hex>` digests and byte `size` values.
 
-Compatible hosts — such as VS Code with `"chat.agentHost.mcpSkills.enabled": true` — automatically discover and load these skills from the connected `kilo-mcp` server without requiring a separate local plugin or filesystem skill installation. Clients that do not implement the extension remain unaffected and see ordinary MCP tools, prompts, instructions, and resources.
+Compatible hosts — such as VS Code with `"chat.agentHost.mcpSkills.enabled": true` — automatically discover and load these skills from the connected `kilo-mcp` server without requiring a separate local plugin or filesystem skill installation. Clients that do not implement the extension remain unaffected and see ordinary MCP tools, prompts, instructions, and resources. Skills are served from the bundled `plugins/` directory next to `server.py`, which is present both when running directly from a repository clone (`uv run server.py`) and in packaged wheel distributions (`tool.hatch.build.targets.wheel.only-include`), ensuring skill discovery functions across install modes.
 
 ---
 

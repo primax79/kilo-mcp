@@ -165,6 +165,6 @@ Reminders for the installing agent:
 
 ---
 
-### Installing as a package (not recommended yet)
+### Installing as a package
 
-The project ships a `pyproject.toml` with a `kilo-mcp` console script, so `uv tool install git+<GIT_REPO_URL_FOR_KILO_MCP>` technically works - **but the packaged install does not include the `skills/` directory**, so `kilo-mcp --install-skills` would find nothing to install. Until packaging bundles the skills, the `git clone` method above is the canonical one.
+The project ships a `pyproject.toml` with a `kilo-mcp` console script, and hatchling wheel packaging includes `plugins/` alongside `server.py` (via `tool.hatch.build.targets.wheel.only-include`). Both running from a Git clone (`uv run --no-project --with "mcp>=2" python server.py`) and packaged installs (`uv tool install git+<GIT_REPO_URL_FOR_KILO_MCP>`) make bundled skills available for both MCP extension serving and `--install-skills`. The `git clone` method remains the canonical developer workflow.

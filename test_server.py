@@ -5459,6 +5459,19 @@ EXPECTED_MCP_SKILLS = {
 }
 
 
+def test_mcp_skills_server_constructed_with_extension():
+    """FastMCP server object is constructed with _KiloSkillsExtension via the public constructor parameter."""
+    assert hasattr(server.mcp, "_extensions")
+    assert server._skills_extension in server.mcp._extensions
+    assert any(
+        isinstance(ext, server._KiloSkillsExtension) and ext.identifier == server.MCP_SKILLS_EXTENSION_ID
+        for ext in server.mcp._extensions
+    )
+    caps = server.mcp._lowlevel_server.get_capabilities()
+    assert caps.extensions is not None
+    assert caps.extensions.get(server.MCP_SKILLS_EXTENSION_ID) == {}
+
+
 def test_mcp_skills_extension_declared_and_five_entries():
     """kilo-mcp declares io.modelcontextprotocol/skills={} (no directoryRead)
     and serves all 5 bundled skills with name matching the final skill-path segment."""
@@ -5647,6 +5660,14 @@ def test_mcp_skills_stdio_client_end_to_end():
             assert caps.extensions is not None
             assert caps.extensions.get("io.modelcontextprotocol/skills") == {}
             assert caps.resources is not None
+
+            # Verify server/discover capability discovery advertises the extension
+            discover_res = await client.session.send_request(
+                types.Request(method="server/discover", params=types.RequestParams()),
+                TypeAdapter(dict),
+            )
+            disc_caps = discover_res.get("capabilities", {})
+            assert disc_caps.get("extensions", {}).get("io.modelcontextprotocol/skills") == {}
 
             list_res = await client.session.send_request(
                 types.Request(method="skills/list", params=types.PaginatedRequestParams()),
