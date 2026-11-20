@@ -2700,11 +2700,15 @@ def test_worktree_git_metadata_and_cleanup_prune(tmp_path, fake_data_dir):
 # 28. Model guidance (flash/argon only, banned refused) and agent parameter
 # ==============================================================================
 
-def test_default_model_is_flash():
-    assert server.DEFAULT_MODEL == "google/gemini-3.8-flash"
-    assert server.COMPLEX_MODEL == "google/gemini-4-argon"
-    assert "google/gemini-3.8-flash" in server.ALLOWED_MODELS
-    assert "google/gemini-4-argon" in server.ALLOWED_MODELS
+def test_default_models_are_gemini_4():
+    assert server.DEFAULT_MODEL == "google/gemini-4-hydrogen"
+    assert server.COMPLEX_MODEL == "google/gemini-4-neon"
+    for m in ("google/gemini-4-hydrogen", "google/gemini-4-neon", "google/gemini-4-carbon"):
+        assert m in server.ALLOWED_MODELS
+    # Legacy ids stay accepted so projects that still pin them keep working.
+    for m in server.LEGACY_MODELS:
+        assert m in server.ALLOWED_MODELS
+        assert not server._is_banned_model(m)
 
 
 def test_is_banned_model():
@@ -2712,6 +2716,9 @@ def test_is_banned_model():
     assert server._is_banned_model("google/gemini-3.1-pro-preview")
     assert server._is_banned_model("google/gemini-3.1-pro-preview-customtools")
     assert server._is_banned_model("google/gemini-flash-latest")
+    assert server._is_banned_model("google/gemini-pro-latest")
+    assert server._is_banned_model("google/gemini-flash-lite-latest")
+    assert not server._is_banned_model("google/gemini-4-hydrogen")
     assert not server._is_banned_model("google/gemini-3.8-flash")
     assert not server._is_banned_model("google/gemini-4-argon")
 
@@ -2730,8 +2737,8 @@ def test_banned_model_refused(tmp_path, banned_model):
     ))
     assert "Error:" in res
     assert "banned by owner policy" in res
-    assert "google/gemini-3.8-flash" in res
-    assert "google/gemini-4-argon" in res
+    assert "google/gemini-4-hydrogen" in res
+    assert "google/gemini-4-neon" in res
 
 
 def test_descriptions_mention_only_allowed_models():
@@ -2751,10 +2758,52 @@ def test_descriptions_mention_only_allowed_models():
     assert "customtools" not in impl_doc
 
     list_models_doc = server.kilo_list_models.__doc__ or ""
-    assert "google/gemini-3.8-flash" in list_models_doc
-    assert "google/gemini-4-argon" in list_models_doc
+    assert "google/gemini-4-hydrogen" in list_models_doc
+    assert "google/gemini-4-neon" in list_models_doc
     assert "gemini-flash-latest" not in list_models_doc
     assert "3.1-pro" not in list_models_doc
+
+
+def test_build_kilo_run_argv_variant():
+    cmd = server._build_kilo_run_argv("/p/spec.md", model="google/gemini-4-hydrogen", variant="medium")
+    idx = cmd.index("--variant")
+    assert cmd[idx + 1] == "medium"
+    assert "--variant" not in server._build_kilo_run_argv("/p/spec.md", model="google/gemini-4-hydrogen")
+
+
+@pytest.mark.parametrize("bad", ["", "high; rm -rf /", "--model", "a" * 40])
+def test_invalid_variant_refused(tmp_path, bad):
+    res = asyncio.run(server.kilo_implement(
+        task_instructions="Perform test task",
+        working_directory=str(tmp_path),
+        model="google/gemini-4-hydrogen",
+        variant=bad,
+    ))
+    assert "invalid variant" in res
+
+
+def test_start_task_from_record_forwards_variant(tmp_path, monkeypatch):
+    captured = {}
+
+    class _P:
+        pid = 4242
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return _P()
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    spec = tmp_path / "spec.md"
+    spec.write_text("x")
+    record = {"working_directory": str(tmp_path), "prompt_file": str(spec),
+              "model": "google/gemini-4-neon", "variant": "high", "title": "t"}
+    try:
+        server._start_task_from_record("tvariant", record)
+    except Exception:
+        pass
+    assert "cmd" in captured, "Popen not reached"
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--variant") + 1] == "high"
 
 
 def test_build_kilo_run_argv_agent_explore():

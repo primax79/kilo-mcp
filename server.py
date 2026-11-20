@@ -1142,17 +1142,31 @@ def _write_db_todos(session_id: str, todos: list[dict]) -> bool:
 # constant so tests can shorten it.
 _CANCEL_GRACE_S = 2.0
 
-# Allowed Kilo models (owner policy, 2026-10-20):
+# Allowed Kilo models (owner policy, 2026-11-20; see ai-orchestration
+# docs/09-gemini-4-model-selection.md). Hydrogen = routine tier, Neon = complex
+# tier, Carbon = hardest problems on demand. 3.8 Flash and Argon stay accepted
+# as legacy so projects that still pin them keep working, but are no default.
 ALLOWED_MODELS = (
+    "google/gemini-4-hydrogen",
+    "google/gemini-4-neon",
+    "google/gemini-4-carbon",
+    "google/gemini-3.5-flash-lite",
+    "google/gemini-3.8-flash",
+    "google/gemini-4-argon",
+)
+LEGACY_MODELS = (
     "google/gemini-3.8-flash",
     "google/gemini-4-argon",
 )
 
-# Banned models / patterns (owner policy, 2026-10-20):
-# Never google/gemini-3.1-pro* (banned), and never the vague google/gemini-flash-latest
+# Banned models / patterns (owner policy, 2026-10-20, confirmed 2026-11-20):
+# never google/gemini-3.1-pro*, and never a `-latest` alias (Google hot-swaps
+# the model behind it on every release).
 BANNED_MODELS = (
     "google/gemini-3.1-pro*",
     "google/gemini-flash-latest",
+    "google/gemini-flash-lite-latest",
+    "google/gemini-pro-latest",
 )
 
 
@@ -1171,15 +1185,15 @@ def _is_banned_model(model: Optional[str]) -> bool:
 
 # Default model used by kilo_implement when the caller does not override it —
 # the "simple/routine task" tier. Must be a valid provider/model id as
-# reported by `kilo models`. Defaults to google/gemini-3.8-flash.
+# reported by `kilo models`. Defaults to google/gemini-4-hydrogen.
 _raw_default_model = _cfg("KILO_MCP_DEFAULT_MODEL", "kilo", "default_model",
-                          "google/gemini-3.8-flash")
+                          "google/gemini-4-hydrogen")
 if _is_banned_model(_raw_default_model):
     logger.warning(
-        "Configured default_model '%s' is banned by owner policy; falling back to 'google/gemini-3.8-flash'",
+        "Configured default_model '%s' is banned by owner policy; falling back to 'google/gemini-4-hydrogen'",
         _raw_default_model,
     )
-    DEFAULT_MODEL = "google/gemini-3.8-flash"
+    DEFAULT_MODEL = "google/gemini-4-hydrogen"
 else:
     DEFAULT_MODEL = _raw_default_model
 
@@ -1187,15 +1201,15 @@ else:
 # tasks with subtle failure modes — read-modify-write races, ambiguous specs,
 # security-sensitive edits, multi-step reasoning — where the connected
 # assistant should NOT reach for the same model it uses for trivial edits.
-# Defaults to google/gemini-4-argon.
+# Defaults to google/gemini-4-neon.
 _raw_complex_model = _cfg("KILO_MCP_COMPLEX_MODEL", "kilo", "complex_model",
-                          "google/gemini-4-argon")
+                          "google/gemini-4-neon")
 if _is_banned_model(_raw_complex_model):
     logger.warning(
-        "Configured complex_model '%s' is banned by owner policy; falling back to 'google/gemini-4-argon'",
+        "Configured complex_model '%s' is banned by owner policy; falling back to 'google/gemini-4-neon'",
         _raw_complex_model,
     )
-    COMPLEX_MODEL = "google/gemini-4-argon"
+    COMPLEX_MODEL = "google/gemini-4-neon"
 else:
     COMPLEX_MODEL = _raw_complex_model
 
@@ -2008,8 +2022,10 @@ async def kilo_list_models(
 
     Use this to validate the `model` argument of kilo_implement BEFORE
     delegating: passing a model id that Kilo does not know makes the run fail.
-    Allowed models by policy: `google/gemini-3.8-flash` (routine tasks) and
-    `google/gemini-4-argon` (complex/high-risk tasks).
+    Allowed models by policy: `google/gemini-4-hydrogen` (routine tasks),
+    `google/gemini-4-neon` (complex/high-risk tasks) and `google/gemini-4-carbon`
+    (hardest problems, on demand). `google/gemini-3.8-flash` and
+    `google/gemini-4-argon` are legacy (accepted, not recommended).
 
     Reflects the providers you are authenticated with; run `kilo auth login` in
     a terminal to add more. This is a read-only discovery call.
@@ -2353,6 +2369,7 @@ def _build_kilo_run_argv(
     model: Optional[str] = None,
     session_id: Optional[str] = None,
     title: Optional[str] = None,
+    variant: Optional[str] = None,
 ) -> list[str]:
     """Build the argument vector for `kilo run`.
 
@@ -2365,6 +2382,8 @@ def _build_kilo_run_argv(
     cmd.extend(["--agent", chosen_agent])
     if model:
         cmd.extend(["--model", model])
+    if variant:
+        cmd.extend(["--variant", variant])
     if title:
         cmd.extend(["--title", title])
     cmd.append(
@@ -2414,8 +2433,11 @@ async def kilo_implement(
         Field(
             description="Model id in `provider/model` form. MUST be a real id "
             "from kilo_list_models; an unknown id makes the run fail. Allowed "
-            "models by policy: google/gemini-3.8-flash (routine tasks) and "
-            "google/gemini-4-argon (complex/high-risk tasks). This "
+            "models by policy: google/gemini-4-hydrogen (routine tasks), "
+            "google/gemini-4-neon (complex/high-risk tasks), "
+            "google/gemini-4-carbon (hardest problems: architecture, security "
+            "audits, a bug the complex tier got stuck on); 3.8-flash and "
+            "4-argon are legacy. This "
             "environment has two configured tiers — pick by task risk, don't "
             "just reuse whatever model you (the connected assistant) happen "
             "to be: simple/routine tasks (mechanical edits, low risk) -> "
@@ -2425,6 +2447,19 @@ async def kilo_implement(
             "configured Kilo model when there is one, or " + DEFAULT_MODEL +
             ". Run `kilo-mcp --configure-models` to change these tiers, or "
             "kilo_list_models for the full catalog."
+        ),
+    ] = None,
+    variant: Annotated[
+        Optional[str],
+        Field(
+            description="Reasoning effort passed to `kilo run --variant` "
+            "(provider-specific). Gemini 4: `low`, `medium`, `high`, `xhigh` "
+            "(Carbon/Argon: up to `high`); Gemini 3.5 Flash-Lite also "
+            "`minimal`. Omit to use the model's own default, which for "
+            "Hydrogen and Neon is `high` (verbose, more output tokens). "
+            "Recommended: Hydrogen `medium` for routine work (`high` for "
+            "multi-file), Neon `high` for complex work, `low` for "
+            "read-only exploration; keep `xhigh` for hard problems."
         ),
     ] = None,
     focus_files: Annotated[
@@ -2810,6 +2845,14 @@ async def kilo_implement(
             f"Allowed models: {allowed_str}."
         )
 
+    if variant is not None:
+        variant = str(variant).strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", variant):
+            return (
+                f"Error: invalid variant '{variant}': expected a short token "
+                "such as low, medium, high or xhigh."
+            )
+
     model = resolved.model
     model_source = resolved.source
     model_warnings = resolved.warnings
@@ -2998,6 +3041,7 @@ async def kilo_implement(
             base_branch=base_branch_for_task,
             base_commit=base_commit_for_task,
             proposed_files=proposed_files,
+            variant=variant,
             brief_file=brief_abs,
             log_dir=log_dir_abs,
             original_spec=original_spec_for_record,
@@ -3038,6 +3082,7 @@ async def kilo_implement(
         model=model,
         session_id=server_session_id,
         title=task_title,
+        variant=variant,
     )
     log_path = os.path.join(TASKS_DIR, f"{run_id}.log")
     bg_rec = {
@@ -3045,6 +3090,7 @@ async def kilo_implement(
         "working_directory": cwd,
         "agent": agent,
         "model": model,
+        "variant": variant,
         "model_source": model_source,
         "isolated_branch": isolated_branch,
         "agent_manager_worktree_id": agent_manager_worktree_id,
@@ -3357,6 +3403,7 @@ def _start_task_from_record(task_id: str, record: dict, base_env: Optional[dict]
             model=model,
             session_id=session_id,
             title=task_title,
+            variant=record.get("variant"),
         )
     log_path = record.get("log_path") or os.path.join(TASKS_DIR, f"{task_id}.log")
     os.makedirs(os.path.dirname(log_path) or TASKS_DIR, exist_ok=True)
@@ -4556,7 +4603,8 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
                              log_dir: Optional[str] = None,
                              original_spec: Optional[str] = None,
                              resumed_from: Optional[str] = None,
-                             title: Optional[str] = None) -> str:
+                             title: Optional[str] = None,
+                             variant: Optional[str] = None) -> str:
     """Run one Kilo implementation task end-to-end: temp-file spec bridge,
     subprocess, Final-Report parsing, metrics. Used by the synchronous
     (background=False) path of kilo_implement only — the background path
@@ -4579,6 +4627,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             model=model,
             session_id=continue_session_id,
             title=task_title,
+            variant=variant,
         )
 
         started = time.monotonic()
@@ -4629,6 +4678,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
             "working_directory": cwd,
             "agent": agent,
             "model": model,
+            "variant": variant,
             "model_source": model_source,
             "isolated_branch": isolated_branch,
             "agent_manager_worktree_id": agent_manager_worktree_id,
@@ -5392,7 +5442,8 @@ def _format_task_result(record: dict, include_trace: bool = False) -> str:
     model_source = record.get("model_source")
     if model:
         source_str = f" ({model_source})" if model_source else ""
-        lines.append(f"- Model: {model}{source_str}")
+        variant_str = f", variant {record.get('variant')}" if record.get("variant") else ""
+        lines.append(f"- Model: {model}{variant_str}{source_str}")
     if session_id:
         lines.append(f"- Session ID: {session_id}")
     if isolated_branch:

@@ -192,8 +192,8 @@ Software engineering agents operate in multi-turn loops where context accumulate
 
 1. **Incremental Dispatch, Not Scheduled Full Passes:**
    Only dispatch an agent task on a component or repository when its pinned Git commit hash has changed. Never re-scan or re-delegate across a repository corpus on a timer (a full pass on 640 repos costs ~$1,440–$2,470; commit-triggered runs reduce annual spend by 98%).
-2. **Flash / Bulk Model by Default, Frontier on Demand:**
-   Use the `bulk-execution` model (e.g. `Gemini 3.8 Flash`, `Claude Sonnet`, `GPT-5-Codex-Mini`) by default for implementation and exploration (~$2.25/component). Promote to `deep-reasoning` (e.g. `Gemini 4 Argon`, `Claude Opus`) only where the stronger model materially changes the verdict: independent verification of high/critical findings, complex architectural specs, and subtle semantic conflict resolution. Empirical production data shows a real-world ~1.7× cost difference per component.
+2. **Fast Model by Default, Frontier on Demand:**
+   Use the `bulk-execution` model (e.g. `Gemini 4 Hydrogen`, `Claude Sonnet`, `GPT-5-Codex-Mini`) by default for implementation and exploration. Promote to `deep-reasoning` (e.g. `Gemini 4 Neon`, `Claude Opus`) only where the stronger model materially changes the verdict: independent verification of high/critical findings, complex architectural specs, and subtle semantic conflict resolution. Keep the top tier (e.g. `Gemini 4 Carbon`) for the hardest problems: system architecture, security audits, multi-file debugging where the `deep-reasoning` model got stuck. Earlier production data (Gemini 3.8 Flash vs 4 Argon) showed a ~1.7× cost difference per component; tune the thinking level/variant before switching model.
 3. **Maximize Implicit Cache via Byte-Stable Prompt Prefixes:**
    In real production runs, fresh (uncached) input accounted for **47% of total model spend**, while implicit caching served 89% of read tokens at 20× less cost. Keep invariant prompt text (grounding rules, methodology, templates) strictly at the beginning of prompts, byte-identical across runs. Put variable context (file paths, diffs, task details) at the very end.
 4. **Session Reuse for Review → Refutation / Fixes (`continue_session_id`):**
@@ -203,14 +203,18 @@ Software engineering agents operate in multi-turn loops where context accumulate
 6. **Asynchronous Batch Path for Latency-Tolerant Bulk Scans:**
    For large-scale, non-interactive sweeps, prefer asynchronous Batch APIs (-50% cost reduction). Split "bulk background scan" (batchable, asynchronous) from "interactive developer orchestration" (synchronous).
 7. **Factor in Scheduled Price Step-Ups:**
-   Track model pricing deadlines (e.g. `Gemini 4 Argon` doubles on 2026-12-01 to $4 in / $20 out; `Gemini 3.8 Flash` holds its promotional $0.75 in / $3.75 out rate until 2026-12-31, providing a **5.33× price advantage** during December 2026).
+   Track model pricing deadlines (e.g. `Gemini 4 Carbon` and `Gemini 4 Argon` double on 2026-12-01 to $4 in / $20 out, which makes `Gemini 4 Neon` at $3 / $15 the cheaper deep-reasoning tier from that date; `Gemini 3.8 Flash` keeps $0.75 / $3.75 until 2026-12-31 and then matches `Gemini 4 Hydrogen` at $1.50 / $7.50). Per-token price is not cost per task: thinking tokens are billed as output, and verbosity differs widely between models and variants (see the selection notes below).
 
 ### Model Pricing Reference Table (USD per 1M Tokens)
 
 | Provider & Model | Cognitive Profile | Input (Uncached) | Output + Thinking | Context Cache Read | Notes & Promo Deadlines |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| **Google Gemini 4 Argon** | `deep-reasoning` / `orchestration` | **$2.00** *(thru Nov 30)* → **$4.00** *(Dec 1)* | **$10.00** *(thru Nov 30)* → **$20.00** *(Dec 1)* | **$0.10** → **$0.20** | Flagship reasoning; NOT on Free Tier; doubles 2026-12-01 |
-| **Google Gemini 3.8 Flash** | `bulk-execution` / `exploration` | **$0.75** *(thru Dec 31)* → **$1.50** *(Jan 1)* | **$3.75** *(thru Dec 31)* → **$7.50** *(Jan 1)* | **$0.075** → **$0.15** | Agent workhorse; 2.67× cheaper than Argon (5.33× in Dec 2026) |
+| **Google Gemini 4 Carbon** | `deep-reasoning` (hardest problems) | **$2.00** *(thru Nov 30)* → **$4.00** *(Dec 1)* | **$10.00** *(thru Nov 30)* → **$20.00** *(Dec 1)* | **$0.10** → **$0.20** | Strongest reasoning; slowest (~56 tok/s); NOT on Free Tier; doubles 2026-12-01 |
+| **Google Gemini 4 Neon** | `deep-reasoning` / `orchestration` | **$3.00** | **$15.00** | **$0.15** | Paid tier only; top AA Coding Agent Index (Nov 2026); very verbose at `xhigh` |
+| **Google Gemini 4 Hydrogen** | `bulk-execution` / `exploration` | **$1.50** | **$7.50** | **$0.075** | Google's default for coding and agents; Free Tier; default thinking `high` (set it explicitly) |
+| **Google Gemini 4 Argon** | *(legacy)* | **$2.00** *(thru Nov 30)* → **$4.00** *(Dec 1)* | **$10.00** *(thru Nov 30)* → **$20.00** *(Dec 1)* | **$0.10** → **$0.20** | Superseded: below Hydrogen `high` on AA indices, priced as Carbon from Dec 1 |
+| **Google Gemini 3.8 Flash** | *(legacy fallback)* | **$0.75** *(thru Dec 31)* → **$1.50** *(Jan 1)* | **$3.75** *(thru Dec 31)* → **$7.50** *(Jan 1)* | **$0.075** → **$0.15** | Google's upgrade target is Hydrogen; Terminal-Bench 4.1 18% vs Hydrogen 57% (vendor) |
+| **Google Gemini 3.5 Flash-Lite** | `exploration` (text-only bulk) | **$0.30** | **$2.50** | **$0.03** | Summaries, translation, JSON extraction, compaction; supports `minimal` thinking |
 | **Anthropic Claude 3.5 Opus** | `deep-reasoning` | **$15.00** | **$75.00** | **$1.50** | 3.75×-7.5× more expensive than Argon; cache write: $18.75 |
 | **Anthropic Claude 3.5 Sonnet** | `bulk-execution` / `orchestration` | **$3.00** | **$15.00** | **$0.30** | Standard workhorse; 2×-4× more expensive than Flash; cache write: $3.75 |
 | **Anthropic Claude 3.5 Haiku** | `exploration` | **$0.80** *(≤128k)* | **$4.00** *(≤128k)* | **$0.08** | Near price-parity with Flash for high-volume read-only |
@@ -221,13 +225,22 @@ Software engineering agents operate in multi-turn loops where context accumulate
 
 | Activity / Mode | Cognitive Profile | Recommended Model & Effort/Variant | Rationale |
 | :--- | :--- | :--- | :--- |
-| **Architect / Plan / Design** | `orchestration` / `deep-reasoning` | **Gemini 4 Argon** (`medium`/`high`) or **Claude Opus** (`high`/`xhigh`) | Error is silent: flawed architecture poisons all downstream code. |
-| **Independent Verification / Code Review** | `deep-reasoning` | **Gemini 4 Argon** (`high`) or **Claude Opus** (`high`) | Must catch subtle logic/security flaws without authorship bias. |
-| **Root-Cause Debug / Tricky Bug** | `deep-reasoning` | **Gemini 4 Argon** (`high`) or **Claude Opus** (`xhigh`) | Ambiguous by nature; wrong hypothesis costs hours. |
-| **Semantic Conflict Resolution** | `deep-reasoning` | **Gemini 4 Argon** (`high`) or **Claude Opus** (`high`) | Design decision disguised as merge; mechanical tools compile broken logic. |
-| **Bulk Implementation (Worktree)** | `bulk-execution` | **Gemini 3.8 Flash** (`medium`) or **Claude Sonnet** (`high`) | Tests and linters catch noisy errors; Flash cuts token cost by 60%–80%. |
-| **Mechanical Refactor / Tests / UI** | `bulk-execution` | **Gemini 3.8 Flash** (`medium`) or **Claude Sonnet** (`medium`) | High volume, spec-bounded, automated verification. |
-| **Exploration / RAG / Q&A / Commit** | `exploration` | **Gemini 3.8 Flash** (`low`) or **Claude Haiku** (`low`) | Read-only, large context, fast deterministic response. |
+| **Architect / Plan / Design** | `orchestration` / `deep-reasoning` | **Gemini 4 Neon** (`high`), **Gemini 4 Carbon** (`high`) for system architecture, or **Claude Opus** (`high`/`xhigh`) | Error is silent: flawed architecture poisons all downstream code. |
+| **Independent Verification / Code Review** | `deep-reasoning` | **Gemini 4 Neon** (`high`), **Gemini 4 Carbon** (`high`) for security audits, or **Claude Opus** (`high`) | Must catch subtle logic/security flaws without authorship bias. |
+| **Root-Cause Debug / Tricky Bug** | `deep-reasoning` | **Gemini 4 Neon** (`high`), escalate to **Gemini 4 Carbon** (`high`) when stuck, or **Claude Opus** (`xhigh`) | Ambiguous by nature; wrong hypothesis costs hours. |
+| **Semantic Conflict Resolution** | `deep-reasoning` | **Gemini 4 Neon** (`high`) or **Claude Opus** (`high`) | Design decision disguised as merge; mechanical tools compile broken logic. |
+| **Orchestration turns (dispatch, wait, bookkeeping)** | `orchestration` | **Gemini 4 Neon** (`medium`) or **Claude Sonnet** (`medium`) | Many short turns; judgment matters but not deep proofs. |
+| **Bulk Implementation (Worktree)** | `bulk-execution` | **Gemini 4 Hydrogen** (`medium`; `high` for multi-file) or **Claude Sonnet** (`high`) | Tests and linters catch noisy errors; Hydrogen `high` scores like Argon `high` at ~40% of its cost per task. |
+| **Mechanical Refactor / Tests / UI** | `bulk-execution` | **Gemini 4 Hydrogen** (`medium`) or **Claude Sonnet** (`medium`) | High volume, spec-bounded, automated verification. |
+| **Exploration / RAG / Q&A / Commit** | `exploration` | **Gemini 4 Hydrogen** (`low`), **Gemini 3.5 Flash-Lite** for pure text summarization, or **Claude Haiku** (`low`) | Read-only, large context, fast deterministic response. |
+
+### Gemini 4 selection notes (researched 2026-11-20)
+
+- **Sources:** Google AI Studio [models](https://aistudio.google.com/docs/models), [choosing a model](https://aistudio.google.com/docs/choosing-a-model) and [pricing](https://aistudio.google.com/docs/pricing); DeepMind model cards; Artificial Analysis (AA) indices. Full analysis: [`docs/09-gemini-4-model-selection.md`](../../../docs/08-gemini-4-model-selection.md).
+- **Google's own map:** Hydrogen is the default for most new projects (everyday coding, parallel worker agents); Neon for complex, high-frequency work where Hydrogen is not enough; Carbon for the hardest problems. Argon is absent from the choosing page. Upgrade target for 3.x Flash is Hydrogen.
+- **Independent numbers (AA, Nov 2026, approximate):** Intelligence Index Neon 60 (`high`), Carbon 60 (`high`), Hydrogen 51 (`high`) / 41 (`medium`), Argon 50 (`high`). Mean cost per coding-agent task Hydrogen ~$4.5, Neon ~$6.9, Argon ~$6.8, Carbon ~$9.8.
+- **Thinking level matters more than the price list:** Hydrogen and Neon default to `high`; `xhigh` roughly doubles output tokens. Set the variant explicitly; reserve `xhigh` for hard problems.
+- **Neon and Hydrogen are new (Nov 12 / Nov 18 2026):** vendor-reported weaknesses include hallucinations and occasional timeouts. Verify their output as any executor's, and record defects so the choice can be revised.
 
 ### Logic & Commands to Recreate and Keep the Table Updated
 
@@ -241,7 +254,7 @@ Software engineering agents operate in multi-turn loops where context accumulate
      `./bin/ai-orch config set-profile <tool> <profile> --model <id> [--variant <v>] [--effort <e>]`
    - Propagate updated model matrix into the project's `AGENTS.md`:
      `./bin/ai-orch render-agents-md --apply`
-   - In Kilo Code, configure `~/.config/kilo/kilo.jsonc` setting `"subagent_model": "google/gemini-flash-latest"` and `"compaction": { "model": "google/gemini-flash-latest" }` to prevent the expensive default chat model from leaking into background workers.
+   - In Kilo Code, configure `~/.config/kilo/kilo.jsonc` setting `"subagent_model"` to the `bulk-execution` model (e.g. `"google/gemini-4-hydrogen"`) and `"compaction": { "model": ... }` to a cheap text model (e.g. `"google/gemini-3.5-flash-lite"`); never a `-latest` alias, which Google hot-swaps on every release to prevent the expensive default chat model from leaking into background workers.
 
 ## Analysis/exploration requests need the same specification rigor as implementation requests
 

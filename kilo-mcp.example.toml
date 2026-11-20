@@ -27,10 +27,13 @@ max_context_tokens_warn = 40000
 max_context_tokens_refuse = 120000
 
 # Default provider/model id for kilo_implement (must exist in `kilo models`) —
-# the "simple/routine task" tier. Allowed models by policy: `google/gemini-3.8-flash`
-# (default: routine work, reviews, exploration) and `google/gemini-4-argon` (complex work).
+# the "simple/routine task" tier. Allowed models by policy: `google/gemini-4-hydrogen`
+# (default: routine work, reviews, exploration), `google/gemini-4-neon` (complex work) and
+# `google/gemini-4-carbon` (hardest problems, on demand). `google/gemini-3.8-flash` and
+# `google/gemini-4-argon` are legacy. Pass kilo_implement's `variant` (low/medium/high/xhigh)
+# explicitly: Hydrogen and Neon default to `high`.
 # env: KILO_MCP_DEFAULT_MODEL
-default_model = "google/gemini-3.8-flash"
+default_model = "google/gemini-4-hydrogen"
 
 # The "complex/high-risk task" tier: a stronger model for tasks with subtle
 # failure modes (read-modify-write races, ambiguous specs, security-sensitive
@@ -42,7 +45,7 @@ default_model = "google/gemini-3.8-flash"
 # models you actually have available and set both tiers interactively,
 # instead of editing this by hand.
 # env: KILO_MCP_COMPLEX_MODEL
-complex_model = "google/gemini-4-argon"
+complex_model = "google/gemini-4-neon"
 
 # What Kilo's model tokens cost YOU (USD per million tokens). Default 0.0 =
 # free, which is right only if your Kilo API keys are provided at no charge
