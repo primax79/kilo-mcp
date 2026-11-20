@@ -1898,6 +1898,22 @@ def _find_kilo_files(pattern: str, cwd: Optional[str] = None) -> list[str]:
     return files
 
 
+def _env_for_cwd(env: Optional[dict], cwd: Optional[str]) -> dict:
+    """Return a copy of `env` (or `os.environ`) with `PWD` synced to `cwd`.
+
+    Python's subprocess `cwd=` calls chdir() in the child without updating the
+    inherited `PWD` environment variable. Kilo (Bun) resolves the session's
+    working directory from `process.env.PWD` when `--dir` is omitted, so a
+    stale `PWD` from the MCP server's startup directory makes `kilo run` read
+    and write in the server's directory instead of `working_directory` (or an
+    isolated worktree). Keeping `PWD` aligned with `os.path.abspath(cwd)` makes
+    every child process see a consistent working directory.
+    """
+    out = dict(env) if env is not None else os.environ.copy()
+    out["PWD"] = os.path.abspath(cwd) if cwd else os.getcwd()
+    return out
+
+
 async def _run_kilo(cmd: list[str], cwd: str, env: dict, on_start=None) -> tuple[Optional[int], str, str]:
     """Run a Kilo subprocess without blocking the asyncio event loop.
 
@@ -1919,10 +1935,11 @@ async def _run_kilo(cmd: list[str], cwd: str, env: dict, on_start=None) -> tuple
 
     Returns (returncode, stdout, stderr). returncode is None on timeout.
     """
+    proc_env = _env_for_cwd(env, cwd)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
-        env=env,
+        env=proc_env,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -2179,7 +2196,7 @@ async def kilo_rag_search(
         # streams events to stdout and exits when the session goes idle), so no
         # special env var is needed to keep it from hanging on prompts.
         cmd = ["kilo", "run", "--agent", "explore", prompt]
-        env = os.environ.copy()
+        env = _env_for_cwd(os.environ, cwd)
 
         coll = f"ws-{hashlib.sha256(cwd.encode('utf-8')).hexdigest()[:16]}"
         saved_meta = _qdrant_get_metadata_point(_QDRANT_DEFAULT_URL, coll)
@@ -3023,6 +3040,7 @@ async def kilo_implement(
     if env_vars:
         for key, value in env_vars.items():
             env[key] = str(value)
+    env = _env_for_cwd(env, cwd)
 
     warnings_prefix = context_warning
     if model_warnings:
@@ -3258,10 +3276,11 @@ def _spawn_kilo_background(cmd: list[str], cwd: str, env: dict, log_path: str) -
     whole background-execution mechanism exists to detect and recover from,
     except here the cause was in this server's own subprocess call, not in
     Kilo or the model). Returns the child's pid."""
+    proc_env = _env_for_cwd(env, cwd)
     log_fd = open(log_path, "wb")
     try:
         proc = subprocess.Popen(
-            cmd, cwd=cwd, env=env,
+            cmd, cwd=cwd, env=proc_env,
             stdin=subprocess.DEVNULL,
             stdout=log_fd, stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -3411,6 +3430,7 @@ def _start_task_from_record(task_id: str, record: dict, base_env: Optional[dict]
     env_overrides = record.get("env_overrides") or {}
     for k, v in env_overrides.items():
         env[str(k)] = str(v)
+    env = _env_for_cwd(env, cwd)
 
     pid = _spawn_kilo_background(cmd, cwd, env, log_path)
     started_iso = datetime.now(timezone.utc).isoformat()
@@ -4631,7 +4651,7 @@ async def _execute_implement(run_id: str, cwd: str, full_content: str,
         )
 
         started = time.monotonic()
-        returncode, stdout, stderr = await _run_kilo(cmd, cwd=cwd, env=env)
+        returncode, stdout, stderr = await _run_kilo(cmd, cwd=cwd, env=_env_for_cwd(env, cwd))
         duration = round(time.monotonic() - started, 1)
 
         # Resolve the Kilo session id so the caller can steer/inspect it later
@@ -5252,14 +5272,15 @@ def _spawn_queue_runner_detached() -> Optional[int]:
     log_path = _queue_runner_log_path()
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     server_script = os.path.abspath(__file__)
+    runner_cwd = os.path.dirname(server_script) or os.getcwd()
     cmd = [sys.executable, server_script, "--queue-runner"]
-    env = os.environ.copy()
+    env = _env_for_cwd(os.environ, runner_cwd)
     env["KILO_MCP_DATA_DIR"] = os.path.dirname(TASKS_DIR) if TASKS_DIR != os.path.join(_DEFAULT_DATA_DIR, "tasks") else DATA_DIR
     log_fd = open(log_path, "ab")
     try:
         proc = subprocess.Popen(
             cmd,
-            cwd=os.path.dirname(server_script) or os.getcwd(),
+            cwd=runner_cwd,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=log_fd,
@@ -6694,7 +6715,7 @@ async def _create_worktree(cwd: str, branch_name: str, base_branch: Optional[str
     if base_branch:
         cmd.append(base_branch)
     async with _worktree_lock_for(cwd):
-        returncode, stdout, stderr = await _run_kilo(cmd, cwd=cwd, env=env)
+        returncode, stdout, stderr = await _run_kilo(cmd, cwd=cwd, env=_env_for_cwd(env, cwd))
     worktree_path = os.path.join(cwd, worktree_rel) if returncode == 0 else None
 
     agent_manager_worktree_id = None
@@ -6853,7 +6874,7 @@ async def kilo_run_command(
     cmd = ["kilo", "run", "--command", command_name]
     if args:
         cmd.append(args)
-    returncode, stdout, stderr = await _run_kilo(cmd, cwd=cwd, env=os.environ.copy())
+    returncode, stdout, stderr = await _run_kilo(cmd, cwd=cwd, env=_env_for_cwd(os.environ, cwd))
     return f"Command execution:\nExit code: {returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
 
 
@@ -6864,7 +6885,7 @@ async def kilo_workspace_status(
     """Report the git status (porcelain short format) of a working directory or
     worktree — use it to review what a delegated run actually touched."""
     cwd = working_directory if working_directory else os.getcwd()
-    returncode, stdout, stderr = await _run_kilo(["git", "status", "-s"], cwd=cwd, env=os.environ.copy())
+    returncode, stdout, stderr = await _run_kilo(["git", "status", "-s"], cwd=cwd, env=_env_for_cwd(os.environ, cwd))
     if returncode != 0:
         return f"git status failed (exit code {returncode}):\n{stderr}"
     status_text = stdout or "(clean — no uncommitted changes)"
@@ -6967,6 +6988,7 @@ async def _run_verify_check(
     proc = await asyncio.create_subprocess_shell(
         cmd_str,
         cwd=cwd,
+        env=_env_for_cwd(os.environ, cwd),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,

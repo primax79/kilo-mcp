@@ -5769,3 +5769,304 @@ def test_mcp_skills_stdio_client_end_to_end():
             assert actual_digest == manifest_entry["digest"]
 
     asyncio.run(scenario())
+
+
+# ==============================================================================
+# T055 — Sync env["PWD"] with subprocess cwd across all launch paths
+# ==============================================================================
+
+def test_t055_run_kilo_syncs_pwd_to_cwd(tmp_path):
+    """_run_kilo sets PWD in the child environment to abspath(cwd) without mutating caller env."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    caller_env = os.environ.copy()
+    caller_env["PWD"] = str(dir_a)
+
+    rc, stdout, stderr = asyncio.run(
+        server._run_kilo(
+            [sys.executable, "-c", "import os; print(os.environ.get('PWD', '')); print(os.getcwd())"],
+            cwd=str(dir_b),
+            env=caller_env,
+        )
+    )
+    assert rc == 0, stderr
+    lines = stdout.strip().splitlines()
+    assert len(lines) == 2
+    assert lines[0] == os.path.abspath(str(dir_b))
+    assert os.path.realpath(lines[1]) == os.path.realpath(str(dir_b))
+    # Caller's env dict must not be mutated in place
+    assert caller_env["PWD"] == str(dir_a)
+
+
+def test_t055_spawn_kilo_background_syncs_pwd_to_cwd(tmp_path):
+    """_spawn_kilo_background sets PWD in the detached child environment to abspath(cwd)."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    log_path = str(tmp_path / "bg.log")
+
+    caller_env = os.environ.copy()
+    caller_env["PWD"] = str(dir_a)
+
+    pid = server._spawn_kilo_background(
+        [sys.executable, "-c", "import os; print(os.environ.get('PWD', '')); print(os.getcwd())"],
+        cwd=str(dir_b),
+        env=caller_env,
+        log_path=log_path,
+    )
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+    lines = pathlib.Path(log_path).read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    assert lines[0] == os.path.abspath(str(dir_b))
+    assert os.path.realpath(lines[1]) == os.path.realpath(str(dir_b))
+    assert caller_env["PWD"] == str(dir_a)
+
+
+def test_t055_kilo_implement_foreground_sets_pwd_to_working_directory(
+    tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch
+):
+    """kilo_implement(background=False) passes PWD == working_directory even when server PWD differs."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv("PWD", str(dir_a))
+
+    mock_run_kilo_custom.returncode = 0
+    mock_run_kilo_custom.stdout = "Outcome: success\n- **Files changed**: none\n"
+
+    asyncio.run(
+        server.kilo_implement(
+            task_instructions="Create b.txt",
+            working_directory=str(dir_b),
+            background=False,
+        )
+    )
+    assert len(mock_run_kilo_custom.calls) == 1
+    call = mock_run_kilo_custom.calls[0]
+    assert call["cwd"] == str(dir_b)
+    assert call["env"]["PWD"] == os.path.abspath(str(dir_b))
+
+
+def test_t055_kilo_implement_worktree_sets_pwd_to_worktree(
+    tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch
+):
+    """kilo_implement(isolation='worktree', background=False) sets PWD to the isolated worktree path."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv("PWD", str(dir_a))
+
+    mock_run_kilo_custom.returncode = 0
+    mock_run_kilo_custom.stdout = "Outcome: success\n- **Files changed**: none\n"
+
+    asyncio.run(
+        server.kilo_implement(
+            task_instructions="Work inside worktree",
+            working_directory=str(dir_b),
+            isolation="worktree",
+            worktree_branch="feat-pwd",
+            background=False,
+        )
+    )
+    assert len(mock_run_kilo_custom.calls) == 2
+    wt_create_call = mock_run_kilo_custom.calls[0]
+    kilo_call = mock_run_kilo_custom.calls[1]
+    expected_wt = os.path.abspath(os.path.join(str(dir_b), ".kilo", "worktrees", "feat-pwd"))
+
+    assert wt_create_call["env"]["PWD"] == os.path.abspath(str(dir_b))
+    assert os.path.abspath(kilo_call["cwd"]) == expected_wt
+    assert kilo_call["env"]["PWD"] == expected_wt
+
+
+def test_t055_kilo_implement_background_sets_pwd_to_working_directory(
+    tmp_path, fake_data_dir, mock_spawn_kilo_background, monkeypatch
+):
+    """kilo_implement(background=True) passes PWD == working_directory to _spawn_kilo_background."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv("PWD", str(dir_a))
+    monkeypatch.setattr(server, "_discover_active_kilo_server", lambda *a, **kw: (None, None))
+
+    asyncio.run(
+        server.kilo_implement(
+            task_instructions="Create b.txt in background",
+            working_directory=str(dir_b),
+            background=True,
+        )
+    )
+    assert len(mock_spawn_kilo_background.calls) == 1
+    call = mock_spawn_kilo_background.calls[0]
+    assert call["cwd"] == str(dir_b)
+    assert call["env"]["PWD"] == os.path.abspath(str(dir_b))
+
+
+def test_t055_queue_runner_sets_pwd_to_task_working_directory(
+    tmp_path, fake_data_dir, mock_spawn_kilo_background, monkeypatch
+):
+    """Queued tasks started via run_queue_once() receive PWD == task working_directory, not runner PWD."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_runner = tmp_path / "runner_dir"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    dir_runner.mkdir()
+
+    monkeypatch.setenv("PWD", str(dir_a))
+    monkeypatch.setattr(server, "_discover_active_kilo_server", lambda *a, **kw: (None, None))
+    monkeypatch.setattr(server, "_ensure_queue_runner_started", lambda: False)
+
+    asyncio.run(
+        server.kilo_implement(
+            task_instructions="Queued task",
+            working_directory=str(dir_b),
+            background=True,
+            queue="pwd-test",
+        )
+    )
+    assert len(mock_spawn_kilo_background.calls) == 0
+
+    # Simulate detached queue runner executing with a different PWD
+    monkeypatch.setenv("PWD", str(dir_runner))
+    summary = server.run_queue_once()
+    assert len(summary["started"]) == 1
+    assert len(mock_spawn_kilo_background.calls) == 1
+    call = mock_spawn_kilo_background.calls[0]
+    assert call["cwd"] == str(dir_b)
+    assert call["env"]["PWD"] == os.path.abspath(str(dir_b))
+
+
+def test_t055_spawn_queue_runner_detached_sets_pwd_to_runner_cwd(tmp_path, fake_data_dir, monkeypatch):
+    """_spawn_queue_runner_detached sets PWD in the runner env to its own cwd."""
+    dir_a = tmp_path / "other_dir"
+    dir_a.mkdir()
+    monkeypatch.setenv("PWD", str(dir_a))
+
+    captured = {}
+
+    class DummyProc:
+        pid = 42424
+
+    def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        captured["env"] = env
+        return DummyProc()
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    pid = server._spawn_queue_runner_detached()
+    assert pid == 42424
+    expected_cwd = os.path.abspath(os.path.dirname(os.path.abspath(server.__file__)))
+    assert os.path.abspath(captured["cwd"]) == expected_cwd
+    assert captured["env"]["PWD"] == expected_cwd
+
+
+def test_t055_kilo_run_command_sets_pwd_to_working_directory(
+    tmp_path, mock_run_kilo_custom, monkeypatch
+):
+    """kilo_run_command passes PWD == working_directory even when server PWD differs."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv("PWD", str(dir_a))
+
+    asyncio.run(
+        server.kilo_run_command(
+            command_name="my-cmd",
+            args="arg1",
+            working_directory=str(dir_b),
+        )
+    )
+    assert len(mock_run_kilo_custom.calls) == 1
+    call = mock_run_kilo_custom.calls[0]
+    assert call["cwd"] == str(dir_b)
+    assert call["env"]["PWD"] == os.path.abspath(str(dir_b))
+
+
+def test_t055_kilo_rag_search_sets_pwd_to_working_directory(
+    tmp_path, fake_data_dir, mock_run_kilo_custom, monkeypatch
+):
+    """kilo_rag_search passes PWD == working_directory even when server PWD differs."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv("PWD", str(dir_a))
+
+    asyncio.run(
+        server.kilo_rag_search(
+            query="find auth logic",
+            working_directory=str(dir_b),
+        )
+    )
+    assert len(mock_run_kilo_custom.calls) == 1
+    call = mock_run_kilo_custom.calls[0]
+    assert call["cwd"] == str(dir_b)
+    assert call["env"]["PWD"] == os.path.abspath(str(dir_b))
+
+
+def test_t055_run_verify_check_sets_pwd_to_cwd(tmp_path, monkeypatch):
+    """_run_verify_check passes PWD == cwd to the verification shell."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv("PWD", str(dir_a))
+
+    captured_env = {}
+    orig_create = asyncio.create_subprocess_shell
+
+    async def spy_create(cmd, *args, **kwargs):
+        captured_env["env"] = kwargs.get("env")
+        return await orig_create(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", spy_create)
+
+    res = asyncio.run(
+        server._run_verify_check(
+            f"{sys.executable} -c \"import os, sys; sys.exit(0 if os.environ.get('PWD') == {os.path.abspath(str(dir_b))!r} else 1)\"",
+            cwd=str(dir_b),
+            timeout_seconds=10,
+            tail_lines=10,
+        )
+    )
+    assert res["exit_code"] == 0
+    assert captured_env["env"] is not None
+    assert captured_env["env"]["PWD"] == os.path.abspath(str(dir_b))
+
+
+def test_t055_kilo_implement_env_vars_preserved_and_pwd_synced(
+    tmp_path, fake_data_dir, mock_spawn_kilo_background, monkeypatch
+):
+    """Custom env_vars are preserved while PWD is always aligned to working_directory."""
+    dir_a = tmp_path / "server_dir"
+    dir_b = tmp_path / "target_repo"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    monkeypatch.setenv("PWD", str(dir_a))
+    monkeypatch.setattr(server, "_discover_active_kilo_server", lambda *a, **kw: (None, None))
+
+    asyncio.run(
+        server.kilo_implement(
+            task_instructions="Check env vars",
+            working_directory=str(dir_b),
+            background=True,
+            env_vars={"CUSTOM_TOKEN": "abc123", "PWD": str(dir_a)},
+        )
+    )
+    assert len(mock_spawn_kilo_background.calls) == 1
+    env = mock_spawn_kilo_background.calls[0]["env"]
+    assert env["CUSTOM_TOKEN"] == "abc123"
+    assert env["PWD"] == os.path.abspath(str(dir_b))
+
+
